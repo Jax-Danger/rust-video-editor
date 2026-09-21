@@ -1,0 +1,12 @@
+{
+  "id": "youtube-1080p30",
+  "name": "YouTube 1080p30",
+  "description": "1920×1080 progressive, 30 fps. Three picture tracks, four audio tracks, one caption track.",
+  "width": 1920,
+  "height": 1080,
+  "fps_num": 30,
+  "fps_den": 1,
+  "video_tracks": 3,
+  "audio_tracks": 4,
+  "caption_tracks": 1
+}

@@ -1,0 +1,563 @@
+{
+  "format_version": 1,
+  "name": "Northline — Opening",
+  "next_id": 1000,
+  "bins": [
+    {
+      "id": 1,
+      "name": "Master"
+    },
+    {
+      "id": 2,
+      "name": "Interviews",
+      "parent": 1
+    },
+    {
+      "id": 3,
+      "name": "B-Roll",
+      "parent": 1
+    },
+    {
+      "id": 4,
+      "name": "Audio",
+      "parent": 1
+    }
+  ],
+  "media": [
+    {
+      "id": 10,
+      "bin_id": 2,
+      "name": "interview.mov",
+      "path": "media/interview.mov",
+      "duration": 480,
+      "timebase": {
+        "numerator": 24,
+        "denominator": 1
+      },
+      "width": 1920,
+      "height": 1080,
+      "video_codec": "h264",
+      "audio_codec": "aac",
+      "audio_channels": 2,
+      "sample_rate": 48000,
+      "has_video": true,
+      "has_audio": true,
+      "offline": true
+    },
+    {
+      "id": 11,
+      "bin_id": 3,
+      "name": "city_broll.mov",
+      "path": "media/city_broll.mov",
+      "duration": 288,
+      "timebase": {
+        "numerator": 24,
+        "denominator": 1
+      },
+      "width": 1920,
+      "height": 1080,
+      "video_codec": "h264",
+      "audio_codec": "aac",
+      "audio_channels": 2,
+      "sample_rate": 48000,
+      "has_video": true,
+      "has_audio": true,
+      "offline": true
+    },
+    {
+      "id": 12,
+      "bin_id": 3,
+      "name": "aerial.mov",
+      "path": "media/aerial.mov",
+      "duration": 192,
+      "timebase": {
+        "numerator": 24,
+        "denominator": 1
+      },
+      "width": 1920,
+      "height": 1080,
+      "video_codec": "prores",
+      "audio_codec": "pcm",
+      "audio_channels": 2,
+      "sample_rate": 48000,
+      "has_video": true,
+      "has_audio": true,
+      "offline": true
+    },
+    {
+      "id": 13,
+      "bin_id": 4,
+      "name": "score.wav",
+      "path": "media/score.wav",
+      "duration": 720,
+      "timebase": {
+        "numerator": 24,
+        "denominator": 1
+      },
+      "audio_codec": "pcm",
+      "audio_channels": 2,
+      "sample_rate": 48000,
+      "has_video": false,
+      "has_audio": true,
+      "offline": true
+    },
+    {
+      "id": 14,
+      "bin_id": 4,
+      "name": "room_tone.wav",
+      "path": "media/room_tone.wav",
+      "duration": 240,
+      "timebase": {
+        "numerator": 24,
+        "denominator": 1
+      },
+      "audio_codec": "pcm",
+      "audio_channels": 2,
+      "sample_rate": 48000,
+      "has_video": false,
+      "has_audio": true,
+      "offline": true
+    }
+  ],
+  "sequences": [
+    {
+      "id": 100,
+      "name": "Timeline 1",
+      "width": 1920,
+      "height": 1080,
+      "timebase": {
+        "numerator": 24,
+        "denominator": 1
+      },
+      "pixel_aspect_num": 1,
+      "pixel_aspect_den": 1,
+      "tracks": [
+        {
+          "id": 201,
+          "kind": "video",
+          "name": "V1",
+          "locked": false,
+          "muted": false,
+          "solo": false,
+          "sync_lock": true,
+          "clips": [
+            {
+              "id": 301,
+              "media_id": 10,
+              "name": "INTV A",
+              "timeline_in": 0,
+              "timeline_out": 144,
+              "source_in": 24,
+              "source_out": 168,
+              "source_min": 0,
+              "source_max": 480,
+              "media_timebase": {
+                "numerator": 24,
+                "denominator": 1
+              },
+              "linked": [
+                311
+              ],
+              "enabled": true,
+              "effects": [
+                {
+                  "type": "color",
+                  "exposure": {
+                    "base": 0.15
+                  },
+                  "contrast": {
+                    "base": 1.05
+                  },
+                  "highlights": {
+                    "base": 0.0
+                  },
+                  "shadows": {
+                    "base": 0.0
+                  },
+                  "temperature": {
+                    "base": 0.28
+                  },
+                  "tint": {
+                    "base": 0.0
+                  },
+                  "saturation": {
+                    "base": 0.92
+                  }
+                }
+              ],
+              "label": "teal"
+            },
+            {
+              "id": 302,
+              "media_id": 11,
+              "name": "CITY",
+              "timeline_in": 144,
+              "timeline_out": 264,
+              "source_in": 12,
+              "source_out": 132,
+              "source_min": 0,
+              "source_max": 288,
+              "media_timebase": {
+                "numerator": 24,
+                "denominator": 1
+              },
+              "linked": [
+                312
+              ],
+              "enabled": true,
+              "effects": [
+                {
+                  "type": "color",
+                  "exposure": {
+                    "base": 0.0
+                  },
+                  "contrast": {
+                    "base": 1.12
+                  },
+                  "highlights": {
+                    "base": -0.22
+                  },
+                  "shadows": {
+                    "base": 0.16
+                  },
+                  "temperature": {
+                    "base": -0.06
+                  },
+                  "tint": {
+                    "base": 0.0
+                  },
+                  "saturation": {
+                    "base": 1.18
+                  }
+                }
+              ],
+              "label": "amber"
+            },
+            {
+              "id": 303,
+              "media_id": 10,
+              "name": "INTV B",
+              "timeline_in": 264,
+              "timeline_out": 408,
+              "source_in": 200,
+              "source_out": 344,
+              "source_min": 0,
+              "source_max": 480,
+              "media_timebase": {
+                "numerator": 24,
+                "denominator": 1
+              },
+              "linked": [
+                313
+              ],
+              "enabled": true,
+              "effects": [
+                {
+                  "type": "color",
+                  "exposure": {
+                    "base": 0.15
+                  },
+                  "contrast": {
+                    "base": 1.05
+                  },
+                  "highlights": {
+                    "base": 0.0
+                  },
+                  "shadows": {
+                    "base": 0.0
+                  },
+                  "temperature": {
+                    "base": 0.28
+                  },
+                  "tint": {
+                    "base": 0.0
+                  },
+                  "saturation": {
+                    "base": 0.92
+                  }
+                }
+              ],
+              "label": "teal"
+            }
+          ],
+          "transitions": [
+            {
+              "id": 601,
+              "kind": {
+                "type": "cross_dissolve"
+              },
+              "left_clip": 301,
+              "right_clip": 302,
+              "duration": 12,
+              "alignment": "center"
+            },
+            {
+              "id": 602,
+              "kind": {
+                "type": "wipe",
+                "angle_deg": 90.0
+              },
+              "left_clip": 302,
+              "right_clip": 303,
+              "duration": 10,
+              "alignment": "center"
+            }
+          ]
+        },
+        {
+          "id": 202,
+          "kind": "video",
+          "name": "V2",
+          "locked": false,
+          "muted": false,
+          "solo": false,
+          "sync_lock": true,
+          "clips": [
+            {
+              "id": 304,
+              "media_id": 12,
+              "name": "AERIAL",
+              "timeline_in": 36,
+              "timeline_out": 108,
+              "source_in": 0,
+              "source_out": 72,
+              "source_min": 0,
+              "source_max": 192,
+              "media_timebase": {
+                "numerator": 24,
+                "denominator": 1
+              },
+              "enabled": true,
+              "effects": [
+                {
+                  "type": "transform",
+                  "position_x": {
+                    "base": 520.0
+                  },
+                  "position_y": {
+                    "base": -260.0
+                  },
+                  "scale_x": {
+                    "base": 0.34,
+                    "keys": [
+                      {
+                        "frame": 0,
+                        "value": 0.32,
+                        "interpolation": "linear"
+                      },
+                      {
+                        "frame": 70,
+                        "value": 0.42,
+                        "interpolation": "linear"
+                      }
+                    ]
+                  },
+                  "scale_y": {
+                    "base": 0.34,
+                    "keys": [
+                      {
+                        "frame": 0,
+                        "value": 0.32,
+                        "interpolation": "linear"
+                      },
+                      {
+                        "frame": 70,
+                        "value": 0.42,
+                        "interpolation": "linear"
+                      }
+                    ]
+                  },
+                  "rotation_deg": {
+                    "base": 0.0
+                  },
+                  "anchor_x": {
+                    "base": 0.5
+                  },
+                  "anchor_y": {
+                    "base": 0.5
+                  },
+                  "opacity": {
+                    "base": 1.0
+                  }
+                }
+              ],
+              "label": "violet"
+            }
+          ]
+        },
+        {
+          "id": 203,
+          "kind": "video",
+          "name": "V3",
+          "locked": false,
+          "muted": false,
+          "solo": false,
+          "sync_lock": true,
+          "clips": []
+        },
+        {
+          "id": 211,
+          "kind": "audio",
+          "name": "A1",
+          "locked": false,
+          "muted": false,
+          "solo": false,
+          "sync_lock": true,
+          "clips": [
+            {
+              "id": 311,
+              "media_id": 10,
+              "name": "INTV A",
+              "timeline_in": 0,
+              "timeline_out": 144,
+              "source_in": 24,
+              "source_out": 168,
+              "source_min": 0,
+              "source_max": 480,
+              "media_timebase": {
+                "numerator": 24,
+                "denominator": 1
+              },
+              "linked": [
+                301
+              ],
+              "enabled": true,
+              "label": "green"
+            },
+            {
+              "id": 312,
+              "media_id": 11,
+              "name": "CITY",
+              "timeline_in": 144,
+              "timeline_out": 264,
+              "source_in": 12,
+              "source_out": 132,
+              "source_min": 0,
+              "source_max": 288,
+              "media_timebase": {
+                "numerator": 24,
+                "denominator": 1
+              },
+              "linked": [
+                302
+              ],
+              "enabled": true,
+              "label": "green"
+            },
+            {
+              "id": 313,
+              "media_id": 10,
+              "name": "INTV B",
+              "timeline_in": 264,
+              "timeline_out": 408,
+              "source_in": 200,
+              "source_out": 344,
+              "source_min": 0,
+              "source_max": 480,
+              "media_timebase": {
+                "numerator": 24,
+                "denominator": 1
+              },
+              "linked": [
+                303
+              ],
+              "enabled": true,
+              "label": "green"
+            }
+          ]
+        },
+        {
+          "id": 212,
+          "kind": "audio",
+          "name": "A2",
+          "locked": false,
+          "muted": false,
+          "solo": false,
+          "sync_lock": true,
+          "clips": [
+            {
+              "id": 314,
+              "media_id": 13,
+              "name": "SCORE",
+              "timeline_in": 0,
+              "timeline_out": 408,
+              "source_in": 0,
+              "source_out": 408,
+              "source_min": 0,
+              "source_max": 720,
+              "media_timebase": {
+                "numerator": 24,
+                "denominator": 1
+              },
+              "enabled": true,
+              "label": "blue"
+            }
+          ]
+        },
+        {
+          "id": 213,
+          "kind": "audio",
+          "name": "A3",
+          "locked": false,
+          "muted": false,
+          "solo": false,
+          "sync_lock": true,
+          "clips": []
+        },
+        {
+          "id": 221,
+          "kind": "caption",
+          "name": "C1",
+          "locked": false,
+          "muted": false,
+          "solo": false,
+          "sync_lock": true,
+          "clips": [],
+          "cues": [
+            {
+              "id": 401,
+              "timeline_in": 12,
+              "timeline_out": 72,
+              "text": "We came in over the ridge at first light.",
+              "speaker": "Interview"
+            },
+            {
+              "id": 402,
+              "timeline_in": 156,
+              "timeline_out": 230,
+              "text": "The city was already awake.",
+              "speaker": "Interview"
+            },
+            {
+              "id": 403,
+              "timeline_in": 280,
+              "timeline_out": 360,
+              "text": "Hold on the skyline.",
+              "speaker": "Interview"
+            }
+          ]
+        }
+      ],
+      "markers": [
+        {
+          "id": 501,
+          "frame": 0,
+          "duration": 0,
+          "name": "Opening",
+          "color": "teal",
+          "comment": "First light over the ridge."
+        },
+        {
+          "id": 502,
+          "frame": 144,
+          "duration": 0,
+          "name": "Cut to city",
+          "color": "amber"
+        }
+      ],
+      "in_point": 0,
+      "out_point": 408
+    }
+  ],
+  "active_sequence": 100
+}
