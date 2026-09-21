@@ -168,19 +168,48 @@ fn follow_ruler_scrub(ui: &egui::Ui, app: &mut MeridianApp) {
     app.halt_transport();
 }
 
+fn transport_scrub(ui: &mut egui::Ui, playhead: i64, end: i64) -> Option<i64> {
+    let width = ui.available_width().max(80.0);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 22.0), Sense::click_and_drag());
+    let track = Rect::from_center_size(rect.center(), Vec2::new(rect.width(), 6.0));
+    let painter = ui.painter();
+    painter.rect_filled(track, 3.0, THEME.inset);
+    let span = end.max(1) as f32;
+    let t = (playhead as f32 / span).clamp(0.0, 1.0);
+    let x = track.left() + track.width() * t;
+    painter.rect_filled(
+        Rect::from_min_max(track.min, pos2(x, track.bottom())),
+        3.0,
+        THEME.accent_dim,
+    );
+    painter.circle_filled(pos2(x, track.center().y), 6.0, THEME.playhead);
+    if response.hovered() || response.dragged() {
+        response.clone().on_hover_cursor(CursorIcon::PointingHand);
+        response.clone().on_hover_text("Drag to scrub");
+    }
+    if !(response.dragged() || response.clicked()) {
+        return None;
+    }
+    let pos = response.interact_pointer_pos()?;
+    let nt = ((pos.x - track.left()) / track.width().max(1.0)).clamp(0.0, 1.0);
+    Some((nt * end.max(0) as f32).round() as i64)
+}
+
 fn transport(ui: &mut egui::Ui, app: &mut MeridianApp) {
     let timebase = app.timebase();
     let end = app.sequence_end();
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 64.0), Sense::hover());
     ui.painter().rect_filled(rect, 0.0, THEME.header);
     ui.painter().hline(
         rect.x_range(),
         rect.bottom(),
         Stroke::new(1.0_f32, THEME.hairline),
     );
+    let controls = Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + 38.0));
+    let scrub_row = Rect::from_min_max(pos2(rect.left(), rect.top() + 38.0), rect.max);
     let mut bar = ui.new_child(
         egui::UiBuilder::new()
-            .max_rect(rect.shrink2(Vec2::new(8.0, 6.0)))
+            .max_rect(controls.shrink2(Vec2::new(8.0, 4.0)))
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     bar.spacing_mut().item_spacing.x = 4.0;
@@ -207,7 +236,7 @@ fn transport(ui: &mut egui::Ui, app: &mut MeridianApp) {
     widgets::readout(&mut bar, &format_tc(app.playhead, timebase), 118.0, true);
     bar.add_space(4.0);
     widgets::readout(&mut bar, &format_tc(end, timebase), 118.0, false);
-    bar.add_space(12.0);
+    bar.add_space(8.0);
     let (inn, out) = app
         .session
         .project()
@@ -253,6 +282,16 @@ fn transport(ui: &mut egui::Ui, app: &mut MeridianApp) {
                 .color(if app.playing { THEME.accent } else { THEME.text_mute }),
         );
     });
+    let mut scrub_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(scrub_row.shrink2(Vec2::new(8.0, 2.0)))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    if let Some(frame) = transport_scrub(&mut scrub_ui, app.playhead, end) {
+        app.playhead = frame;
+        app.preview_scrub = true;
+        app.halt_transport();
+    }
 }
 
 fn header_row(

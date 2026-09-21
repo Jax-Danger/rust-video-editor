@@ -21,7 +21,7 @@ const PREVIEW_MAX_W: u32 = 960;
 const PREVIEW_MAX_H: u32 = 540;
 const PLAY_BURST: u32 = 12;
 const SCRUB_BURST: u32 = 8;
-const SCRUB_H: f32 = 36.0;
+const SCRUB_H: f32 = 32.0;
 
 pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
     let Some(sequence) = app.session.project().active().cloned() else {
@@ -253,8 +253,11 @@ fn follow_viewer_scrub(ui: &egui::Ui, app: &mut MeridianApp) {
     let (Some(pos), Some(bar)) = (pos, app.viewer_bar) else {
         return;
     };
-    let span = bar.width().max(1.0);
-    let t = ((pos.x - bar.min.x) / span).clamp(0.0, 1.0);
+    // The painted track starts after the "Scrub" label. Match program_scrubber.
+    let track_left = bar.left() + 58.0;
+    let track_right = bar.right() - 16.0;
+    let span = (track_right - track_left).max(1.0);
+    let t = ((pos.x - track_left) / span).clamp(0.0, 1.0);
     let end = app.viewer_bar_end.max(0);
     app.playhead = if end == 0 {
         0
@@ -268,13 +271,23 @@ fn follow_viewer_scrub(ui: &egui::Ui, app: &mut MeridianApp) {
 fn program_scrubber(ui: &mut egui::Ui, app: &mut MeridianApp, end: i64) {
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), SCRUB_H), Sense::click_and_drag());
-    let bar = rect.shrink2(Vec2::new(16.0, 14.0));
-    app.viewer_bar = Some(bar);
+    let bar = Rect::from_min_max(
+        Pos2::new(rect.left() + 58.0, rect.center().y - 6.0),
+        Pos2::new(rect.right() - 16.0, rect.center().y + 6.0),
+    );
+    app.viewer_bar = Some(rect);
     app.viewer_bar_end = end.max(0);
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, THEME.header);
     painter.hline(rect.x_range(), rect.top(), Stroke::new(1.0_f32, THEME.hairline));
-    painter.rect_filled(bar, 2.0, THEME.inset);
+    painter.text(
+        Pos2::new(rect.left() + 10.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        "Scrub",
+        FontId::proportional(11.0),
+        THEME.text_mute,
+    );
+    painter.rect_filled(bar, 3.0, THEME.inset);
     if let Some(sequence) = app.session.project().active() {
         if let (Some(inn), Some(out)) = (sequence.in_point, sequence.out_point) {
             if end > 0 {
@@ -302,13 +315,18 @@ fn program_scrubber(ui: &mut egui::Ui, app: &mut MeridianApp, end: i64) {
         2.0,
         Color32::from_white_alpha(28),
     );
-    painter.vline(x, bar.y_range(), Stroke::new(2.0_f32, THEME.playhead));
+    painter.vline(x, bar.y_range().expand(3.0), Stroke::new(2.0_f32, THEME.playhead));
+    painter.circle_filled(Pos2::new(x, bar.center().y), 6.0, THEME.playhead);
     if response.hovered() || response.dragged() {
         response.clone().on_hover_cursor(egui::CursorIcon::PointingHand);
+        response.clone().on_hover_text("Drag to scrub the program");
     }
-    if response.is_pointer_button_down_on() {
+    let pointer = ui.input(|input| input.pointer.interact_pos());
+    let pointer_down = ui.input(|input| input.pointer.primary_down());
+    let over = pointer.is_some_and(|pos| rect.contains(pos)) && pointer_down;
+    if over || response.is_pointer_button_down_on() {
         app.scrub = Some(ScrubSource::Viewer);
-        if let Some(pos) = response.interact_pointer_pos() {
+        if let Some(pos) = pointer.or(response.interact_pointer_pos()) {
             let span = bar.width().max(1.0);
             let local = ((pos.x - bar.min.x) / span).clamp(0.0, 1.0);
             app.playhead = if end <= 0 {
