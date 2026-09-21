@@ -1,7 +1,7 @@
 use editor_core::MediaId;
 use egui::{pos2, Align2, Color32, FontId, Id, Rect, RichText, Sense, Stroke, Vec2};
 
-use crate::app::{open_import, MeridianApp};
+use crate::app::MeridianApp;
 use crate::theme::THEME;
 use crate::ui::format_tc;
 use crate::ui::widgets;
@@ -9,7 +9,7 @@ use crate::ui::widgets;
 pub fn media_pool(ui: &mut egui::Ui, app: &mut MeridianApp) {
     widgets::panel_header(ui, "Media Pool", |ui| {
         if widgets::ghost_button(ui, "Import") {
-            open_import(app);
+            app.import_dialog();
         }
     });
 
@@ -42,7 +42,20 @@ pub fn media_pool(ui: &mut egui::Ui, app: &mut MeridianApp) {
         })
         .collect();
 
-    if bins.is_empty() && media.is_empty() {
+    let dropping = ui.input(|input| !input.raw.hovered_files.is_empty());
+    if dropping {
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 36.0), Sense::hover());
+        ui.painter().rect_filled(rect, 3.0, THEME.accent_dim);
+        ui.painter().text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "Drop to import",
+            FontId::new(12.0, egui::FontFamily::Proportional),
+            THEME.accent,
+        );
+    }
+
+    if media.is_empty() {
         ui.add_space(12.0);
         ui.label(
             RichText::new("The pool is empty.")
@@ -51,7 +64,7 @@ pub fn media_pool(ui: &mut egui::Ui, app: &mut MeridianApp) {
         );
         widgets::empty_note(
             ui,
-            "Import a file, then Overwrite or Insert it onto the timeline.",
+            "File → Import, Ctrl+I, or drop video, audio, or stills here. Then double-click, drag onto the timeline, or press Overwrite / Insert.",
         );
         return;
     }
@@ -149,7 +162,7 @@ fn media_row(
 ) {
     let selected = app.selected_media == Some(id);
     let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::click());
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::click_and_drag());
     let painter = ui.painter();
     if selected {
         painter.rect_filled(rect, 0.0, THEME.accent_dim);
@@ -206,11 +219,22 @@ fn media_row(
         FontId::new(12.5, egui::FontFamily::Proportional),
         THEME.text,
     );
-    let meta = match (width, height) {
-        (Some(w), Some(h)) if w > 0 => {
-            format!("{kind}   {w}×{h}   {}", format_tc(duration, timebase))
+    let path = app
+        .session
+        .project()
+        .media(id)
+        .map(|media| media.path.clone())
+        .unwrap_or_default();
+    let missing = offline || super::media_missing(&path);
+    let meta = if missing {
+        "Offline — file is not on disk".to_string()
+    } else {
+        match (width, height) {
+            (Some(w), Some(h)) if w > 0 => {
+                format!("{kind}   {w}×{h}   {}", format_tc(duration, timebase))
+            }
+            _ => format!("{kind}   {}", format_tc(duration, timebase)),
         }
-        _ => format!("{kind}   {}", format_tc(duration, timebase)),
     };
     painter.text(
         pos2(thumb.right() + 8.0, rect.top() + 23.0),
@@ -219,7 +243,7 @@ fn media_row(
         FontId::new(10.5, egui::FontFamily::Proportional),
         THEME.text_mute,
     );
-    if offline {
+    if missing {
         let pill = Rect::from_min_size(
             pos2(rect.right() - 58.0, rect.top() + 12.0),
             Vec2::new(48.0, 16.0),
@@ -239,11 +263,21 @@ fn media_row(
         );
     }
 
-    if response.clicked() {
+    if response.drag_started() {
+        app.dragging_media = Some(id);
+        app.selected_media = Some(id);
+        app.status = "Drop on the timeline. Shift inserts instead of overwriting.".into();
+    } else if response.clicked() {
         app.selected_media = Some(id);
     }
     if response.double_clicked() {
         app.selected_media = Some(id);
+        app.dragging_media = None;
         app.place_selected_media(false);
+    }
+    if missing {
+        if let Some(path) = app.session.project().media(id).map(|media| media.path.clone()) {
+            response.on_hover_text(format!("Offline — {path}"));
+        }
     }
 }

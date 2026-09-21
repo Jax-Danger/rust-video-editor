@@ -18,7 +18,9 @@ egui = "0.31.1"
 editor-core = { path = "../editor-core" }
 editor-media = { path = "../editor-media" }
 serde_json = { workspace = true }
+rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
+rodio = { version = "0.22", optional = true, default-features = false, features = ["playback"] }
 
 [features]
 default = []
-ffmpeg = ["editor-media/ffmpeg"]
+ffmpeg = ["editor-media/ffmpeg", "dep:rodio"]

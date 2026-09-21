@@ -1,11 +1,14 @@
 //! Timeline: ruler, track headers, clip lanes, transport.
 
-use editor_core::{
-    collect_snap_points, expand_linked, snap_span, ClipId, Frame, TrackFlag, TrackKind, TrimEdge,
-};
-use egui::{pos2, Align2, Color32, CursorIcon, FontId, Rect, Sense, Shape, Stroke, Vec2};
+use std::collections::HashSet;
 
-use crate::app::{note_track_flag, Drag, DragKind, MeridianApp, Tool};
+use editor_core::{
+    collect_snap_points, expand_linked, snap_span, ClipId, Frame, MediaId, TrackFlag, TrackKind,
+    TrimEdge,
+};
+use egui::{pos2, Align2, Color32, CursorIcon, FontId, Id, Rect, Sense, Shape, Stroke, Vec2};
+
+use crate::app::{note_track_flag, Drag, DragKind, MeridianApp, ScrubSource, Tool};
 use crate::theme::{self, THEME};
 use crate::ui::format_tc;
 use crate::ui::widgets;
@@ -24,8 +27,11 @@ pub fn timeline_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
     let visual = sequence.visual_track_indices();
     let end = (sequence.end_frame().0 + 48).max(app.playhead + 24).max(96);
     let content_w = (end as f32 * app.pixels_per_frame).max(400.0);
+    let offline = offline_media(app);
+    let body_h = ui.available_height();
 
     ui.horizontal(|ui| {
+        ui.set_min_height(body_h);
         ui.vertical(|ui| {
             ui.set_width(HEADER_W);
             ui.allocate_exact_size(Vec2::new(HEADER_W, RULER_H), Sense::hover());
@@ -33,63 +39,204 @@ pub fn timeline_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
                 header_row(ui, app, &sequence, *index);
             }
         });
-        let scroll = egui::ScrollArea::horizontal()
-            .id_salt("timeline_body")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.vertical(|ui| {
-                    app.timeline_width = ui.available_width().max(app.timeline_width);
-                    ruler(ui, app, &sequence, content_w, end);
-                    for index in &visual {
-                        lane(ui, app, &sequence, *index, content_w);
-                    }
-                });
-            });
-        let _ = scroll;
+        let body_w = (ui.available_width() - 4.0).max(80.0);
+        ui.allocate_ui_with_layout(
+            Vec2::new(body_w, body_h),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                nudge_timeline_scroll(ui, app);
+                let output = egui::ScrollArea::horizontal()
+                    .id_salt("timeline_body")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.vertical(|ui| {
+                            app.timeline_width = content_w;
+                            ruler(ui, app, &sequence, content_w, end);
+                            for index in &visual {
+                                lane(ui, app, &sequence, *index, content_w, &offline);
+                            }
+                        });
+                    });
+                app.timeline_view = Some(output.inner_rect);
+            },
+        );
     });
+    follow_ruler_scrub(ui, app);
+}
+
+fn timeline_scroll_id(ui: &egui::Ui) -> Id {
+    ui.make_persistent_id(Id::new("timeline_body"))
+}
+
+fn nudge_timeline_scroll(ui: &egui::Ui, app: &mut MeridianApp) {
+    let Some(view) = app.timeline_view else {
+        return;
+    };
+    let pointer = ui.input(|input| input.pointer.hover_pos());
+    let Some(pointer) = pointer else {
+        return;
+    };
+    if !view.contains(pointer) {
+        return;
+    }
+    let (dx, dy, zoom, command) = ui.input(|input| {
+        (
+            input.smooth_scroll_delta.x,
+            input.smooth_scroll_delta.y,
+            input.zoom_delta(),
+            input.modifiers.command || input.modifiers.ctrl,
+        )
+    });
+    let scrolling = dx.abs() + dy.abs() > 0.0;
+    let zooming = (zoom - 1.0).abs() > 0.01 || (command && dy.abs() > 0.0);
+    if !scrolling && !zooming {
+        return;
+    }
+    ui.input_mut(|input| input.smooth_scroll_delta = Vec2::ZERO);
+    let id = timeline_scroll_id(ui);
+    let Some(mut state) = egui::scroll_area::State::load(ui.ctx(), id) else {
+        return;
+    };
+    if zooming {
+        let factor = if (zoom - 1.0).abs() > 0.01 {
+            zoom
+        } else {
+            (dy * 0.0016).exp()
+        };
+        let old = app.pixels_per_frame;
+        let new = (old * factor).clamp(0.2, 64.0);
+        let content_x = state.offset.x + (pointer.x - view.min.x);
+        let frame = if old > 0.0 { content_x / old } else { 0.0 };
+        state.offset.x = (frame * new - (pointer.x - view.min.x)).max(0.0);
+        app.pixels_per_frame = new;
+    } else {
+        state.offset.x = (state.offset.x - (dx + dy)).max(0.0);
+    }
+    state.store(ui.ctx(), id);
+}
+
+fn ruler_visible(app: &MeridianApp) -> Option<Rect> {
+    let ruler = app.ruler_rect?;
+    let Some(view) = app.timeline_view else {
+        return Some(ruler);
+    };
+    Some(Rect::from_min_max(
+        pos2(view.min.x.max(ruler.min.x), ruler.min.y),
+        pos2(view.max.x.min(ruler.max.x), ruler.max.y),
+    ))
+}
+
+fn offline_media(app: &MeridianApp) -> HashSet<MediaId> {
+    app.session
+        .project()
+        .media
+        .iter()
+        .filter(|media| super::media_missing(&media.path))
+        .map(|media| media.id)
+        .collect()
+}
+
+fn follow_ruler_scrub(ui: &egui::Ui, app: &mut MeridianApp) {
+    let (down, pressed, pos) = ui.input(|input| {
+        (
+            input.pointer.primary_down(),
+            input.pointer.primary_pressed(),
+            input.pointer.interact_pos(),
+        )
+    });
+    if pressed {
+        if let Some(pos) = pos {
+            if ruler_visible(app).is_some_and(|ruler| ruler.contains(pos)) {
+                app.scrub = Some(ScrubSource::Ruler);
+            }
+        }
+    }
+    if !down {
+        if app.scrub == Some(ScrubSource::Ruler) {
+            app.scrub = None;
+        }
+        return;
+    }
+    if app.scrub != Some(ScrubSource::Ruler) {
+        return;
+    }
+    let (Some(pos), Some(ruler)) = (pos, app.ruler_rect) else {
+        return;
+    };
+    app.playhead = x_to_frame(pos.x, ruler.min.x, app.pixels_per_frame).max(0);
+    app.preview_scrub = true;
+    app.halt_transport();
+}
+
+fn transport_scrub(ui: &mut egui::Ui, playhead: i64, end: i64) -> Option<i64> {
+    let width = ui.available_width().max(80.0);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 22.0), Sense::click_and_drag());
+    let track = Rect::from_center_size(rect.center(), Vec2::new(rect.width(), 6.0));
+    let painter = ui.painter();
+    painter.rect_filled(track, 3.0, THEME.inset);
+    let span = end.max(1) as f32;
+    let t = (playhead as f32 / span).clamp(0.0, 1.0);
+    let x = track.left() + track.width() * t;
+    painter.rect_filled(
+        Rect::from_min_max(track.min, pos2(x, track.bottom())),
+        3.0,
+        THEME.accent_dim,
+    );
+    painter.circle_filled(pos2(x, track.center().y), 6.0, THEME.playhead);
+    if response.hovered() || response.dragged() {
+        response.clone().on_hover_cursor(CursorIcon::PointingHand);
+        response.clone().on_hover_text("Drag to scrub");
+    }
+    if !(response.dragged() || response.clicked()) {
+        return None;
+    }
+    let pos = response.interact_pointer_pos()?;
+    let nt = ((pos.x - track.left()) / track.width().max(1.0)).clamp(0.0, 1.0);
+    Some((nt * end.max(0) as f32).round() as i64)
 }
 
 fn transport(ui: &mut egui::Ui, app: &mut MeridianApp) {
     let timebase = app.timebase();
     let end = app.sequence_end();
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 64.0), Sense::hover());
     ui.painter().rect_filled(rect, 0.0, THEME.header);
     ui.painter().hline(
         rect.x_range(),
         rect.bottom(),
         Stroke::new(1.0_f32, THEME.hairline),
     );
+    let controls = Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + 38.0));
+    let scrub_row = Rect::from_min_max(pos2(rect.left(), rect.top() + 38.0), rect.max);
     let mut bar = ui.new_child(
         egui::UiBuilder::new()
-            .max_rect(rect.shrink2(Vec2::new(8.0, 6.0)))
+            .max_rect(controls.shrink2(Vec2::new(8.0, 4.0)))
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     bar.spacing_mut().item_spacing.x = 4.0;
     if widgets::transport_glyph(&mut bar, "Go to start", widgets::bar_left) {
         app.playhead = 0;
-        app.playing = false;
+        app.halt_transport();
+        app.reveal_playhead = true;
     }
     if widgets::transport_glyph(&mut bar, "Step back", widgets::tri_left) {
-        app.playhead = (app.playhead - 1).max(0);
-        app.playing = false;
+        app.step_playhead(-1);
     }
     if widgets::play_button(&mut bar, app.playing) {
-        app.playing = !app.playing;
-        app.play_accum = 0.0;
+        app.toggle_play();
     }
     if widgets::transport_glyph(&mut bar, "Step forward", widgets::tri_right) {
-        app.playhead += 1;
-        app.playing = false;
+        app.step_playhead(1);
     }
     if widgets::transport_glyph(&mut bar, "Go to end", widgets::bar_right) {
         app.playhead = end;
-        app.playing = false;
+        app.halt_transport();
+        app.reveal_playhead = true;
     }
     bar.add_space(10.0);
     widgets::readout(&mut bar, &format_tc(app.playhead, timebase), 118.0, true);
     bar.add_space(4.0);
     widgets::readout(&mut bar, &format_tc(end, timebase), 118.0, false);
-    bar.add_space(12.0);
+    bar.add_space(8.0);
     let (inn, out) = app
         .session
         .project()
@@ -115,15 +262,36 @@ fn transport(ui: &mut egui::Ui, app: &mut MeridianApp) {
             app.zoom_to_fit();
         }
         if widgets::ghost_button(ui, "+") {
-            app.pixels_per_frame = (app.pixels_per_frame * 1.25).min(24.0);
+            app.zoom_by(1.25);
         }
-        if let Some(zoom) = widgets::mini_slider(ui, app.pixels_per_frame, 0.35..=24.0) {
+        if let Some(zoom) = widgets::mini_slider(ui, app.pixels_per_frame, 0.2..=64.0) {
             app.pixels_per_frame = zoom;
         }
         if widgets::ghost_button(ui, "−") {
-            app.pixels_per_frame = (app.pixels_per_frame / 1.25).max(0.35);
+            app.zoom_by(1.0 / 1.25);
         }
+        let rate = if app.playing {
+            format!("{}×", app.play_rate)
+        } else {
+            "Stop".into()
+        };
+        ui.label(
+            egui::RichText::new(rate)
+                .size(11.0)
+                .monospace()
+                .color(if app.playing { THEME.accent } else { THEME.text_mute }),
+        );
     });
+    let mut scrub_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(scrub_row.shrink2(Vec2::new(8.0, 2.0)))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    if let Some(frame) = transport_scrub(&mut scrub_ui, app.playhead, end) {
+        app.playhead = frame;
+        app.preview_scrub = true;
+        app.halt_transport();
+    }
 }
 
 fn header_row(
@@ -179,6 +347,7 @@ fn ruler(
 ) {
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(content_w, RULER_H), Sense::click_and_drag());
+    app.ruler_rect = Some(rect);
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, theme::RULER);
     painter.hline(
@@ -245,11 +414,19 @@ fn ruler(
             Stroke::NONE,
         ));
     }
-    if response.dragged() || response.clicked() {
+    if response.is_pointer_button_down_on() {
+        app.scrub = Some(ScrubSource::Ruler);
         if let Some(pos) = response.interact_pointer_pos() {
             app.playhead = x_to_frame(pos.x, rect.min.x, ppf).max(0);
-            app.playing = false;
+            app.preview_scrub = true;
+            app.halt_transport();
         }
+    }
+    if app.reveal_playhead {
+        let x = rect.min.x + app.playhead as f32 * ppf;
+        let target = Rect::from_center_size(pos2(x, rect.center().y), Vec2::new(48.0, rect.height()));
+        ui.scroll_to_rect(target, None);
+        app.reveal_playhead = false;
     }
     paint_playhead(&painter, rect, app.playhead, ppf);
 }
@@ -260,6 +437,7 @@ fn lane(
     sequence: &editor_core::Sequence,
     index: usize,
     content_w: f32,
+    offline: &HashSet<MediaId>,
 ) {
     let track = &sequence.tracks[index];
     let (rect, response) =
@@ -302,6 +480,7 @@ fn lane(
         );
         let selected = app.selected.contains(&clip.id);
         let fill = theme::label_fill(clip.label, track.kind);
+        let clip_offline = clip.media_id.is_some_and(|id| offline.contains(&id));
         paint_clip_body(
             &painter,
             crect,
@@ -309,6 +488,16 @@ fn lane(
             selected,
             track.kind == TrackKind::Audio,
         );
+        if clip_offline {
+            painter.rect_filled(crect, 3.0, Color32::from_black_alpha(90));
+            painter.text(
+                crect.right_center() - Vec2::new(8.0, 0.0),
+                Align2::RIGHT_CENTER,
+                "Offline",
+                FontId::new(10.0, egui::FontFamily::Proportional),
+                THEME.amber,
+            );
+        }
         painter.with_clip_rect(crect.shrink(4.0)).text(
             crect.left_center() + Vec2::new(7.0, 0.0),
             Align2::LEFT_CENTER,
@@ -365,7 +554,7 @@ fn lane(
         if let Some(pos) = response.interact_pointer_pos() {
             let frame = x_to_frame(pos.x, rect.min.x, ppf).max(0);
             if let Some(hit) = hit_test(track, rect, pos, ppf) {
-                select_clip(app, sequence, hit.clip_id, false);
+                select_clip(app, sequence, hit.clip_id, false, false);
                 if let Some(clip) = track.clips.iter().find(|c| c.id == hit.clip_id) {
                     let kind = drag_kind(app.tool, hit.edge);
                     app.drag = Some(Drag {
@@ -382,7 +571,8 @@ fn lane(
             } else {
                 app.selected.clear();
                 app.playhead = frame;
-                app.playing = false;
+                app.halt_transport();
+                app.preview_scrub = true;
             }
         }
     } else if let Some(pos) = response.interact_pointer_pos() {
@@ -402,13 +592,38 @@ fn lane(
     } else if response.clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
             if let Some(hit) = hit_test(track, rect, pos, ppf) {
-                select_clip(app, sequence, hit.clip_id, ui.input(|i| i.modifiers.shift));
-            } else {
+                let shift = ui.input(|i| i.modifiers.shift);
+                let toggle = ui.input(|i| i.modifiers.command);
+                select_clip(app, sequence, hit.clip_id, shift, toggle);
+            } else if app.dragging_media.is_none() {
                 app.playhead = x_to_frame(pos.x, rect.min.x, ppf).max(0);
-                app.playing = false;
+                app.halt_transport();
+                app.preview_scrub = true;
                 if !ui.input(|i| i.modifiers.shift) {
                     app.selected.clear();
                 }
+            }
+        }
+    }
+
+    if ui.input(|i| i.pointer.any_released()) {
+        if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+            if rect.contains(pos) {
+                if let Some(id) = app.dragging_media.take() {
+                    let frame = x_to_frame(pos.x, rect.min.x, ppf).max(0);
+                    app.selected_media = Some(id);
+                    app.playhead = frame;
+                    app.halt_transport();
+                    let insert = ui.input(|i| i.modifiers.shift);
+                    app.place_selected_media(insert);
+                }
+            }
+        }
+    }
+    if app.dragging_media.is_some() {
+        if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+            if rect.contains(pos) {
+                painter.rect_filled(rect, 0.0, Color32::from_white_alpha(16));
             }
         }
     }
@@ -508,13 +723,30 @@ fn hit_test(track: &editor_core::Track, rect: Rect, pos: egui::Pos2, ppf: f32) -
     None
 }
 
-fn select_clip(app: &mut MeridianApp, sequence: &editor_core::Sequence, id: ClipId, extend: bool) {
+fn select_clip(
+    app: &mut MeridianApp,
+    sequence: &editor_core::Sequence,
+    id: ClipId,
+    extend: bool,
+    toggle: bool,
+) {
     let group = if app.linked_selection {
         expand_linked(sequence, &[id])
     } else {
         vec![id]
     };
-    if extend {
+    if toggle {
+        let removing = group.iter().all(|id| app.selected.contains(id));
+        if removing {
+            app.selected.retain(|id| !group.contains(id));
+        } else {
+            for id in group {
+                if !app.selected.contains(&id) {
+                    app.selected.push(id);
+                }
+            }
+        }
+    } else if extend {
         for id in group {
             if !app.selected.contains(&id) {
                 app.selected.push(id);
@@ -527,7 +759,7 @@ fn select_clip(app: &mut MeridianApp, sequence: &editor_core::Sequence, id: Clip
 
 fn razor_at(app: &mut MeridianApp, track: &editor_core::Track, frame: i64) {
     app.playhead = frame;
-    app.playing = false;
+    app.halt_transport();
     if let Some(clip) = track.clips.iter().find(|c| c.contains_frame(Frame(frame))) {
         match app.session.razor_clip(clip.id, Frame(frame)) {
             Ok(()) => app.status = "Split clip.".into(),

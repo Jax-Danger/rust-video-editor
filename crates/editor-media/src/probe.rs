@@ -42,14 +42,18 @@ pub enum ProbeError {
 ///
 /// With the `ffmpeg` feature this runs `ffprobe`. Otherwise it uses the stub.
 pub fn probe(path: &Path) -> Result<ProbeResult, ProbeError> {
-    #[cfg(feature = "ffmpeg")]
-    {
-        probe_ffprobe(path)
-    }
-    #[cfg(not(feature = "ffmpeg"))]
-    {
-        probe_stub(path)
-    }
+    let mut result = {
+        #[cfg(feature = "ffmpeg")]
+        {
+            probe_ffprobe(path)?
+        }
+        #[cfg(not(feature = "ffmpeg"))]
+        {
+            probe_stub(path)?
+        }
+    };
+    apply_still_hold(&mut result, path);
+    Ok(result)
 }
 
 pub fn probe_stub(path: &Path) -> Result<ProbeResult, ProbeError> {
@@ -299,10 +303,10 @@ fn classify(ext: &str) -> (bool, bool, Option<String>, Option<String>) {
             ),
             Some("aac".into()),
         ),
-        "wav" | "aif" | "aiff" | "mp3" | "flac" | "m4a" | "aac" => {
+        "wav" | "aif" | "aiff" | "mp3" | "flac" | "m4a" | "aac" | "ogg" => {
             (false, true, None, Some(ext.into()))
         }
-        "png" | "jpg" | "jpeg" | "tif" | "tiff" | "exr" | "dpx" => {
+        "png" | "jpg" | "jpeg" | "tif" | "tiff" | "exr" | "dpx" | "webp" | "bmp" | "gif" => {
             (true, false, Some(ext.into()), None)
         }
         _ => (true, true, Some("h264".into()), Some("aac".into())),
@@ -310,7 +314,30 @@ fn classify(ext: &str) -> (bool, bool, Option<String>, Option<String>) {
 }
 
 fn is_still(ext: &str) -> bool {
-    matches!(ext, "png" | "jpg" | "jpeg" | "tif" | "tiff" | "exr" | "dpx")
+    matches!(
+        ext,
+        "png" | "jpg" | "jpeg" | "tif" | "tiff" | "exr" | "dpx" | "webp" | "bmp" | "gif"
+    )
+}
+
+/// Stills from ffprobe often report a single frame or no duration. Hold them
+/// for five seconds so they can be cut onto a timeline.
+pub fn apply_still_hold(result: &mut ProbeResult, path: &Path) {
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !is_still(&ext) {
+        return;
+    }
+    if result.duration.to_seconds() < 5.0 {
+        let timebase = Timebase::fps_24();
+        result.duration = MediaTime::from_frames(timebase.timecode_fps() * 5, timebase);
+        result.timebase = Some(timebase);
+    }
+    result.has_video = true;
+    result.has_audio = false;
 }
 
 fn infer_timebase(name: &str, ext: &str, has_video: bool) -> Timebase {
@@ -441,5 +468,28 @@ mod tests {
     #[test]
     fn empty_path_errors() {
         assert_eq!(probe_stub(Path::new("")), Err(ProbeError::EmptyPath));
+    }
+
+    #[test]
+    fn still_hold_extends_a_single_frame_image() {
+        let mut result = parse_ffprobe_json(
+            r#"
+            {
+              "streams": [{
+                "codec_type": "video",
+                "codec_name": "png",
+                "width": 640,
+                "height": 360,
+                "r_frame_rate": "25/1"
+              }],
+              "format": { "duration": "0.040000" }
+            }
+            "#,
+        )
+        .unwrap();
+        apply_still_hold(&mut result, Path::new("slate.png"));
+        assert_eq!(result.duration.to_frame_count(Timebase::fps_24()), 24 * 5);
+        assert!(result.has_video);
+        assert!(!result.has_audio);
     }
 }

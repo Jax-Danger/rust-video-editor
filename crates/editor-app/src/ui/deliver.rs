@@ -90,7 +90,9 @@ pub fn deliver_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
             widgets::section_label(ui, "Output");
             ui.add_space(8.0);
             ui.label(RichText::new("Manifest path").size(11.0).color(THEME.text_mute));
-            ui.add(TextEdit::singleline(&mut app.deliver.output_path).desired_width(520.0));
+            let response =
+                ui.add(TextEdit::singleline(&mut app.deliver.output_path).desired_width(520.0));
+            app.note_text_focus(&response);
             ui.add_space(12.0);
             if widgets::action_button(ui, "Write Manifest", true) {
                 app.export_manifest();

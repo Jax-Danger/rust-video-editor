@@ -1939,4 +1939,44 @@ mod tests {
         };
         assert_eq!(kind.label(), "Push");
     }
+
+    #[test]
+    fn imported_media_path_survives_project_json() {
+        use crate::model::{Bin, BinId, MediaAsset, MediaId};
+
+        let mut project = Project::new("import");
+        let bin = BinId(project.alloc());
+        project.bins.push(Bin {
+            id: bin,
+            name: "Master".into(),
+            parent: None,
+        });
+        let asset = MediaAsset {
+            id: MediaId(0),
+            bin_id: BinId(0),
+            name: "interview.mp4".into(),
+            path: "/home/editor/footage/interview.mp4".into(),
+            duration: Frame(240),
+            timebase: Timebase::fps_24(),
+            width: Some(1920),
+            height: Some(1080),
+            video_codec: Some("h264".into()),
+            audio_codec: Some("aac".into()),
+            audio_channels: Some(2),
+            sample_rate: Some(48_000),
+            has_video: true,
+            has_audio: true,
+            offline: false,
+        };
+        let id = import_media(&mut project, asset);
+        let json = project.to_json_pretty().unwrap();
+        let loaded = Project::from_json(&json).unwrap();
+        let media = loaded.media(id).unwrap();
+        assert_eq!(media.path, "/home/editor/footage/interview.mp4");
+        assert_eq!(media.name, "interview.mp4");
+        assert_eq!(media.bin_id, bin);
+        assert!(media.has_video && media.has_audio);
+        assert!(!media.offline);
+        assert_eq!(media.duration, Frame(240));
+    }
 }
