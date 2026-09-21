@@ -24,3 +24,5 @@ rodio = { version = "0.22", optional = true, default-features = false, features 
 [features]
 default = []
 ffmpeg = ["editor-media/ffmpeg", "dep:rodio"]
+# Local Whisper captions. Implies ffmpeg so audio can be extracted for the model.
+whisper = ["ffmpeg", "editor-media/whisper"]

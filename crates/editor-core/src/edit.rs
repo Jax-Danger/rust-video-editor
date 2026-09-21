@@ -841,6 +841,21 @@ pub fn set_transform_at(
     })
 }
 
+pub fn set_clip_volume(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    clip_id: ClipId,
+    volume: f32,
+) -> Result<(), EditError> {
+    map_sequence(project, sequence_id, |sequence, _alloc| {
+        let (ti, ci) = sequence
+            .locate_clip(clip_id)
+            .ok_or(EditError::ClipNotFound)?;
+        sequence.tracks[ti].clips[ci].volume = volume.clamp(0.0, 4.0);
+        Ok(())
+    })
+}
+
 pub fn toggle_grade_key(
     project: &mut Project,
     sequence_id: SequenceId,
@@ -1096,6 +1111,7 @@ pub fn clip_from_media(
         } else {
             crate::model::LabelColor::Green
         },
+        volume: 1.0,
     })
 }
 

@@ -9,13 +9,30 @@ const CODECS: &[&str] = &["H.264", "H.265", "ProRes 422", "ProRes 4444", "DNxHR 
 const CONTAINERS: &[&str] = &["mp4", "mov", "mxf"];
 
 pub fn deliver_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
-    widgets::panel_header(ui, "Deliver", |_| {});
+    let running = app.export_running();
+    widgets::panel_header(ui, "Deliver", |ui| {
+        if running && widgets::ghost_button(ui, "Cancel") {
+            app.cancel_export();
+        }
+        if widgets::action_button(ui, "Export", !running) {
+            app.start_export();
+        }
+    });
     let sequence = app.session.project().active().cloned();
     let Some(sequence) = sequence else {
         widgets::empty_note(ui, "Open a sequence before delivering.");
         return;
     };
 
+    egui::ScrollArea::vertical()
+        .id_salt("deliver_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            deliver_body(ui, app, &sequence);
+        });
+}
+
+fn deliver_body(ui: &mut egui::Ui, app: &mut MeridianApp, sequence: &editor_core::Sequence) {
     ui.add_space(18.0);
     ui.horizontal(|ui| {
         ui.add_space((ui.available_width() - 560.0).max(24.0) * 0.5);
@@ -49,7 +66,7 @@ pub fn deliver_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
             ui.add_space(8.0);
             ui.label(
                 RichText::new(
-                    "Write a manifest for this sequence. Picture encoding is not linked in this build — the file is what a later encoder consumes.",
+                    "Export encodes this sequence with ffmpeg: top-to-bottom picture, grade and transform, audio gain, and captions. H.264 / AAC in an mp4 is the tested path.",
                 )
                 .size(12.5)
                 .color(THEME.text_dim),
@@ -85,17 +102,26 @@ pub fn deliver_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
             });
             ui.add_space(6.0);
             ui.checkbox(&mut app.deliver.use_in_out, "Limit to the marked in and out");
+            ui.checkbox(&mut app.deliver.burn_captions, "Burn captions into the picture");
 
             ui.add_space(12.0);
             widgets::section_label(ui, "Output");
             ui.add_space(8.0);
-            ui.label(RichText::new("Manifest path").size(11.0).color(THEME.text_mute));
+            ui.label(RichText::new("File path").size(11.0).color(THEME.text_mute));
             let response =
                 ui.add(TextEdit::singleline(&mut app.deliver.output_path).desired_width(520.0));
             app.note_text_focus(&response);
             ui.add_space(12.0);
-            if widgets::action_button(ui, "Write Manifest", true) {
-                app.export_manifest();
+            let running = app.export_running();
+            if running || app.deliver.progress > 0.0 {
+                ui.add_space(8.0);
+                let width = ui.available_width().min(520.0);
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 8.0), egui::Sense::hover());
+                ui.painter().rect_filled(rect, 2.0, THEME.header);
+                let fill = rect.shrink2(egui::vec2(0.0, 0.0));
+                let mut done = fill;
+                done.set_width(fill.width() * app.deliver.progress.clamp(0.0, 1.0));
+                ui.painter().rect_filled(done, 2.0, THEME.accent);
             }
             if !app.deliver.report.is_empty() {
                 ui.add_space(10.0);

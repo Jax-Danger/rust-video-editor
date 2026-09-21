@@ -1,5 +1,8 @@
 mod app;
 mod audio;
+#[cfg(all(feature = "ffmpeg", feature = "whisper"))]
+mod caption_job;
+mod composite;
 mod dialogs;
 mod preview;
 mod theme;

@@ -4,10 +4,14 @@
 //! clip is a decoded frame. Otherwise the monitor keeps the graded proxy cards
 //! and explains why picture is missing.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
 use editor_core::{
     clip_relative, color_grade, source_frame_at, transform, ColorGrade, Frame, MediaAsset,
-    Timebase, TrackKind, Transform,
+    TrackKind, Transform,
 };
+use crate::composite::{place_from_transform, BlitLayer, GradeSample, PictureCache, Place};
 use editor_media::{clamp_preview_time, fit_preview_size, resolve_media_path, PreviewBackend};
 use egui::{Color32, FontId, Painter, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 
@@ -37,7 +41,7 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
     let audio_badge = app.audio.badge();
     let audio_status = app.audio.status().to_string();
     let media = app.session.project().media.clone();
-    let source = top_picture(&sequence, playhead, &media);
+    let plan = decode_plan(&sequence, playhead, &media, playing, scrubbing, reverse);
     let backend = app.preview.backend().clone();
 
     let mut banner: Option<String> = None;
@@ -53,36 +57,98 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
             banner = Some(format!("ffmpeg is not available — {message}"));
         }
         PreviewBackend::Cli => {
-            if let Some(source) = &source {
-                if let Some(problem) = &source.problem {
-                    banner = Some(problem.clone());
-                } else {
-                    let query = source.query(playing, scrubbing, reverse);
-                    match app.preview.request(query) {
-                        FrameView::Exact(image) | FrameView::Nearby(image) => {
-                            picture = Some(image);
-                            paint_proxy = false;
-                        }
-                        FrameView::Pending => {
-                            banner = Some("Decoding preview…".into());
-                        }
+            if let Some(problem) = &plan.problem {
+                banner = Some(problem.clone());
+            } else if plan.layers.is_empty() {
+                paint_proxy = true;
+            } else {
+                let mut ready = Vec::new();
+                let mut waiting = false;
+                for layer in &plan.layers {
+                    match app.preview.request(layer.query.clone()) {
+                        FrameView::Exact(image) | FrameView::Nearby(image) => ready.push(image),
+                        FrameView::Pending => waiting = true,
                         FrameView::Failed(message) => banner = Some(message),
                         FrameView::Unavailable => {
                             banner = Some("ffmpeg is not available.".into());
                         }
                     }
-                    if app.preview.busy() {
-                        ui.ctx()
-                            .request_repaint_after(std::time::Duration::from_millis(16));
+                }
+                if banner.is_none() && ready.len() == plan.layers.len() {
+                    let signature = plan.signature(playhead);
+                    if app
+                        .picture_cache
+                        .as_ref()
+                        .is_none_or(|cache| cache.signature != signature)
+                    {
+                        let blits: Vec<BlitLayer<'_>> = ready
+                            .iter()
+                            .zip(plan.layers.iter())
+                            .map(|(image, layer)| BlitLayer {
+                                rgba: &image.rgba,
+                                width: image.width,
+                                height: image.height,
+                                grade: layer.grade,
+                                place: layer.place,
+                            })
+                            .collect();
+                        let rgba = crate::composite::composite(
+                            plan.canvas_w,
+                            plan.canvas_h,
+                            sequence.width as f32,
+                            sequence.height as f32,
+                            &blits,
+                        );
+                        app.picture_cache = Some(PictureCache {
+                            signature,
+                            width: plan.canvas_w,
+                            height: plan.canvas_h,
+                            rgba,
+                        });
                     }
+                    if let Some(cache) = &app.picture_cache {
+                        picture = Some(PreviewImage {
+                            key: crate::preview::FrameKey {
+                                path: format!("composite-{signature}"),
+                                source_frame: playhead,
+                                width: cache.width,
+                                height: cache.height,
+                            },
+                            width: cache.width,
+                            height: cache.height,
+                            rgba: std::sync::Arc::from(cache.rgba.clone().into_boxed_slice()),
+                        });
+                        paint_proxy = false;
+                    }
+                } else if banner.is_none() && waiting {
+                    if let Some(cache) = &app.picture_cache {
+                        picture = Some(PreviewImage {
+                            key: crate::preview::FrameKey {
+                                path: format!("composite-{}", cache.signature),
+                                source_frame: playhead,
+                                width: cache.width,
+                                height: cache.height,
+                            },
+                            width: cache.width,
+                            height: cache.height,
+                            rgba: std::sync::Arc::from(cache.rgba.clone().into_boxed_slice()),
+                        });
+                        paint_proxy = false;
+                    } else {
+                        banner = Some("Decoding preview…".into());
+                    }
+                }
+                if app.preview.busy() || waiting {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(16));
                 }
             }
         }
     }
-    let mode = match (&backend, picture.is_some(), source.as_ref()) {
+    let mode = match (&backend, picture.is_some(), plan.problem.is_some()) {
         (PreviewBackend::Disabled | PreviewBackend::Unavailable(_), _, _) => "Proxy",
-        (_, _, Some(source)) if source.problem.is_some() => "Offline",
-        (PreviewBackend::Cli, _, Some(_)) => "Preview",
+        (_, _, true) => "Offline",
+        (PreviewBackend::Cli, true, _) => "Preview",
         _ => "Empty",
     };
 
@@ -111,11 +177,8 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
         let id = app.preview.texture(ui.ctx(), image);
         (id, image.width, image.height)
     });
-    let opacity = source.as_ref().map(|item| item.opacity).unwrap_or(1.0);
-    let chip = source
-        .as_ref()
-        .filter(|_| picture.is_some())
-        .map(|item| format!("{}  {}", item.track_name, item.clip_name));
+    let opacity = 1.0;
+    let chip = (!plan.chip.is_empty() && picture.is_some()).then(|| plan.chip.clone());
 
     let monitor_h = (ui.available_height() - SCRUB_H).max(48.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), monitor_h), Sense::hover());
@@ -373,160 +436,219 @@ fn audio_meters(ui: &mut egui::Ui, peaks: [f32; 2], badge: &str, status: &str) {
     );
 }
 
-struct PictureSource {
-    track_name: String,
-    clip_name: String,
-    path: String,
-    source_frame: i64,
-    time_secs: f64,
-    frame_secs: f64,
-    width: u32,
-    height: u32,
-    last_source_frame: i64,
-    opacity: f32,
+struct DecodePlan {
+    layers: Vec<DecodedLayer>,
     problem: Option<String>,
+    chip: String,
+    canvas_w: u32,
+    canvas_h: u32,
 }
 
-impl PictureSource {
-    fn query(&self, playing: bool, scrubbing: bool, reverse: bool) -> PreviewQuery {
-        let burst = if playing && !scrubbing {
-            PLAY_BURST
-        } else {
-            SCRUB_BURST
-        };
-        let lead = if scrubbing || reverse { burst / 3 } else { 0 };
-        PreviewQuery {
-            path: self.path.clone(),
-            source_frame: self.source_frame,
-            width: self.width,
-            height: self.height,
-            time_secs: self.time_secs,
-            frame_secs: self.frame_secs,
-            last_source_frame: self.last_source_frame,
-            burst,
-            lead,
+impl DecodePlan {
+    fn signature(&self, playhead: i64) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        playhead.hash(&mut hasher);
+        self.canvas_w.hash(&mut hasher);
+        self.canvas_h.hash(&mut hasher);
+        for layer in &self.layers {
+            layer.query.path.hash(&mut hasher);
+            layer.query.source_frame.hash(&mut hasher);
+            layer.query.width.hash(&mut hasher);
+            layer.query.height.hash(&mut hasher);
+            bits(layer.grade.exposure).hash(&mut hasher);
+            bits(layer.grade.contrast).hash(&mut hasher);
+            bits(layer.grade.highlights).hash(&mut hasher);
+            bits(layer.grade.shadows).hash(&mut hasher);
+            bits(layer.grade.temperature).hash(&mut hasher);
+            bits(layer.grade.tint).hash(&mut hasher);
+            bits(layer.grade.saturation).hash(&mut hasher);
+            bits(layer.place.scale_x).hash(&mut hasher);
+            bits(layer.place.scale_y).hash(&mut hasher);
+            bits(layer.place.pos_x).hash(&mut hasher);
+            bits(layer.place.pos_y).hash(&mut hasher);
+            bits(layer.place.rotation).hash(&mut hasher);
+            bits(layer.place.opacity).hash(&mut hasher);
+            bits(layer.place.clip_u0).hash(&mut hasher);
+            bits(layer.place.clip_u1).hash(&mut hasher);
+            bits(layer.place.shift_x).hash(&mut hasher);
+            layer.label.hash(&mut hasher);
         }
+        hasher.finish()
     }
 }
 
-fn top_picture(
+struct DecodedLayer {
+    query: PreviewQuery,
+    grade: GradeSample,
+    place: Place,
+    label: String,
+}
+
+fn bits(value: f32) -> u32 {
+    value.to_bits()
+}
+
+fn decode_plan(
     sequence: &editor_core::Sequence,
     playhead: i64,
     media: &[MediaAsset],
-) -> Option<PictureSource> {
-    let video: Vec<_> = sequence
+    playing: bool,
+    scrubbing: bool,
+    reverse: bool,
+) -> DecodePlan {
+    let (canvas_w, canvas_h) =
+        fit_preview_size(sequence.width.max(2), sequence.height.max(2), PREVIEW_MAX_W, PREVIEW_MAX_H)
+            .unwrap_or((PREVIEW_MAX_W, PREVIEW_MAX_H));
+    let mut layers = Vec::new();
+    let mut problem = None;
+    let mut chip = String::new();
+    for track in sequence
         .tracks
         .iter()
-        .filter(|track| track.kind == TrackKind::Video)
-        .collect();
-    for track in video.into_iter().rev() {
-        if !track_visible(track, &sequence.tracks) {
-            continue;
-        }
-        let Some(clip) = track
+        .filter(|track| track.kind == TrackKind::Video && track_visible(track, &sequence.tracks))
+    {
+        if let Some(hit) = transition_hit(track, playhead) {
+            for (clip, mix, side) in [
+                (hit.left, 1.0 - hit.progress, true),
+                (hit.right, hit.progress, false),
+            ] {
+                match layer_for_clip(
+                    sequence, track, clip, media, playhead, playing, scrubbing, reverse, mix,
+                    canvas_w, canvas_h,
+                ) {
+                    Ok(mut layer) => {
+                        match &hit.kind {
+                            editor_core::TransitionKind::Wipe { .. } => {
+                                // Incoming picture wipes in from the left, matching export's wipeleft.
+                                if side {
+                                    layer.place.clip_u0 = hit.progress;
+                                } else {
+                                    layer.place.clip_u1 = hit.progress;
+                                }
+                                layer.place.opacity = (layer.place.opacity / mix.max(0.001)).clamp(0.0, 1.0);
+                            }
+                            editor_core::TransitionKind::PushSlide { .. } => {
+                                let shift = sequence.width as f32 * hit.progress;
+                                layer.place.shift_x = if side {
+                                    -shift
+                                } else {
+                                    sequence.width as f32 - shift
+                                };
+                                layer.place.opacity = (layer.place.opacity / mix.max(0.001)).clamp(0.0, 1.0);
+                            }
+                            editor_core::TransitionKind::CrossDissolve => {}
+                        }
+                        chip = layer.label.clone();
+                        layers.push(layer);
+                    }
+                    Err(message) => problem = Some(message),
+                }
+            }
+        } else if let Some(clip) = track
             .clips
             .iter()
             .find(|clip| clip.enabled && clip.covers(Frame(playhead)))
-        else {
-            continue;
-        };
-        let rel = clip_relative(Frame(playhead), clip.timeline_in);
-        let xform = transform(&clip.effects)
-            .cloned()
-            .unwrap_or_else(Transform::identity);
-        let opacity = xform.opacity.value_at(rel).clamp(0.0, 1.0);
-        if opacity <= 0.001 {
-            continue;
+        {
+            match layer_for_clip(
+                sequence, track, clip, media, playhead, playing, scrubbing, reverse, 1.0,
+                canvas_w, canvas_h,
+            ) {
+                Ok(layer) => {
+                    chip = layer.label.clone();
+                    layers.push(layer);
+                }
+                Err(message) => problem = Some(message),
+            }
         }
-        let Some(media_id) = clip.media_id else {
-            return Some(unreadable(
-                track,
-                clip,
-                opacity,
-                format!("No media linked to {}", clip.name),
-            ));
-        };
-        let Some(asset) = media.iter().find(|item| item.id == media_id) else {
-            return Some(unreadable(
-                track,
-                clip,
-                opacity,
-                format!("Missing media for {}", clip.name),
-            ));
-        };
-        if !asset.has_video {
-            return Some(unreadable(
-                track,
-                clip,
-                opacity,
-                format!("{} has no picture", asset.name),
-            ));
-        }
-        let resolved = resolve_media_path(&asset.path);
-        if !resolved.is_file() {
-            return Some(unreadable(
-                track,
-                clip,
-                opacity,
-                format!("Offline — {} is not on disk", asset.name),
-            ));
-        }
-        let (src_w, src_h) = match (asset.width, asset.height) {
-            (Some(w), Some(h)) if w > 0 && h > 0 => (w, h),
-            _ => (PREVIEW_MAX_W, PREVIEW_MAX_H),
-        };
-        let (width, height) = fit_preview_size(src_w, src_h, PREVIEW_MAX_W, PREVIEW_MAX_H)
-            .unwrap_or((
-                PREVIEW_MAX_W.min(src_w).max(2),
-                PREVIEW_MAX_H.min(src_h).max(2),
-            ));
-        let mut source_frame = source_frame_at(clip, Frame(playhead), sequence.timebase)
-            .0
-            .max(0);
-        let last_source_frame = asset.duration.0.saturating_sub(1).max(0);
-        if source_frame > last_source_frame {
-            source_frame = last_source_frame;
-        }
-        let duration_secs = asset.duration.to_seconds(asset.timebase);
-        let raw_time = Frame(source_frame).to_seconds(clip.media_timebase);
-        let time_secs = clamp_preview_time(raw_time, duration_secs).unwrap_or(0.0);
-        let frame_secs = clip.media_timebase.frame_duration_secs();
-        return Some(PictureSource {
-            track_name: track.name.clone(),
-            clip_name: clip.name.clone(),
-            path: resolved.to_string_lossy().into_owned(),
-            source_frame,
-            time_secs,
-            frame_secs,
-            width,
-            height,
-            last_source_frame,
-            opacity,
-            problem: None,
-        });
     }
-    None
+    if !layers.is_empty() {
+        problem = None;
+    }
+    DecodePlan {
+        layers,
+        problem,
+        chip,
+        canvas_w,
+        canvas_h,
+    }
 }
 
-fn unreadable(
+fn layer_for_clip(
+    sequence: &editor_core::Sequence,
     track: &editor_core::Track,
     clip: &editor_core::Clip,
-    opacity: f32,
-    problem: String,
-) -> PictureSource {
-    PictureSource {
-        track_name: track.name.clone(),
-        clip_name: clip.name.clone(),
-        path: String::new(),
-        source_frame: 0,
-        time_secs: 0.0,
-        frame_secs: Timebase::fps_24().frame_duration_secs(),
-        width: 2,
-        height: 2,
-        last_source_frame: 0,
-        opacity,
-        problem: Some(problem),
+    media: &[MediaAsset],
+    playhead: i64,
+    playing: bool,
+    scrubbing: bool,
+    reverse: bool,
+    mix: f32,
+    canvas_w: u32,
+    canvas_h: u32,
+) -> Result<DecodedLayer, String> {
+    let rel = clip_relative(Frame(playhead), clip.timeline_in);
+    let xform = transform(&clip.effects)
+        .cloned()
+        .unwrap_or_else(Transform::identity);
+    let place = place_from_transform(&xform, rel, mix);
+    if place.opacity <= 0.001 {
+        return Err(format!("{} is fully transparent", clip.name));
     }
+    let media_id = clip
+        .media_id
+        .ok_or_else(|| format!("No media linked to {}", clip.name))?;
+    let asset = media
+        .iter()
+        .find(|item| item.id == media_id)
+        .ok_or_else(|| format!("Missing media for {}", clip.name))?;
+    if !asset.has_video {
+        return Err(format!("{} has no picture", asset.name));
+    }
+    let resolved = resolve_media_path(&asset.path);
+    if !resolved.is_file() {
+        return Err(format!("Offline — {} is not on disk", asset.name));
+    }
+    let (src_w, src_h) = match (asset.width, asset.height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => (w, h),
+        _ => (canvas_w, canvas_h),
+    };
+    let (width, height) = fit_preview_size(src_w, src_h, canvas_w, canvas_h).unwrap_or((
+        canvas_w.min(src_w).max(2),
+        canvas_h.min(src_h).max(2),
+    ));
+    let mut source_frame = source_frame_at(clip, Frame(playhead), sequence.timebase)
+        .0
+        .max(0);
+    let last_source_frame = asset.duration.0.saturating_sub(1).max(0);
+    if source_frame > last_source_frame {
+        source_frame = last_source_frame;
+    }
+    let duration_secs = asset.duration.to_seconds(asset.timebase);
+    let raw_time = Frame(source_frame).to_seconds(clip.media_timebase);
+    let time_secs = clamp_preview_time(raw_time, duration_secs).unwrap_or(0.0);
+    let frame_secs = clip.media_timebase.frame_duration_secs();
+    let burst = if playing && !scrubbing {
+        PLAY_BURST
+    } else {
+        SCRUB_BURST
+    };
+    let lead = if scrubbing || reverse { burst / 3 } else { 0 };
+    Ok(DecodedLayer {
+        query: PreviewQuery {
+            path: resolved.to_string_lossy().into_owned(),
+            source_frame,
+            width,
+            height,
+            time_secs,
+            frame_secs,
+            last_source_frame,
+            burst,
+            lead,
+        },
+        grade: GradeSample::from_effects(&clip.effects, rel),
+        place,
+        label: format!("{}  {}", track.name, clip.name),
+    })
 }
 
 fn paint_decoded(
@@ -735,27 +857,7 @@ fn base_rgb(clip: &editor_core::Clip) -> [f32; 3] {
 }
 
 fn apply_grade(rgb: [f32; 3], grade: &ColorGrade, rel: i64) -> [f32; 3] {
-    let exposure = grade.exposure.value_at(rel);
-    let contrast = grade.contrast.value_at(rel);
-    let highlights = grade.highlights.value_at(rel);
-    let shadows = grade.shadows.value_at(rel);
-    let temperature = grade.temperature.value_at(rel);
-    let tint = grade.tint.value_at(rel);
-    let saturation = grade.saturation.value_at(rel);
-    let mut c = rgb.map(|channel| channel * 2.0_f32.powf(exposure));
-    c = c.map(|channel| ((channel - 0.5) * contrast + 0.5).clamp(0.0, 1.5));
-    c = c.map(|channel| {
-        let shadow_w = (1.0 - channel).clamp(0.0, 1.0);
-        let high_w = channel.clamp(0.0, 1.0);
-        (channel + shadows * 0.35 * shadow_w + highlights * 0.35 * high_w).clamp(0.0, 1.5)
-    });
-    c[0] = (c[0] + temperature * 0.18).clamp(0.0, 1.5);
-    c[2] = (c[2] - temperature * 0.18).clamp(0.0, 1.5);
-    c[1] = (c[1] - tint * 0.14).clamp(0.0, 1.5);
-    c[0] = (c[0] + tint * 0.06).clamp(0.0, 1.5);
-    c[2] = (c[2] + tint * 0.06).clamp(0.0, 1.5);
-    let luma = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
-    c.map(|channel| (luma + (channel - luma) * saturation).clamp(0.0, 1.0))
+    GradeSample::from_grade(grade, rel).apply(rgb)
 }
 
 fn rotate(v: Vec2, degrees: f32) -> Vec2 {

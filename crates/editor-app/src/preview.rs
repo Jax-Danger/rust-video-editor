@@ -151,7 +151,7 @@ pub struct PreviewEngine {
     worker: Option<JoinHandle<()>>,
     next_id: u64,
     inflight: Option<Span>,
-    queued: Option<Job>,
+    queued: VecDeque<Job>,
     slots: HashMap<FrameKey, Slot>,
     lru: VecDeque<FrameKey>,
     textures: HashMap<FrameKey, TextureHandle>,
@@ -174,7 +174,7 @@ impl PreviewEngine {
             worker,
             next_id: 1,
             inflight: None,
-            queued: None,
+            queued: VecDeque::new(),
             slots: HashMap::new(),
             lru: VecDeque::new(),
             textures: HashMap::new(),
@@ -186,7 +186,7 @@ impl PreviewEngine {
     }
 
     pub fn busy(&self) -> bool {
-        self.inflight.is_some() || self.queued.is_some()
+        self.inflight.is_some() || !self.queued.is_empty()
     }
 
     pub fn request(&mut self, query: PreviewQuery) -> FrameView {
@@ -205,7 +205,7 @@ impl PreviewEngine {
             return FrameView::Failed(message.clone());
         }
         if !self.covers(&query) {
-            self.schedule(query.clone());
+            self.schedule(query.clone(), true);
         }
         let slack = i64::from(query.burst.max(1)) + i64::from(query.lead);
         self.nearby(&query, slack)
@@ -256,10 +256,13 @@ impl PreviewEngine {
         let delta = (ahead - query.source_frame) as f64;
         next.source_frame = ahead;
         next.time_secs = (query.time_secs + delta * query.frame_secs.max(0.0)).max(0.0);
-        self.schedule(next);
+        if self.queued.len() >= 4 {
+            return;
+        }
+        self.schedule(next, false);
     }
 
-    fn schedule(&mut self, query: PreviewQuery) {
+    fn schedule(&mut self, query: PreviewQuery, priority: bool) {
         let Some(tx) = self.tx.clone() else {
             return;
         };
@@ -288,12 +291,43 @@ impl PreviewEngine {
         if !matches!(self.slots.get(&job.key()), Some(Slot::Ready(_))) {
             self.slots.insert(job.key(), Slot::Pending);
         }
-        if self.inflight.is_some() {
-            if let Some(previous) = self.queued.replace(job) {
-                self.forget_pending(&previous.key());
-            }
+        let same = |span: &Span| {
+            span.path == job.path
+                && span.start == job.start_frame
+                && span.count == job.count
+                && span.width == job.width
+                && span.height == job.height
+        };
+        if self.inflight.as_ref().is_some_and(same) {
             return;
         }
+        if self.queued.iter().map(Job::span).any(|span| same(&span)) {
+            return;
+        }
+        while self.queued.len() >= 8 {
+            if let Some(previous) = self.queued.pop_back() {
+                self.forget_pending(&previous.key());
+            }
+        }
+        if priority {
+            self.queued.push_front(job);
+        } else {
+            self.queued.push_back(job);
+        }
+        self.pump_queue();
+        let _ = tx;
+    }
+
+    fn pump_queue(&mut self) {
+        if self.inflight.is_some() {
+            return;
+        }
+        let Some(tx) = self.tx.clone() else {
+            return;
+        };
+        let Some(job) = self.queued.pop_front() else {
+            return;
+        };
         self.inflight = Some(job.span());
         if tx.send(job).is_err() {
             self.inflight = None;
@@ -313,12 +347,7 @@ impl PreviewEngine {
                 && frame < span.start + i64::from(span.count)
         };
         self.inflight.as_ref().is_some_and(hit)
-            || self
-                .queued
-                .as_ref()
-                .map(Job::span)
-                .as_ref()
-                .is_some_and(hit)
+            || self.queued.iter().map(Job::span).any(|span| hit(&span))
     }
 
     fn nearby(&self, query: &PreviewQuery, max_distance: i64) -> Option<PreviewImage> {
@@ -351,7 +380,7 @@ impl PreviewEngine {
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.inflight = None;
-                    self.queued = None;
+                    self.queued.clear();
                     break;
                 }
             };
@@ -384,16 +413,7 @@ impl PreviewEngine {
                     }
                 }
             }
-            if self.inflight.is_none() {
-                if let Some(job) = self.queued.take() {
-                    self.inflight = Some(job.span());
-                    if let Some(tx) = &self.tx {
-                        if tx.send(job).is_err() {
-                            self.inflight = None;
-                        }
-                    }
-                }
-            }
+            self.pump_queue();
         }
     }
 
