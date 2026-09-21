@@ -9,6 +9,7 @@ use editor_core::{
 use editor_media::{duration_frames, probe};
 use egui::{Key, Modifiers, RichText, ViewportCommand};
 
+use crate::preview::PreviewEngine;
 use crate::theme;
 use crate::ui::{self, format_tc};
 
@@ -139,6 +140,7 @@ pub struct MeridianApp {
     pub drag: Option<Drag>,
     pub nudge: i64,
     pub transcriber: editor_core::StubTranscriber,
+    pub preview: PreviewEngine,
 }
 
 impl MeridianApp {
@@ -165,6 +167,7 @@ impl MeridianApp {
             drag: None,
             nudge: 1,
             transcriber: editor_core::StubTranscriber::default(),
+            preview: PreviewEngine::new(),
         };
         app.sync_title(&cc.egui_ctx);
         app
@@ -1354,7 +1357,7 @@ impl MeridianApp {
             .open(&mut shown)
             .show(ctx, |ui| {
                 ui.set_min_width(480.0);
-                ui.label("Probe uses the built-in stub unless Meridian was built with the ffmpeg feature. Missing files import as offline.");
+                ui.label("With --features ffmpeg, Probe calls ffprobe and the program viewer decodes frames with ffmpeg. Otherwise files are classified by extension and the viewer draws placeholders.");
                 ui.add(egui::TextEdit::singleline(&mut path).desired_width(440.0));
                 ui.horizontal(|ui| {
                     if ui.button("Probe").clicked() {
@@ -1470,7 +1473,7 @@ pub fn note_track_flag(app: &mut MeridianApp, track: TrackId, flag: TrackFlag, v
 
 pub fn open_import(app: &mut MeridianApp) {
     app.modal = Modal::Import {
-        path: "media/interview.mov".into(),
+        path: "samples/media/interview.mp4".into(),
         note: String::new(),
     };
 }

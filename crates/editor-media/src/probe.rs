@@ -69,7 +69,8 @@ pub fn probe_stub(path: &Path) -> Result<ProbeResult, ProbeError> {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    let offline = !path.exists();
+    let located = crate::decode::resolve_media_path(&path.to_string_lossy());
+    let offline = !located.is_file();
     let (has_video, has_audio, video_codec, audio_codec) = classify(&ext);
     let timebase = infer_timebase(&name, &ext, has_video);
     let seconds = stable_seconds(&name);
@@ -105,6 +106,12 @@ pub fn probe_ffprobe(path: &Path) -> Result<ProbeResult, ProbeError> {
     if path.as_os_str().is_empty() {
         return Err(ProbeError::EmptyPath);
     }
+    let located = crate::decode::resolve_media_path(&path.to_string_lossy());
+    let input = if located.is_file() {
+        located
+    } else {
+        path.to_path_buf()
+    };
     let output = Command::new("ffprobe")
         .args([
             "-v",
@@ -114,7 +121,7 @@ pub fn probe_ffprobe(path: &Path) -> Result<ProbeResult, ProbeError> {
             "-show_format",
             "-show_streams",
         ])
-        .arg(path)
+        .arg(&input)
         .output()
         .map_err(|err| ProbeError::Ffprobe(err.to_string()))?;
     if !output.status.success() {
@@ -124,7 +131,7 @@ pub fn probe_ffprobe(path: &Path) -> Result<ProbeResult, ProbeError> {
     let text = String::from_utf8_lossy(&output.stdout);
     let mut result = parse_ffprobe_json(&text)?;
     result.path = path.to_string_lossy().into_owned();
-    result.offline = !path.exists();
+    result.offline = !input.is_file();
     Ok(result)
 }
 

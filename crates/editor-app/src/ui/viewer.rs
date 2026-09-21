@@ -1,19 +1,83 @@
-//! Program monitor. Clips are drawn as graded, transformed cards — a stand-in
-//! for a GPU viewer. Colour, opacity, dissolves, wipes, and pushes are real.
+//! Program monitor.
+//!
+//! With the `ffmpeg` feature and a readable file, the topmost visible video
+//! clip is a decoded frame. Otherwise the monitor keeps the graded proxy cards
+//! and explains why picture is missing.
 
-use editor_core::{clip_relative, color_grade, transform, ColorGrade, Frame, TrackKind, Transform};
+use editor_core::{
+    clip_relative, color_grade, source_frame_at, transform, ColorGrade, Frame, MediaAsset,
+    Timebase, TrackKind, Transform,
+};
+use editor_media::{clamp_preview_time, fit_preview_size, resolve_media_path, PreviewBackend};
 use egui::{Color32, FontId, Painter, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 
 use crate::app::MeridianApp;
+use crate::preview::{FrameView, PreviewImage, PreviewQuery};
 use crate::theme::THEME;
 use crate::ui::format_tc;
 use crate::ui::widgets;
 
-pub fn viewer_panel(ui: &mut egui::Ui, app: &MeridianApp) {
+const PREVIEW_MAX_W: u32 = 960;
+const PREVIEW_MAX_H: u32 = 540;
+const PLAY_BURST: u32 = 12;
+
+pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
     let Some(sequence) = app.session.project().active().cloned() else {
         ui.label("No sequence.");
         return;
     };
+    let playhead = app.playhead;
+    let playing = app.playing;
+    let media = app.session.project().media.clone();
+    let source = top_picture(&sequence, playhead, &media);
+    let backend = app.preview.backend().clone();
+
+    let mut banner: Option<String> = None;
+    let mut picture: Option<PreviewImage> = None;
+    let mut paint_proxy = true;
+    match &backend {
+        PreviewBackend::Disabled => {
+            banner = Some(
+                "Decoded preview is off. Run cargo run -p editor-app --features ffmpeg.".into(),
+            );
+        }
+        PreviewBackend::Unavailable(message) => {
+            banner = Some(format!("ffmpeg is not available — {message}"));
+        }
+        PreviewBackend::Cli => {
+            if let Some(source) = &source {
+                if let Some(problem) = &source.problem {
+                    banner = Some(problem.clone());
+                } else {
+                    let query = source.query(playing);
+                    match app.preview.request(query) {
+                        FrameView::Exact(image) | FrameView::Nearby(image) => {
+                            picture = Some(image);
+                            paint_proxy = false;
+                        }
+                        FrameView::Pending => {
+                            banner = Some("Decoding preview…".into());
+                        }
+                        FrameView::Failed(message) => banner = Some(message),
+                        FrameView::Unavailable => {
+                            banner = Some("ffmpeg is not available.".into());
+                        }
+                    }
+                    if app.preview.busy() {
+                        ui.ctx()
+                            .request_repaint_after(std::time::Duration::from_millis(16));
+                    }
+                }
+            }
+        }
+    }
+    let mode = match (&backend, picture.is_some(), source.as_ref()) {
+        (PreviewBackend::Disabled | PreviewBackend::Unavailable(_), _, _) => "Proxy",
+        (_, _, Some(source)) if source.problem.is_some() => "Offline",
+        (PreviewBackend::Cli, _, Some(_)) => "Preview",
+        _ => "Empty",
+    };
+
     widgets::panel_header(ui, "Program", |ui| {
         ui.label(
             egui::RichText::new(&sequence.name)
@@ -28,8 +92,21 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &MeridianApp) {
             false,
         );
         ui.add_space(6.0);
-        widgets::readout(ui, &format_tc(app.playhead, sequence.timebase), 118.0, true);
+        widgets::readout(ui, mode, 78.0, mode == "Preview");
+        ui.add_space(6.0);
+        widgets::readout(ui, &format_tc(playhead, sequence.timebase), 118.0, true);
     });
+
+    let texture = picture.as_ref().map(|image| {
+        let id = app.preview.texture(ui.ctx(), image);
+        (id, image.width, image.height)
+    });
+    let opacity = source.as_ref().map(|item| item.opacity).unwrap_or(1.0);
+    let chip = source
+        .as_ref()
+        .filter(|_| picture.is_some())
+        .map(|item| format!("{}  {}", item.track_name, item.clip_name));
+
     let (rect, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, THEME.stage);
@@ -47,31 +124,34 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &MeridianApp) {
     checker(&painter, frame);
     painter.rect_filled(frame, 0.0, Color32::BLACK);
 
-    let video: Vec<_> = sequence
-        .tracks
-        .iter()
-        .filter(|t| t.kind == TrackKind::Video)
-        .filter(|t| track_visible(t, &sequence.tracks))
-        .collect();
-
-    for track in video {
-        if let Some(hit) = transition_hit(track, app.playhead) {
-            paint_transition(&painter, frame, &sequence, hit, app.playhead);
-        } else if let Some(clip) = track
-            .clips
+    if paint_proxy {
+        let video: Vec<_> = sequence
+            .tracks
             .iter()
-            .find(|c| c.covers(Frame(app.playhead)) && c.enabled)
-        {
-            paint_clip(
-                &painter,
-                frame,
-                sequence.width as f32,
-                sequence.height as f32,
-                clip,
-                1.0,
-                app.playhead,
-            );
+            .filter(|t| t.kind == TrackKind::Video)
+            .filter(|t| track_visible(t, &sequence.tracks))
+            .collect();
+        for track in video {
+            if let Some(hit) = transition_hit(track, playhead) {
+                paint_transition(&painter, frame, &sequence, hit, playhead);
+            } else if let Some(clip) = track
+                .clips
+                .iter()
+                .find(|c| c.covers(Frame(playhead)) && c.enabled)
+            {
+                paint_clip(
+                    &painter,
+                    frame,
+                    sequence.width as f32,
+                    sequence.height as f32,
+                    clip,
+                    1.0,
+                    playhead,
+                );
+            }
         }
+    } else if let Some((texture, width, height)) = texture {
+        paint_decoded(&painter, frame, texture, width, height, opacity);
     }
 
     let captions: Vec<_> = sequence
@@ -110,6 +190,219 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &MeridianApp) {
         FontId::monospace(12.0),
         Color32::from_rgb(255, 214, 160),
     );
+    if let Some(label) = chip {
+        let chip_rect = Rect::from_min_size(
+            Pos2::new(frame.right() - 148.0, frame.top() + 8.0),
+            Vec2::new(140.0, 20.0),
+        );
+        painter.rect_filled(
+            chip_rect,
+            3.0,
+            Color32::from_rgba_unmultiplied(0, 0, 0, 160),
+        );
+        painter.text(
+            chip_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            FontId::proportional(11.0),
+            THEME.accent,
+        );
+    }
+    if let Some(text) = banner {
+        overlay_note(&painter, frame, &text);
+    }
+}
+
+struct PictureSource {
+    track_name: String,
+    clip_name: String,
+    path: String,
+    source_frame: i64,
+    time_secs: f64,
+    frame_secs: f64,
+    width: u32,
+    height: u32,
+    last_source_frame: i64,
+    opacity: f32,
+    problem: Option<String>,
+}
+
+impl PictureSource {
+    fn query(&self, playing: bool) -> PreviewQuery {
+        PreviewQuery {
+            path: self.path.clone(),
+            source_frame: self.source_frame,
+            width: self.width,
+            height: self.height,
+            time_secs: self.time_secs,
+            frame_secs: self.frame_secs,
+            last_source_frame: self.last_source_frame,
+            burst: if playing { PLAY_BURST } else { 1 },
+        }
+    }
+}
+
+fn top_picture(
+    sequence: &editor_core::Sequence,
+    playhead: i64,
+    media: &[MediaAsset],
+) -> Option<PictureSource> {
+    let video: Vec<_> = sequence
+        .tracks
+        .iter()
+        .filter(|track| track.kind == TrackKind::Video)
+        .collect();
+    for track in video.into_iter().rev() {
+        if !track_visible(track, &sequence.tracks) {
+            continue;
+        }
+        let Some(clip) = track
+            .clips
+            .iter()
+            .find(|clip| clip.enabled && clip.covers(Frame(playhead)))
+        else {
+            continue;
+        };
+        let rel = clip_relative(Frame(playhead), clip.timeline_in);
+        let xform = transform(&clip.effects)
+            .cloned()
+            .unwrap_or_else(Transform::identity);
+        let opacity = xform.opacity.value_at(rel).clamp(0.0, 1.0);
+        if opacity <= 0.001 {
+            continue;
+        }
+        let Some(media_id) = clip.media_id else {
+            return Some(unreadable(
+                track,
+                clip,
+                opacity,
+                format!("No media linked to {}", clip.name),
+            ));
+        };
+        let Some(asset) = media.iter().find(|item| item.id == media_id) else {
+            return Some(unreadable(
+                track,
+                clip,
+                opacity,
+                format!("Missing media for {}", clip.name),
+            ));
+        };
+        if !asset.has_video {
+            return Some(unreadable(
+                track,
+                clip,
+                opacity,
+                format!("{} has no picture", asset.name),
+            ));
+        }
+        let resolved = resolve_media_path(&asset.path);
+        if !resolved.is_file() {
+            return Some(unreadable(
+                track,
+                clip,
+                opacity,
+                format!("Offline — {} is not on disk", asset.name),
+            ));
+        }
+        let (src_w, src_h) = match (asset.width, asset.height) {
+            (Some(w), Some(h)) if w > 0 && h > 0 => (w, h),
+            _ => (PREVIEW_MAX_W, PREVIEW_MAX_H),
+        };
+        let (width, height) = fit_preview_size(src_w, src_h, PREVIEW_MAX_W, PREVIEW_MAX_H)
+            .unwrap_or((
+                PREVIEW_MAX_W.min(src_w).max(2),
+                PREVIEW_MAX_H.min(src_h).max(2),
+            ));
+        let mut source_frame = source_frame_at(clip, Frame(playhead), sequence.timebase)
+            .0
+            .max(0);
+        let last_source_frame = asset.duration.0.saturating_sub(1).max(0);
+        if source_frame > last_source_frame {
+            source_frame = last_source_frame;
+        }
+        let duration_secs = asset.duration.to_seconds(asset.timebase);
+        let raw_time = Frame(source_frame).to_seconds(clip.media_timebase);
+        let time_secs = clamp_preview_time(raw_time, duration_secs).unwrap_or(0.0);
+        let frame_secs = clip.media_timebase.frame_duration_secs();
+        return Some(PictureSource {
+            track_name: track.name.clone(),
+            clip_name: clip.name.clone(),
+            path: resolved.to_string_lossy().into_owned(),
+            source_frame,
+            time_secs,
+            frame_secs,
+            width,
+            height,
+            last_source_frame,
+            opacity,
+            problem: None,
+        });
+    }
+    None
+}
+
+fn unreadable(
+    track: &editor_core::Track,
+    clip: &editor_core::Clip,
+    opacity: f32,
+    problem: String,
+) -> PictureSource {
+    PictureSource {
+        track_name: track.name.clone(),
+        clip_name: clip.name.clone(),
+        path: String::new(),
+        source_frame: 0,
+        time_secs: 0.0,
+        frame_secs: Timebase::fps_24().frame_duration_secs(),
+        width: 2,
+        height: 2,
+        last_source_frame: 0,
+        opacity,
+        problem: Some(problem),
+    }
+}
+
+fn paint_decoded(
+    painter: &Painter,
+    frame: Rect,
+    texture: egui::TextureId,
+    width: u32,
+    height: u32,
+    opacity: f32,
+) {
+    let dest = letterbox(frame, width as f32, height as f32);
+    let alpha = (opacity * 255.0).round().clamp(0.0, 255.0) as u8;
+    let tint = Color32::from_white_alpha(alpha);
+    let painter = painter.with_clip_rect(frame);
+    painter.image(
+        texture,
+        dest,
+        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+        tint,
+    );
+}
+
+fn overlay_note(painter: &Painter, frame: Rect, text: &str) {
+    let galley = painter.layout(
+        text.to_owned(),
+        FontId::proportional(13.0),
+        THEME.text,
+        (frame.width() - 36.0).max(40.0),
+    );
+    let pad = Vec2::new(12.0, 7.0);
+    let size = galley.size() + pad * 2.0;
+    let rect = Rect::from_center_size(
+        Pos2::new(frame.center().x, frame.top() + 40.0 + size.y * 0.5),
+        size,
+    );
+    painter.rect_filled(rect, 3.0, Color32::from_rgba_unmultiplied(8, 10, 12, 220));
+    painter.rect_stroke(
+        rect,
+        3.0,
+        Stroke::new(1.0_f32, THEME.border),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(rect.min + pad, galley, THEME.text);
 }
 
 fn track_visible(track: &editor_core::Track, tracks: &[editor_core::Track]) -> bool {

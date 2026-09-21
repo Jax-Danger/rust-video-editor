@@ -1,4 +1,5 @@
 mod app;
+mod preview;
 mod theme;
 mod ui;
 

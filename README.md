@@ -9,7 +9,7 @@ Meridian is a desktop non-linear editor written in Rust. The timeline is frame-a
 | Crate | Role |
 | --- | --- |
 | `editor-core` | Timebase, project model, edit engine, grades, captions, templates, JSON I/O |
-| `editor-media` | Probe API. Stub by default; `ffprobe` behind the `ffmpeg` feature |
+| `editor-media` | Probe and preview decode. Stub by default; `ffprobe` / `ffmpeg` CLI behind the `ffmpeg` feature |
 | `editor-app` | egui / eframe shell. Binary name: `meridian` |
 
 `editor-core` never stores an edit in floating-point seconds. A [`Timebase`](crates/editor-core/src/time.rs) is a rational frame rate. A [`Frame`](crates/editor-core/src/time.rs) is an `i64` index on that rate. Media time is an integer tick count (`MediaTime`) and converts onto the sequence with rounded rational arithmetic. Drop-frame timecode is used for 29.97 and 59.94.
@@ -20,7 +20,7 @@ Edits are transactional. `Session` clones the project, runs the operation, and p
 
 ## Build and run
 
-Rust **1.85** or newer (edition 2024 crates in the egui stack). This tree was built with 1.98.
+Rust **1.88** or newer. The egui stack in this lockfile pulls crates that declare that minimum (the package `rust-version` is still 1.85). This tree was built with 1.98.
 
 ```bash
 cargo build
@@ -64,7 +64,7 @@ Transitions (cross dissolve, wipe, push) are centered on a cut and consume head 
 - **Colour** — viewer plus grade, wheels, and transform
 - **Deliver** — codec, container, and in/out. **Write Manifest** saves a JSON export plan. This build does not encode pictures
 
-The program monitor is a procedural composite: mute/solo, grade, transform, dissolve, wipe, push, and caption burn-in. It is a stand-in for a decoded frame.
+The program monitor draws mute/solo, grade, transform, dissolve, wipe, push, and caption burn-in as proxy cards. With `--features ffmpeg` it replaces that stack with a decoded frame of the topmost visible video clip under the playhead. Play and scrub both follow the sequence timebase. If ffmpeg is missing or the file is offline, the proxy stays up and the viewer says why.
 
 ## Templates
 
@@ -80,19 +80,45 @@ The program monitor is a procedural composite: mute/solo, grade, transform, diss
 
 The same JSON is embedded with `include_str!`, so the app does not depend on the current working directory. `load_template_dir` reads a folder of the same shape if you add presets later.
 
-## Media probe
+## Media probe and preview
 
-`editor_media::probe` returns duration, resolution, codecs, and whether the file is offline.
+`editor_media::probe` returns duration, resolution, codecs, and whether the file is offline. `editor_media::decode_frames` turns a timestamp into RGBA for the program viewer.
 
-The default build never links or spawns ffmpeg. It classifies the extension, invents a stable duration from the file name (stills become a five-second hold), and marks missing files offline. Drop a `<file>.probe.json` sidecar next to the media if you want the stub to return exact values. The sidecar uses the same JSON shape `ffprobe -show_streams -show_format` emits, or the smaller Meridian object documented by `parse_ffprobe_json`.
+The default build never links or spawns ffmpeg. Probe classifies the extension, invents a stable duration from the file name (stills become a five-second hold), and marks missing files offline. Decode returns `FeatureDisabled`. Drop a `<file>.probe.json` sidecar next to the media if you want the stub to return exact values.
 
-To probe with a real `ffprobe` binary on `PATH`:
+### Install ffmpeg and ffprobe
+
+Preview shells out to the `ffmpeg` and `ffprobe` binaries. It does not link libav, so any system build is enough, including one without proprietary codecs you don't have. The sample clips are H.264 + AAC, which a normal ffmpeg package can read. Other files decode only when that same binary has a decoder for them.
+
+| Platform | Install |
+| --- | --- |
+| macOS | `brew install ffmpeg` |
+| Debian / Ubuntu | `sudo apt install ffmpeg` |
+| Fedora | `sudo dnf install ffmpeg` |
+| Arch | `sudo pacman -S ffmpeg` |
+| Windows | `winget install Gyan.FFmpeg` (or `choco install ffmpeg`), then open a new terminal so `ffmpeg` and `ffprobe` are on `PATH` |
+
+Check with `ffmpeg -version` and `ffprobe -version`.
+
+### Run with real pictures
 
 ```bash
 cargo run -p editor-app --features ffmpeg
 ```
 
-The feature does not vendor or link libav. It shells out to `ffprobe -print_format json`.
+`cargo run` and `cargo test` without the feature stay on the proxy and do not need ffmpeg installed.
+
+The example sequence *Northline — Opening* points its three picture clips at synthetic files in [`samples/media/`](samples/media/):
+
+| File | What you see | Length |
+| --- | --- | --- |
+| `interview.mp4` | `testsrc2` card with a running clock | 480 frames, 24 fps |
+| `city_broll.mp4` | classic `testsrc` card | 288 frames, 24 fps |
+| `aerial.mp4` | the same card with a moving hue | 192 frames, 24 fps |
+
+They are generated, not third-party footage. Regenerate them with [`scripts/generate-sample-media.sh`](scripts/generate-sample-media.sh) if you have ffmpeg. Launching from the repo root (or any subdirectory) resolves those relative paths. The viewer picks the highest unmuted video track that covers the playhead — V2's aerial replaces V1 while that clip is on screen — and caches a short burst of frames so playback does not spawn ffmpeg once per frame.
+
+Import still accepts any path `ffprobe` can open. Offline media and a missing `ffmpeg` binary leave the shell usable and put the reason on the program monitor.
 
 ## Captions
 
@@ -119,11 +145,11 @@ Map word timestamps through the sequence timebase into `Frame` in/out points. `r
 
 ## Tests
 
-`cargo test` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, the sample project round-trip, and both the stub probe and the ffprobe JSON parser.
+`cargo test` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, the sample project round-trip, the stub probe, the ffprobe JSON parser, and preview frame-request bounds. A real decode runs only when tests are built with `--features ffmpeg` and `ffmpeg` is on `PATH`; otherwise that test returns without spawning.
 
 ## Roadmap
 
-- GPU viewer that decodes and composites real frames
+- GPU viewer that composites more than the top decoded video track
 - Fairlight-class audio: mixer, metering, and clip gain
 - OFX-style plugins for third-party effects
 - Deliver codecs that encode the manifest instead of only writing it

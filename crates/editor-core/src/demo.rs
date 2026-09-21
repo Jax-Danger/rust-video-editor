@@ -40,41 +40,47 @@ pub fn demo_project() -> Project {
         asset(
             10,
             2,
-            "interview.mov",
-            "media/interview.mov",
+            "interview.mp4",
+            "samples/media/interview.mp4",
             480,
             tb,
             true,
             true,
             Some("h264"),
             Some("aac"),
-            Labelish::Video,
+            Some(960),
+            Some(540),
+            false,
         ),
         asset(
             11,
             3,
-            "city_broll.mov",
-            "media/city_broll.mov",
+            "city_broll.mp4",
+            "samples/media/city_broll.mp4",
             288,
             tb,
             true,
             true,
             Some("h264"),
             Some("aac"),
-            Labelish::Video,
+            Some(960),
+            Some(540),
+            false,
         ),
         asset(
             12,
             3,
-            "aerial.mov",
-            "media/aerial.mov",
+            "aerial.mp4",
+            "samples/media/aerial.mp4",
             192,
             tb,
             true,
             true,
-            Some("prores"),
-            Some("pcm"),
-            Labelish::Video,
+            Some("h264"),
+            Some("aac"),
+            Some(960),
+            Some(540),
+            false,
         ),
         asset(
             13,
@@ -87,7 +93,9 @@ pub fn demo_project() -> Project {
             true,
             None,
             Some("pcm"),
-            Labelish::Audio,
+            None,
+            None,
+            true,
         ),
         asset(
             14,
@@ -100,7 +108,9 @@ pub fn demo_project() -> Project {
             true,
             None,
             Some("pcm"),
-            Labelish::Audio,
+            None,
+            None,
+            true,
         ),
     ];
 
@@ -201,11 +211,6 @@ pub fn demo_project() -> Project {
     project
 }
 
-enum Labelish {
-    Video,
-    Audio,
-}
-
 fn asset(
     id: u64,
     bin: u64,
@@ -217,9 +222,10 @@ fn asset(
     has_audio: bool,
     video_codec: Option<&str>,
     audio_codec: Option<&str>,
-    kind: Labelish,
+    width: Option<u32>,
+    height: Option<u32>,
+    offline: bool,
 ) -> MediaAsset {
-    let _ = kind;
     MediaAsset {
         id: MediaId(id),
         bin_id: BinId(bin),
@@ -227,15 +233,15 @@ fn asset(
         path: path.into(),
         duration: Frame(duration),
         timebase,
-        width: has_video.then_some(1920),
-        height: has_video.then_some(1080),
+        width,
+        height,
         video_codec: video_codec.map(str::to_string),
         audio_codec: audio_codec.map(str::to_string),
         audio_channels: has_audio.then_some(2),
         sample_rate: has_audio.then_some(48_000),
         has_video,
         has_audio,
-        offline: true,
+        offline,
     }
 }
 

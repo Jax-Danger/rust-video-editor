@@ -27,62 +27,62 @@
     {
       "id": 10,
       "bin_id": 2,
-      "name": "interview.mov",
-      "path": "media/interview.mov",
+      "name": "interview.mp4",
+      "path": "samples/media/interview.mp4",
       "duration": 480,
       "timebase": {
         "numerator": 24,
         "denominator": 1
       },
-      "width": 1920,
-      "height": 1080,
+      "width": 960,
+      "height": 540,
       "video_codec": "h264",
       "audio_codec": "aac",
       "audio_channels": 2,
       "sample_rate": 48000,
       "has_video": true,
       "has_audio": true,
-      "offline": true
+      "offline": false
     },
     {
       "id": 11,
       "bin_id": 3,
-      "name": "city_broll.mov",
-      "path": "media/city_broll.mov",
+      "name": "city_broll.mp4",
+      "path": "samples/media/city_broll.mp4",
       "duration": 288,
       "timebase": {
         "numerator": 24,
         "denominator": 1
       },
-      "width": 1920,
-      "height": 1080,
+      "width": 960,
+      "height": 540,
       "video_codec": "h264",
       "audio_codec": "aac",
       "audio_channels": 2,
       "sample_rate": 48000,
       "has_video": true,
       "has_audio": true,
-      "offline": true
+      "offline": false
     },
     {
       "id": 12,
       "bin_id": 3,
-      "name": "aerial.mov",
-      "path": "media/aerial.mov",
+      "name": "aerial.mp4",
+      "path": "samples/media/aerial.mp4",
       "duration": 192,
       "timebase": {
         "numerator": 24,
         "denominator": 1
       },
-      "width": 1920,
-      "height": 1080,
-      "video_codec": "prores",
-      "audio_codec": "pcm",
+      "width": 960,
+      "height": 540,
+      "video_codec": "h264",
+      "audio_codec": "aac",
       "audio_channels": 2,
       "sample_rate": 48000,
       "has_video": true,
       "has_audio": true,
-      "offline": true
+      "offline": false
     },
     {
       "id": 13,
