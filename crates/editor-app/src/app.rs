@@ -107,12 +107,26 @@ pub enum Modal {
     Shortcuts,
 }
 
+struct CaptionRequest {
+    name: String,
+    start: i64,
+    end: i64,
+    timebase: editor_core::Timebase,
+    #[cfg_attr(
+        not(all(feature = "ffmpeg", feature = "whisper")),
+        allow(dead_code)
+    )]
+    pieces: Vec<crate::audio::AudioPiece>,
+}
+
 pub struct DeliverState {
     pub codec: String,
     pub container: String,
     pub use_in_out: bool,
     pub output_path: String,
     pub report: String,
+    pub burn_captions: bool,
+    pub progress: f32,
 }
 
 impl Default for DeliverState {
@@ -121,8 +135,10 @@ impl Default for DeliverState {
             codec: "H.264".into(),
             container: "mp4".into(),
             use_in_out: false,
-            output_path: "/tmp/meridian-export.json".into(),
+            output_path: "/tmp/meridian-export.mp4".into(),
             report: String::new(),
+            burn_captions: true,
+            progress: 0.0,
         }
     }
 }
@@ -160,6 +176,11 @@ pub struct MeridianApp {
     pub viewer_bar: Option<egui::Rect>,
     pub viewer_bar_end: i64,
     pub audio: AudioEngine,
+    pub picture_cache: Option<crate::composite::PictureCache>,
+    #[cfg(feature = "ffmpeg")]
+    pub export_job: Option<editor_media::ExportJob>,
+    #[cfg(all(feature = "ffmpeg", feature = "whisper"))]
+    pub caption_job: Option<crate::caption_job::CaptionJob>,
 }
 
 impl MeridianApp {
@@ -198,6 +219,11 @@ impl MeridianApp {
             viewer_bar: None,
             viewer_bar_end: 0,
             audio: AudioEngine::new(),
+            picture_cache: None,
+            #[cfg(feature = "ffmpeg")]
+            export_job: None,
+            #[cfg(all(feature = "ffmpeg", feature = "whisper"))]
+            caption_job: None,
         };
         app.sync_title(&cc.egui_ctx);
         app
@@ -598,45 +624,119 @@ impl MeridianApp {
             place_media(project, media_id, playhead, insert)
         });
         self.status = match result {
-            Ok(()) => format!("{label} at {}.", format_tc(playhead, self.timebase())),
+            Ok(()) => {
+                if let Some(sequence) = self.session.project().active() {
+                    let placed: Vec<ClipId> = sequence
+                        .tracks
+                        .iter()
+                        .flat_map(|track| track.clips.iter())
+                        .filter(|clip| {
+                            clip.media_id == Some(media_id) && clip.covers(Frame(playhead))
+                        })
+                        .map(|clip| clip.id)
+                        .collect();
+                    if let Some(first) = placed.first().copied() {
+                        self.selected = if self.linked_selection {
+                            expand_linked(sequence, &[first])
+                        } else {
+                            placed
+                        };
+                    }
+                }
+                format!("{label} at {}.", format_tc(playhead, self.timebase()))
+            }
             Err(err) => err.to_string(),
         };
     }
 
+    pub fn caption_backend_note(&self) -> String {
+        #[cfg(all(feature = "ffmpeg", feature = "whisper"))]
+        {
+            match editor_media::whisper_availability() {
+                Ok(paths) => format!(
+                    "Whisper · {}",
+                    paths
+                        .model
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("model")
+                ),
+                Err(err) => format!("Stub captions — {err}"),
+            }
+        }
+        #[cfg(not(all(feature = "ffmpeg", feature = "whisper")))]
+        {
+            "Stub captions. Rebuild with --features whisper for local Whisper.".into()
+        }
+    }
+
     pub fn auto_caption(&mut self) {
-        let request = {
-            let Some(sequence) = self.session.project().active() else {
-                self.status = "No sequence.".into();
-                return;
-            };
-            let (name, start, end) = if let Some(clip_id) = self.selected.first() {
-                if let Some(clip) = sequence.clip(*clip_id) {
-                    (clip.name.clone(), clip.timeline_in, clip.timeline_out)
-                } else {
-                    ("Sequence".into(), Frame(0), sequence.end_frame())
-                }
-            } else {
-                ("Sequence".into(), Frame(0), sequence.end_frame())
-            };
-            if end.0 <= start.0 {
-                self.status = "Nothing to transcribe.".into();
-                return;
-            }
-            editor_core::TranscribeRequest {
-                media_name: name,
-                language: Some("en".into()),
-                range_in: start,
-                range_out: end,
-                timebase: sequence.timebase,
-            }
+        #[cfg(all(feature = "ffmpeg", feature = "whisper"))]
+        if self
+            .caption_job
+            .as_ref()
+            .is_some_and(|job| !job.snapshot().finished)
+        {
+            self.status = "Whisper is already running.".into();
+            return;
+        }
+        let Some(request) = self.caption_request() else {
+            return;
         };
-        let drafts = match self.transcriber.transcribe(&request) {
+        #[cfg(all(feature = "ffmpeg", feature = "whisper"))]
+        if self.try_start_whisper(&request) {
+            return;
+        }
+        self.write_stub_captions(&request);
+    }
+
+    fn caption_request(&mut self) -> Option<CaptionRequest> {
+        let sequence = self.session.project().active()?;
+        let (name, start, end) = if let Some(clip_id) = self.selected.first() {
+            if let Some(clip) = sequence.clip(*clip_id) {
+                (clip.name.clone(), clip.timeline_in.0, clip.timeline_out.0)
+            } else {
+                ("Sequence".into(), 0, sequence.end_frame().0)
+            }
+        } else if let (Some(inn), Some(out)) = (sequence.in_point, sequence.out_point) {
+            ("In/Out".into(), inn.0, out.0)
+        } else {
+            ("Sequence".into(), 0, sequence.end_frame().0)
+        };
+        if end <= start {
+            self.status = "Nothing to transcribe.".into();
+            return None;
+        }
+        let media = self.session.project().media.clone();
+        let pieces = collect_pieces(sequence, &media, start, end);
+        Some(CaptionRequest {
+            name,
+            start,
+            end,
+            timebase: sequence.timebase,
+            pieces,
+        })
+    }
+
+    fn write_stub_captions(&mut self, request: &CaptionRequest) {
+        let transcribe = editor_core::TranscribeRequest {
+            media_name: request.name.clone(),
+            language: Some("en".into()),
+            range_in: Frame(request.start),
+            range_out: Frame(request.end),
+            timebase: request.timebase,
+        };
+        let drafts = match self.transcriber.transcribe(&transcribe) {
             Ok(drafts) => drafts,
             Err(err) => {
                 self.status = err.to_string();
                 return;
             }
         };
+        self.apply_captions(drafts, "stub transcriber");
+    }
+
+    fn apply_captions(&mut self, drafts: Vec<editor_core::CaptionDraft>, engine: &str) {
         let count = drafts.len();
         let result = self.session.edit("Auto caption", |project| {
             let seq_id = project.active_sequence.ok_or(EditError::NoActiveSequence)?;
@@ -663,9 +763,84 @@ impl MeridianApp {
             replace_captions(project, seq_id, track_id, drafts)
         });
         self.status = match result {
-            Ok(()) => format!("Auto caption wrote {count} cues (stub transcriber)."),
+            Ok(()) => format!("Auto caption wrote {count} cues ({engine})."),
             Err(err) => err.to_string(),
         };
+    }
+
+    #[cfg(all(feature = "ffmpeg", feature = "whisper"))]
+    fn try_start_whisper(&mut self, request: &CaptionRequest) -> bool {
+        if let Err(err) = editor_media::whisper_availability() {
+            self.status = format!("{err} Using stub cues.");
+            return false;
+        }
+        if request.pieces.is_empty() {
+            self.status = "No audible audio in that range. Using stub cues.".into();
+            return false;
+        }
+        let pieces = request
+            .pieces
+            .iter()
+            .map(|piece| editor_media::WavPiece {
+                path: piece.path.clone(),
+                timeline_in: piece.timeline_in,
+                timeline_out: piece.timeline_out,
+                source_at_in: piece.source_at_in,
+                seconds_per_frame: piece.seconds_per_frame,
+                gain: piece.gain,
+            })
+            .collect();
+        self.caption_job = Some(crate::caption_job::spawn_caption(
+            pieces,
+            request.start,
+            request.end,
+            request.timebase,
+            request.name.clone(),
+            Some("en".into()),
+        ));
+        self.status = "Transcribing with Whisper…".into();
+        true
+    }
+
+    fn pump_jobs(&mut self, ctx: &egui::Context) {
+        let _ = ctx;
+        #[cfg(feature = "ffmpeg")]
+        {
+            let snap = self.export_job.as_ref().map(|job| job.snapshot());
+            if let Some(snap) = snap {
+                self.deliver.progress = snap.fraction;
+                self.deliver.report = snap.message.clone();
+                if snap.finished {
+                    self.export_job = None;
+                    self.status = if snap.ok {
+                        "Export finished.".into()
+                    } else {
+                        snap.message
+                    };
+                } else {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                }
+            }
+        }
+        #[cfg(all(feature = "ffmpeg", feature = "whisper"))]
+        {
+            let snap = self.caption_job.as_ref().map(|job| job.snapshot());
+            if let Some(snap) = snap {
+                if snap.finished {
+                    self.caption_job = None;
+                    if snap.ok {
+                        self.apply_captions(snap.drafts, "Whisper");
+                    } else if let Some(request) = self.caption_request() {
+                        self.write_stub_captions(&request);
+                        self.status = format!("{}. Using stub cues.", snap.message);
+                    } else {
+                        self.status = format!("{}. Using stub cues.", snap.message);
+                    }
+                } else {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                }
+            }
+        }
     }
 
     pub fn add_transition_at_selection(&mut self, kind: TransitionKind) {
@@ -919,6 +1094,88 @@ impl MeridianApp {
         self.status = "Opened example project — Northline — Opening.".into();
     }
 
+    pub(crate) fn start_export(&mut self) {
+        #[cfg(feature = "ffmpeg")]
+        if self
+            .export_job
+            .as_ref()
+            .is_some_and(|job| !job.snapshot().finished)
+        {
+            self.deliver.report = "An export is already running.".into();
+            return;
+        }
+        let Some(sequence) = self.session.project().active().cloned() else {
+            self.deliver.report = "No sequence.".into();
+            return;
+        };
+        let media = self.session.project().media.clone();
+        let range = if self.deliver.use_in_out {
+            ExportRange::InOut
+        } else {
+            ExportRange::WholeSequence
+        };
+        let output = self.deliver.output_path.clone();
+        #[cfg(feature = "ffmpeg")]
+        {
+            match editor_media::plan_encode(
+                &sequence,
+                &media,
+                range,
+                &self.deliver.codec,
+                &self.deliver.container,
+                self.deliver.burn_captions,
+            ) {
+                Ok(script) => {
+                    let duration = script.duration_secs;
+                    match editor_media::spawn_export(script, std::path::PathBuf::from(&output)) {
+                        Ok(job) => {
+                            self.export_job = Some(job);
+                            self.deliver.progress = 0.0;
+                            self.deliver.report = format!(
+                                "Encoding {output} ({duration:.2}s, {}).",
+                                self.deliver.codec
+                            );
+                            self.status = "Export started.".into();
+                        }
+                        Err(err) => self.deliver.report = err,
+                    }
+                }
+                Err(err) => self.deliver.report = err,
+            }
+        }
+        #[cfg(not(feature = "ffmpeg"))]
+        {
+            let _ = (sequence, media, range, output);
+            self.deliver.report = "Picture encoding needs the ffmpeg feature. Rebuild with --features ffmpeg, then Export writes an H.264/AAC mp4.".into();
+            self.export_manifest();
+        }
+    }
+
+    pub(crate) fn export_running(&self) -> bool {
+        #[cfg(feature = "ffmpeg")]
+        {
+            self.export_job.is_some()
+        }
+        #[cfg(not(feature = "ffmpeg"))]
+        {
+            false
+        }
+    }
+
+    pub(crate) fn cancel_export(&mut self) {
+        #[cfg(feature = "ffmpeg")]
+        if let Some(job) = &self.export_job {
+            job.cancel();
+            self.deliver.report = "Cancelling export…".into();
+            self.status = "Cancelling export.".into();
+        }
+        #[cfg(not(feature = "ffmpeg"))]
+        {
+            self.deliver.report = "No encode is running.".into();
+        }
+    }
+
+    #[cfg_attr(feature = "ffmpeg", allow(dead_code))]
     pub(crate) fn export_manifest(&mut self) {
         let Some(sequence) = self.session.project().active() else {
             self.deliver.report = "No sequence.".into();
@@ -1130,6 +1387,7 @@ fn consume_key(ctx: &egui::Context, modifiers: Modifiers, key: Key, allow_repeat
 impl eframe::App for MeridianApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.preview_scrub = false;
+        self.pump_jobs(ctx);
         self.tick_playback(ctx);
         self.handle_keys(ctx);
         self.text_editing = false;
@@ -1261,6 +1519,11 @@ impl MeridianApp {
                         }
                         if ui.button("Import from Path…").clicked() {
                             open_import(self);
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Deliver / Export").clicked() {
+                            self.workspace = Workspace::Deliver;
                             ui.close_menu();
                         }
                         ui.separator();

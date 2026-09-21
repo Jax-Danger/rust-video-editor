@@ -18,3 +18,5 @@ thiserror = { workspace = true }
 default = []
 # Shell out to `ffprobe` and `ffmpeg` on PATH. The default build never invokes them.
 ffmpeg = []
+# Shell out to `whisper-cli` (whisper.cpp). No model is downloaded at build time.
+whisper = []

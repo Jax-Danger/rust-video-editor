@@ -271,6 +271,7 @@ fn placed(
         enabled: true,
         effects: Vec::new(),
         label,
+        volume: 1.0,
     }
 }
 

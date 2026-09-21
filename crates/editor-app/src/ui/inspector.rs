@@ -1,6 +1,6 @@
 use editor_core::{
-    clip_relative, color_grade, set_grade_at, set_transform_at, toggle_grade_key,
-    toggle_transform_key, transform, ClipId, GradeParam, TransformParam,
+    clip_relative, color_grade, set_clip_volume, set_grade_at, set_transform_at, toggle_grade_key,
+    toggle_transform_key, transform, ClipId, GradeParam, TrackKind, TransformParam,
 };
 use egui::{Color32, RichText, Sense, Shape, Stroke, Vec2};
 
@@ -71,6 +71,31 @@ fn inspector_body(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId, sna
         editor_core::Frame(snapshot.timeline_in),
     )
     .max(0);
+
+    if snapshot.kind == TrackKind::Audio {
+        ui.add_space(8.0);
+        widgets::section_label(ui, "Sound");
+        let (current, _) = (snapshot.volume, false);
+        let edit = widgets::param_slider(ui, "Clip gain", current, 0.0..=2.0, false);
+        if edit.started {
+            app.session.begin_interactive("Clip gain");
+        }
+        if edit.changed {
+            let value = edit.value;
+            let result = app.session.edit("Clip gain", |project| {
+                let seq = project
+                    .active_sequence
+                    .ok_or(editor_core::EditError::NoActiveSequence)?;
+                set_clip_volume(project, seq, clip_id, value)
+            });
+            if let Err(err) = result {
+                app.status = err.to_string();
+            }
+        }
+        if edit.stopped {
+            app.session.end_interactive();
+        }
+    }
 
     if matches!(app.workspace, crate::app::Workspace::Colour) {
         colour_wheel(ui, app, clip_id, rel);
@@ -235,6 +260,8 @@ fn inspector_body(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId, sna
 struct ClipSnap {
     name: String,
     track_name: String,
+    kind: TrackKind,
+    volume: f32,
     timeline_in: i64,
     timeline_out: i64,
     source_in: i64,
@@ -252,6 +279,8 @@ fn clip_snapshot(app: &MeridianApp, id: ClipId) -> Option<ClipSnap> {
     Some(ClipSnap {
         name: clip.name.clone(),
         track_name: sequence.tracks[ti].name.clone(),
+        kind: sequence.tracks[ti].kind,
+        volume: clip.volume,
         timeline_in: clip.timeline_in.0,
         timeline_out: clip.timeline_out.0,
         source_in: clip.source_in.0,

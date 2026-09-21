@@ -293,7 +293,12 @@ pub fn param_slider(
 
     paint_diamond(painter, diamond, keyed);
 
-    let hit = track.expand2(Vec2::new(0.0, 8.0));
+    // The painted track is only a few pixels tall. The whole row, including the
+    // numeric readout, is the hit target so a click sets the value.
+    let hit = Rect::from_min_max(
+        pos2(track.left(), rect.top()),
+        pos2(value_rect.right(), rect.bottom()),
+    );
     let drag = ui.interact(hit, Id::new(("param", label)), Sense::click_and_drag());
     let key = ui.interact(diamond.expand(3.0), Id::new(("key", label)), Sense::click());
 

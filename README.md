@@ -9,7 +9,7 @@ Meridian is a desktop non-linear editor written in Rust. The timeline is frame-a
 | Crate | Role |
 | --- | --- |
 | `editor-core` | Timebase, project model, edit engine, grades, captions, templates, JSON I/O |
-| `editor-media` | Probe and preview decode. Stub by default; `ffprobe` / `ffmpeg` CLI behind the `ffmpeg` feature |
+| `editor-media` | Probe, preview decode, timeline export, and Whisper captions. Stub by default; `ffprobe` / `ffmpeg` behind the `ffmpeg` feature; `whisper-cli` behind the `whisper` feature |
 | `editor-app` | egui / eframe shell. Binary name: `meridian` |
 
 `editor-core` never stores an edit in floating-point seconds. A [`Timebase`](crates/editor-core/src/time.rs) is a rational frame rate. A [`Frame`](crates/editor-core/src/time.rs) is an `i64` index on that rate. Media time is an integer tick count (`MediaTime`) and converts onto the sequence with rounded rational arithmetic. Drop-frame timecode is used for 29.97 and 59.94.
@@ -35,18 +35,18 @@ cargo run
 Daily editing needs a desktop session, GTK 3 (native file dialogs), and ffmpeg. Audio playback also needs ALSA (PipeWire's ALSA plugin is enough).
 
 ```bash
-sudo dnf install gcc pkg-config gtk3-devel alsa-lib-devel ffmpeg \
-  libxkbcommon-x11 mesa-libGL mesa-libEGL pipewire-alsa
+sudo dnf install gcc gcc-c++ cmake pkg-config gtk3-devel alsa-lib-devel ffmpeg \
+  dejavu-sans-fonts libxkbcommon-x11 mesa-libGL mesa-libEGL pipewire-alsa
 cargo run -p editor-app --features ffmpeg
 ```
 
-`gtk3-devel` is required to compile: the open, save, and import dialogs link GTK 3. `alsa-lib-devel` is required only for `--features ffmpeg`, which is the build that plays audio. The default `cargo build` / `cargo test` does not link ALSA.
+`gtk3-devel` is required to compile: the open, save, and import dialogs link GTK 3. `alsa-lib-devel` is required only for `--features ffmpeg`, which is the build that plays audio and encodes. The default `cargo build` / `cargo test` does not link ALSA and does not spawn ffmpeg. Auto Caption with a local model is a separate build: `cargo run -p editor-app --features whisper` (that feature includes ffmpeg). `gcc-c++` and `cmake` are only for building whisper.cpp itself — use `g++`, not Clang, because the Cloud and Fedora Clang packages often cannot find `libstdc++`. `dejavu-sans-fonts` is what Export uses to burn captions into the picture.
 
 ### Debian / Ubuntu
 
 ```bash
-sudo apt install gcc pkg-config libgtk-3-dev libasound2-dev ffmpeg \
-  libxkbcommon-x11-0 libegl1 libgl1
+sudo apt install gcc g++ cmake pkg-config libgtk-3-dev libasound2-dev ffmpeg \
+  fonts-dejavu-core libxkbcommon-x11-0 libegl1 libgl1
 cargo run -p editor-app --features ffmpeg
 ```
 
@@ -115,6 +115,8 @@ Shortcuts are global while you are not typing in a text field. The same list is 
 
 Reverse shuttle and rates other than 1× play the picture and stay silent. At 1×, the ffmpeg build decodes interleaved stereo PCM at 48 kHz in about two-second chunks and plays it through the default ALSA device (rodio). The viewer shows a stereo meter and a badge: `Audio`, `Buffering`, `Silent`, `No device`, or `No audio`. A missing device does not stop the picture. The default build (no `ffmpeg` feature) does not link an audio backend; its badge is `No audio` and the status line says to rebuild with `--features ffmpeg`.
 
+Muted audio tracks, and every non-solo track while any audio track is soloed, stay out of the mix. Each clip has a **Clip gain** slider in the inspector (0 to 2 in the UI, stored up to 4). Playback, the meters, caption extraction, and export all use that gain. Meters are the peak of the chunk currently playing, so they move with the mix rather than with a single clip.
+
 Colour and transform parameters are `AnimatedF32`: a constant until you add a keyframe, then linear or hold interpolation in clip-relative frames. The inspector diamond toggles a key at the playhead. The Colour workspace adds an offset pad for temperature and tint.
 
 Transitions (cross dissolve, wipe, push) are centered on a cut and consume head and tail handles. Duration is in sequence frames.
@@ -123,9 +125,11 @@ Transitions (cross dissolve, wipe, push) are centered on a cut and consume head 
 
 - **Edit** — media pool, program viewer, inspector, captions, timeline
 - **Colour** — viewer plus grade, wheels, and transform
-- **Deliver** — codec, container, and in/out. **Write Manifest** saves a JSON export plan. This build does not encode pictures
+- **Deliver** — codec, container, in/out, and **Export**. With `--features ffmpeg` this encodes a real file. Without that feature, Export still writes the JSON manifest and says the encoder is compiled out.
 
-The program monitor draws mute/solo, grade, transform, dissolve, wipe, push, and caption burn-in as proxy cards. With `--features ffmpeg` it replaces that stack with a decoded frame of the topmost visible video clip under the playhead. Play, keyboard stepping, and mouse scrubbing all follow the sequence timebase. If ffmpeg is missing or the file is offline, the proxy stays up and the viewer says why.
+The program monitor draws mute/solo, grade, transform, dissolve, wipe, push, and caption burn-in as proxy cards when decode is off. With `--features ffmpeg` it decodes every visible video layer under the playhead and composites them on the CPU: the same grade formula as the proxy cards, plus scale, position, rotation, anchor, opacity, a left wipe, and a push. Dissolves update every frame. Play, keyboard stepping, and mouse scrubbing all follow the sequence timebase. If ffmpeg is missing or every layer is offline, the proxy stays up and the viewer says why.
+
+What the preview still does not do: blend modes, motion blur, and a true wipe angle (wipes are always left-to-right). Decoded frames are fit into the preview box before the transform, so a source that is not the sequence aspect is letterboxed by ffmpeg and then scaled again by the clip transform. Export samples a keyed grade or transform about every six frames, and its grade filters are an ffmpeg approximation of the preview formula (exposure, eq, colorbalance). The preview formula and the export filters will not match pixel for pixel.
 
 ## Templates
 
@@ -177,43 +181,75 @@ The example sequence *Northline — Opening* points its three picture clips at s
 | `city_broll.mp4` | classic `testsrc` card | 288 frames, 24 fps |
 | `aerial.mp4` | the same card with a moving hue | 192 frames, 24 fps |
 
-They are generated, not third-party footage. Regenerate them with [`scripts/generate-sample-media.sh`](scripts/generate-sample-media.sh) if you have ffmpeg. Launching from the repo root (or any subdirectory) resolves those relative paths. The viewer picks the highest unmuted video track that covers the playhead — V2's aerial replaces V1 while that clip is on screen — and caches a short burst of frames so playback and scrubbing do not spawn ffmpeg once per frame.
+They are generated, not third-party footage. Regenerate them with [`scripts/generate-sample-media.sh`](scripts/generate-sample-media.sh) if you have ffmpeg. Launching from the repo root (or any subdirectory) resolves those relative paths. The viewer stacks every visible video layer, so V2's keyed aerial sits on top of V1 instead of replacing it, and caches a short burst of frames per layer so playback and scrubbing do not spawn ffmpeg once per frame.
 
 **File → Import** probes any file `ffprobe` can open and writes the absolute path into the project. Offline media and a missing `ffmpeg` binary leave the shell usable and put the reason on the program monitor and on the clip.
 
 ## Captions
 
-Each sequence can carry a caption track of `CaptionCue`s. **Auto Caption** calls a `CaptionTranscriber`. The shipping implementation is `StubTranscriber`: it slices the selected range into roughly two-second cues and cycles a fixed phrase list. No API key, no network.
+Each sequence can carry a caption track of editable `CaptionCue`s. **Auto Caption** transcribes a range and replaces that track in one undo step.
 
-To attach a real engine, implement the trait and construct the app with your type (the app currently stores `StubTranscriber` directly; widening that field to `Box<dyn CaptionTranscriber>` is the intended seam):
+The range is the selected clip, otherwise the marked in and out when both are set, otherwise the whole sequence. The ffmpeg build mixes the audible audio in that range — mute, solo, and clip gain included, with silence in the gaps — to a 16 kHz mono wav. Word times on that wav map linearly onto sequence frames, then words are grouped into cues (a pause over 0.45 s, a cue longer than about 2.8 s, 48 characters, or sentence punctuation).
 
-```rust
-use editor_core::{CaptionDraft, CaptionError, CaptionTranscriber, TranscribeRequest};
+### Stub
 
-struct WhisperTranscriber { /* model path or client */ }
+The default build, and any build that cannot find `whisper-cli` or a model, uses `StubTranscriber`. It slices the range into roughly two-second cues and cycles a fixed phrase list. No network, no model. The captions panel says which backend it will use. If Whisper runs and returns no speech, or the process fails, the same stub cues are written and the status line keeps the error.
 
-impl CaptionTranscriber for WhisperTranscriber {
-    fn transcribe(&mut self, request: &TranscribeRequest) -> Result<Vec<CaptionDraft>, CaptionError> {
-        // Local: whisper.cpp / whisper-rs over the media range.
-        // Cloud: send the same range and map word timings back onto `request.timebase`.
-        let _ = request;
-        Err(CaptionError::Failed("not linked".into()))
-    }
-}
+### Local Whisper
+
+```bash
+cargo run -p editor-app --features whisper
 ```
 
-Map word timestamps through the sequence timebase into `Frame` in/out points. `replace_captions` writes the drafts onto the caption track in one undoable edit.
+`whisper` turns on the ffmpeg feature as well. It does not download a model and it does not link whisper.cpp, so `cargo test` without the feature never needs either. At runtime the app looks for `whisper-cli` (or `whisper-cpp`) on `PATH`, then `~/.local/bin/whisper-cli`, `~/.cache/meridian/whisper.cpp/build/bin/whisper-cli`, `/usr/local/bin`, and `/usr/bin`. Override with `WHISPER_BIN`. The model search is `WHISPER_MODEL`, then the first of `ggml-tiny.en.bin`, `ggml-base.en.bin`, `ggml-tiny.bin`, `ggml-base.bin`, and `ggml-small.en.bin` under `~/.cache/whisper`, then `./models/ggml-tiny.en.bin`.
+
+On Fedora, build whisper.cpp with GCC:
+
+```bash
+sudo dnf install git cmake gcc gcc-c++
+git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git
+cmake -S whisper.cpp -B whisper.cpp/build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++
+cmake --build whisper.cpp/build -j --target whisper-cli
+install -D whisper.cpp/build/bin/whisper-cli "$HOME/.local/bin/whisper-cli"
+mkdir -p "$HOME/.cache/whisper"
+curl -L -o "$HOME/.cache/whisper/ggml-tiny.en.bin" \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin
+```
+
+Debian and Ubuntu use the same cmake line after `sudo apt install git cmake g++`. A larger `ggml-base.en.bin` or `ggml-small.en.bin` in that cache directory is picked up automatically when tiny is absent; set `WHISPER_MODEL` to force one. [`scripts/setup-whisper.sh`](scripts/setup-whisper.sh) does the clone, the GCC build, and the tiny.en download.
+
+The Northline sample audio is sine tones, so Whisper on the example falls back to stub cues. Import a clip that contains speech, select it, and run **Auto Caption**.
+
+`editor_core::parse_stt_json` reads whisper.cpp `-ojf` token offsets (milliseconds) and OpenAI `segments` / `words`. `CaptionTranscriber` is still the seam for another engine.
+
+## Deliver
+
+**Deliver → Export** runs ffmpeg and writes the file in the path field (default `/tmp/meridian-export.mp4`). The tested path is H.264 + AAC in an mp4. H.265, ProRes, and DNxHR are passed through as codec arguments when that ffmpeg build has the encoder.
+
+The graph is the sequence, or the marked in/out when that checkbox is on:
+
+- Visible video tracks, bottom to top. Muted video is black. Solo hides the other video tracks.
+- A cross dissolve, left wipe, or left push that fills a slice uses ffmpeg `xfade`. A slice that only overlaps part of a transition holds the midpoint opacity.
+- Scale, position, rotation, and opacity are applied. Rotation is around the center. Anchor is preview-only.
+- Grade is an ffmpeg approximation (exposure, contrast, saturation, shadow/highlight lift, temperature and tint). Neutral grades are omitted.
+- Audio is mixed with each clip's gain. Offline audio is skipped and named in the report. Offline video that is actually visible fails the export.
+- Captions are burned with `drawtext` when a DejaVu, Liberation, FreeSans, or Arial font is installed, and written as `mov_text` soft subtitles on mp4 and mov. Uncheck **Burn captions into the picture** to keep them soft only. MXF does not get the soft-sub input.
+
+A progress bar follows ffmpeg's `out_time`. **Cancel** sends `SIGTERM`. A failed or cancelled encode deletes the partial file. Without `--features ffmpeg`, Export writes the JSON manifest instead and explains how to rebuild.
 
 ## Tests
 
-`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, the sample project round-trip, imported media paths in JSON, the stub probe, still-image holds, the ffprobe JSON parser, and preview frame-request bounds. A real decode runs only when tests are built with `--features ffmpeg` and `ffmpeg` is on `PATH`; otherwise that test returns without spawning.
+`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, the sample project round-trip, imported media paths in JSON, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, caption JSON parsing, the export filter graph (grade, overlay, dissolve, gain, burned captions), and the preview composite. It does not spawn ffmpeg or whisper.
+
+`cargo test -p editor-media --features ffmpeg` also encodes a short H.264/AAC mp4 when `ffmpeg` is on `PATH`. `cargo test -p editor-app --features whisper` builds the local speech-to-text path; the binary and model are resolved at runtime, not at compile time.
 
 ## Roadmap
 
-- GPU viewer that composites more than the top decoded video track
-- Fairlight-class audio: mixer and clip gain (1× playback and stereo meters are in the ffmpeg build)
+- GPU viewer. The CPU composite already stacks tracks, grades, transforms, and the three transitions; it is not a full optical-flow or blend-mode engine
+- Fairlight-class mixing beyond mute, solo, and clip gain
 - OFX-style plugins for third-party effects
-- Deliver codecs that encode the manifest instead of only writing it
+- Export that matches the preview grade formula per frame, including anchor and wipe angle
 - Multi-cam: sync groups and angle switching
 - More trim shortcuts, gang, and a command palette
 

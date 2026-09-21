@@ -263,7 +263,7 @@ pub fn collect_pieces(sequence: &Sequence, media: &[MediaAsset], from: i64, to: 
                 timeline_out: clip.timeline_out.0,
                 source_at_in: at_in.to_seconds(clip.media_timebase),
                 seconds_per_frame,
-                gain: 1.0,
+                gain: clip.volume.clamp(0.0, 4.0),
             });
         }
     }
@@ -518,5 +518,60 @@ mod tests {
         assert!(collect_pieces(&sequence, &media, 0, 48).is_empty());
         sequence.tracks[0].muted = false;
         assert!(collect_pieces(&sequence, &media, 0, 48).is_empty());
+    }
+
+    #[test]
+    fn collect_respects_clip_gain_and_solo() {
+        let dir = std::env::temp_dir().join(format!("meridian-gain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let keep = dir.join("keep.wav");
+        let other = dir.join("other.wav");
+        std::fs::write(&keep, b"wav").unwrap();
+        std::fs::write(&other, b"wav").unwrap();
+        let mut sequence = Sequence::new(SequenceId(1), "T", 1920, 1080, Timebase::fps_24());
+        sequence.add_track(TrackId(2), TrackKind::Audio, "A1");
+        sequence.add_track(TrackId(3), TrackKind::Audio, "A2");
+        let mut quiet = Clip::basic(4, 0, 24);
+        quiet.media_id = Some(MediaId(1));
+        quiet.volume = 0.35;
+        let mut loud = Clip::basic(5, 0, 24);
+        loud.media_id = Some(MediaId(2));
+        loud.volume = 1.5;
+        sequence.tracks[0].clips = vec![quiet];
+        sequence.tracks[1].clips = vec![loud];
+        let media = vec![
+            tone(MediaId(1), &keep),
+            tone(MediaId(2), &other),
+        ];
+        let mixed = collect_pieces(&sequence, &media, 0, 24);
+        assert_eq!(mixed.len(), 2);
+        assert!((mixed[0].gain - 0.35).abs() < 1.0e-5);
+        sequence.tracks[1].solo = true;
+        let solo = collect_pieces(&sequence, &media, 0, 24);
+        assert_eq!(solo.len(), 1);
+        assert!((solo[0].gain - 1.5).abs() < 1.0e-5);
+        assert!(solo[0].path.ends_with("other.wav"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn tone(id: MediaId, path: &std::path::Path) -> MediaAsset {
+        MediaAsset {
+            id,
+            bin_id: editor_core::BinId(1),
+            name: path.file_name().unwrap().to_string_lossy().into_owned(),
+            path: path.to_string_lossy().into_owned(),
+            duration: Frame(48),
+            timebase: Timebase::fps_24(),
+            width: None,
+            height: None,
+            video_codec: None,
+            audio_codec: Some("pcm".into()),
+            audio_channels: Some(2),
+            sample_rate: Some(48_000),
+            has_video: false,
+            has_audio: true,
+            offline: false,
+        }
     }
 }

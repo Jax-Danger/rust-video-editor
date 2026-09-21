@@ -16,7 +16,7 @@ pub fn captions_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
     ui.horizontal(|ui| {
         ui.add_space(10.0);
         ui.label(
-            RichText::new("Drafts cues on the caption track. This build uses the local stub.")
+            RichText::new(app.caption_backend_note())
                 .size(11.0)
                 .color(THEME.text_mute),
         );

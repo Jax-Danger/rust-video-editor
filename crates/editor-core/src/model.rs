@@ -11,6 +11,12 @@ fn default_version() -> u32 {
 fn default_true() -> bool {
     true
 }
+fn default_volume() -> f32 {
+    1.0
+}
+fn is_unity_volume(value: &f32) -> bool {
+    (*value - 1.0).abs() < 1.0e-5
+}
 fn default_label() -> LabelColor {
     LabelColor::Neutral
 }
@@ -196,6 +202,9 @@ pub struct Clip {
     pub effects: Vec<Effect>,
     #[serde(default = "default_label")]
     pub label: LabelColor,
+    /// Linear clip gain. 1 is unity. Audio playback and export both read it.
+    #[serde(default = "default_volume", skip_serializing_if = "is_unity_volume")]
+    pub volume: f32,
 }
 
 impl Clip {
@@ -241,6 +250,7 @@ impl Clip {
             enabled: true,
             effects: Vec::new(),
             label: LabelColor::Neutral,
+            volume: 1.0,
         }
     }
 
