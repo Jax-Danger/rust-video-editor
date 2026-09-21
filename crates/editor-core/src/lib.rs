@@ -23,8 +23,8 @@ pub use edit::{
     delete_cue, expand_linked, import_media, insert_clips, lift_delete, link_clips, move_clips,
     overwrite_clips, razor_at, razor_clip, replace_captions, ripple_delete, ripple_trim, roll_cut,
     set_grade_at, set_in_point, set_out_point, set_track_flag, set_transform_at, slide, slip,
-    snap_span, snap_to_targets, toggle_grade_key, toggle_transform_key, trim, update_cue_text,
-    EditError, SnapHit, SnapKind, SnapPoint, TrackFlag, TrimEdge,
+    snap_span, snap_to_targets, source_frame_at, toggle_grade_key, toggle_transform_key, trim,
+    update_cue_text, EditError, SnapHit, SnapKind, SnapPoint, TrackFlag, TrimEdge,
 };
 pub use effects::{
     clip_relative, color_grade, color_grade_mut, transform, transform_mut, AnimatedF32, ColorGrade,

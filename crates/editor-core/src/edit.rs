@@ -1124,6 +1124,12 @@ fn source_delta(clip: &Clip, timeline_delta: i64, sequence_timebase: Timebase) -
     convert_frames(timeline_delta, sequence_timebase, clip.media_timebase)
 }
 
+/// Media frame of `clip` corresponding to `timeline_frame` on the sequence.
+pub fn source_frame_at(clip: &Clip, timeline_frame: Frame, sequence_timebase: Timebase) -> Frame {
+    let delta = timeline_frame.0 - clip.timeline_in.0;
+    Frame(clip.source_in.0 + source_delta(clip, delta, sequence_timebase))
+}
+
 fn overlap_pair(duration: i64, alignment: TransitionAlign) -> (i64, i64) {
     match alignment {
         TransitionAlign::Center => {
@@ -1568,6 +1574,22 @@ mod tests {
         project.next_id = 50_000;
         project.sequences.push(sequence);
         project
+    }
+
+    #[test]
+    fn source_frame_follows_the_playhead() {
+        let clip = Clip::basic(1, 10, 40);
+        assert_eq!(source_frame_at(&clip, Frame(10), Timebase::fps_24()).0, 0);
+        assert_eq!(source_frame_at(&clip, Frame(25), Timebase::fps_24()).0, 15);
+        let handled = clip.with_handles(5, 5);
+        assert_eq!(
+            source_frame_at(&handled, Frame(10), Timebase::fps_24()).0,
+            5
+        );
+        assert_eq!(
+            source_frame_at(&handled, Frame(25), Timebase::fps_24()).0,
+            20
+        );
     }
 
     fn video_sequence() -> (Sequence, TrackId) {
