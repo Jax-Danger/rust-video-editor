@@ -6,6 +6,7 @@ mod inspector;
 mod pool;
 mod timeline;
 mod viewer;
+pub mod widgets;
 
 use editor_core::{Frame, Timebase};
 

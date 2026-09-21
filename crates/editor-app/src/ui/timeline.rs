@@ -1,18 +1,18 @@
 //! Timeline: ruler, track headers, clip lanes, transport.
 
 use editor_core::{
-    collect_snap_points, expand_linked, snap_span, ClipId, Frame, TrackFlag, TrackId, TrackKind,
-    TrimEdge,
+    collect_snap_points, expand_linked, snap_span, ClipId, Frame, TrackFlag, TrackKind, TrimEdge,
 };
-use egui::{pos2, Color32, CursorIcon, Rect, RichText, Sense, Stroke, Vec2};
+use egui::{pos2, Align2, Color32, CursorIcon, FontId, Rect, Sense, Shape, Stroke, Vec2};
 
 use crate::app::{note_track_flag, Drag, DragKind, MeridianApp, Tool};
-use crate::theme;
+use crate::theme::{self, THEME};
 use crate::ui::format_tc;
+use crate::ui::widgets;
 
-const HEADER_W: f32 = 168.0;
-const RULER_H: f32 = 26.0;
-const ROW_H: f32 = 34.0;
+const HEADER_W: f32 = 156.0;
+const RULER_H: f32 = 28.0;
+const ROW_H: f32 = 36.0;
 
 pub fn timeline_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
     transport(ui, app);
@@ -52,89 +52,76 @@ pub fn timeline_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
 fn transport(ui: &mut egui::Ui, app: &mut MeridianApp) {
     let timebase = app.timebase();
     let end = app.sequence_end();
-    ui.horizontal(|ui| {
-        if ui.small_button("|◀").clicked() {
-            app.playhead = 0;
-            app.playing = false;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::hover());
+    ui.painter().rect_filled(rect, 0.0, THEME.header);
+    ui.painter().hline(
+        rect.x_range(),
+        rect.bottom(),
+        Stroke::new(1.0_f32, THEME.hairline),
+    );
+    let mut bar = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect.shrink2(Vec2::new(8.0, 6.0)))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    bar.spacing_mut().item_spacing.x = 4.0;
+    if widgets::transport_glyph(&mut bar, "Go to start", widgets::bar_left) {
+        app.playhead = 0;
+        app.playing = false;
+    }
+    if widgets::transport_glyph(&mut bar, "Step back", widgets::tri_left) {
+        app.playhead = (app.playhead - 1).max(0);
+        app.playing = false;
+    }
+    if widgets::play_button(&mut bar, app.playing) {
+        app.playing = !app.playing;
+        app.play_accum = 0.0;
+    }
+    if widgets::transport_glyph(&mut bar, "Step forward", widgets::tri_right) {
+        app.playhead += 1;
+        app.playing = false;
+    }
+    if widgets::transport_glyph(&mut bar, "Go to end", widgets::bar_right) {
+        app.playhead = end;
+        app.playing = false;
+    }
+    bar.add_space(10.0);
+    widgets::readout(&mut bar, &format_tc(app.playhead, timebase), 118.0, true);
+    bar.add_space(4.0);
+    widgets::readout(&mut bar, &format_tc(end, timebase), 118.0, false);
+    bar.add_space(12.0);
+    let (inn, out) = app
+        .session
+        .project()
+        .active()
+        .map(|s| (s.in_point.map(|f| f.0), s.out_point.map(|f| f.0)))
+        .unwrap_or((None, None));
+    let in_label = match inn {
+        Some(frame) => format!("In {}", format_tc(frame, timebase)),
+        None => "Mark In".into(),
+    };
+    let out_label = match out {
+        Some(frame) => format!("Out {}", format_tc(frame, timebase)),
+        None => "Mark Out".into(),
+    };
+    if widgets::ghost_button(&mut bar, &in_label) {
+        app.mark_in();
+    }
+    if widgets::ghost_button(&mut bar, &out_label) {
+        app.mark_out();
+    }
+    bar.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if widgets::ghost_button(ui, "Fit") {
+            app.zoom_to_fit();
         }
-        if ui.small_button("◀").clicked() {
-            app.playhead = (app.playhead - 1).max(0);
-            app.playing = false;
-        }
-        let play_label = if app.playing { "Pause" } else { "Play" };
-        if ui.button(play_label).clicked() {
-            app.playing = !app.playing;
-            app.play_accum = 0.0;
-        }
-        if ui.small_button("▶").clicked() {
-            app.playhead += 1;
-            app.playing = false;
-        }
-        if ui.small_button("▶|").clicked() {
-            app.playhead = end;
-            app.playing = false;
-        }
-        ui.add_space(8.0);
-        ui.label(
-            RichText::new(format_tc(app.playhead, timebase))
-                .monospace()
-                .size(16.0)
-                .color(theme::AMBER),
-        );
-        ui.label(
-            RichText::new(format!("/ {}", format_tc(end, timebase)))
-                .monospace()
-                .color(theme::DIM),
-        );
-        ui.separator();
-        let (inn, out) = app
-            .session
-            .project()
-            .active()
-            .map(|s| (s.in_point.map(|f| f.0), s.out_point.map(|f| f.0)))
-            .unwrap_or((None, None));
-        ui.label(
-            RichText::new(match inn {
-                Some(f) => format!("In {}", format_tc(f, timebase)),
-                None => "In —".into(),
-            })
-            .small()
-            .monospace(),
-        );
-        ui.label(
-            RichText::new(match out {
-                Some(f) => format!("Out {}", format_tc(f, timebase)),
-                None => "Out —".into(),
-            })
-            .small()
-            .monospace(),
-        );
-        if ui.small_button("In").clicked() {
-            app.mark_in();
-        }
-        if ui.small_button("Out").clicked() {
-            app.mark_out();
-        }
-        ui.separator();
-        if ui.small_button("−").clicked() {
-            app.pixels_per_frame = (app.pixels_per_frame / 1.25).max(0.35);
-        }
-        let mut zoom = app.pixels_per_frame;
-        if ui
-            .add(
-                egui::Slider::new(&mut zoom, 0.35..=24.0)
-                    .show_value(false)
-                    .text("zoom"),
-            )
-            .changed()
-        {
-            app.pixels_per_frame = zoom;
-        }
-        if ui.small_button("+").clicked() {
+        if widgets::ghost_button(ui, "+") {
             app.pixels_per_frame = (app.pixels_per_frame * 1.25).min(24.0);
         }
-        if ui.small_button("Fit").clicked() {
-            app.zoom_to_fit();
+        if let Some(zoom) = widgets::mini_slider(ui, app.pixels_per_frame, 0.35..=24.0) {
+            app.pixels_per_frame = zoom;
+        }
+        if widgets::ghost_button(ui, "−") {
+            app.pixels_per_frame = (app.pixels_per_frame / 1.25).max(0.35);
         }
     });
 }
@@ -148,67 +135,38 @@ fn header_row(
     let track = &sequence.tracks[index];
     let (rect, _) = ui.allocate_exact_size(Vec2::new(HEADER_W, ROW_H), Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, 0.0, theme::HEADER);
+    painter.rect_filled(rect, 0.0, THEME.header);
+    painter.hline(
+        rect.x_range(),
+        rect.bottom(),
+        Stroke::new(1.0_f32, THEME.hairline),
+    );
     painter.rect_filled(
         Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height())),
         0.0,
         theme::track_color(track.kind),
     );
+    painter.text(
+        pos2(rect.left() + 12.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        &track.name,
+        FontId::new(12.0, egui::FontFamily::Proportional),
+        THEME.text,
+    );
     let mut child = ui.new_child(
         egui::UiBuilder::new()
-            .max_rect(rect.shrink2(Vec2::new(6.0, 2.0)))
-            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            .max_rect(rect.shrink2(Vec2::new(8.0, 4.0)))
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
     );
-    child.label(RichText::new(&track.name).small().strong());
-    child.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        flag_button(
-            ui,
-            app,
-            track.id,
-            "S",
-            track.solo,
-            TrackFlag::Solo,
-            theme::AMBER,
-        );
-        flag_button(
-            ui,
-            app,
-            track.id,
-            "M",
-            track.muted,
-            TrackFlag::Mute,
-            theme::DANGER,
-        );
-        flag_button(
-            ui,
-            app,
-            track.id,
-            "L",
-            track.locked,
-            TrackFlag::Lock,
-            theme::AMBER,
-        );
-    });
-}
-
-fn flag_button(
-    ui: &mut egui::Ui,
-    app: &mut MeridianApp,
-    track: TrackId,
-    label: &str,
-    on: bool,
-    flag: TrackFlag,
-    color: Color32,
-) {
-    let button = egui::Button::new(RichText::new(label).small().color(if on {
-        theme::BG
-    } else {
-        theme::DIM
-    }))
-    .min_size(Vec2::new(18.0, 16.0))
-    .fill(if on { color } else { theme::PANEL });
-    if ui.add(button).clicked() {
-        note_track_flag(app, track, flag, !on);
+    child.spacing_mut().item_spacing.x = 3.0;
+    if widgets::icon_toggle(&mut child, "S", track.solo, THEME.amber) {
+        note_track_flag(app, track.id, TrackFlag::Solo, !track.solo);
+    }
+    if widgets::icon_toggle(&mut child, "M", track.muted, THEME.danger) {
+        note_track_flag(app, track.id, TrackFlag::Mute, !track.muted);
+    }
+    if widgets::icon_toggle(&mut child, "L", track.locked, THEME.control_hover) {
+        note_track_flag(app, track.id, TrackFlag::Lock, !track.locked);
     }
 }
 
@@ -223,19 +181,37 @@ fn ruler(
         ui.allocate_exact_size(Vec2::new(content_w, RULER_H), Sense::click_and_drag());
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, theme::RULER);
+    painter.hline(
+        rect.x_range(),
+        rect.bottom(),
+        Stroke::new(1.0_f32, THEME.hairline),
+    );
     let ppf = app.pixels_per_frame;
     let fps = sequence.timebase.timecode_fps().max(1);
     let major = fps;
+    if let (Some(inn), Some(out)) = (sequence.in_point, sequence.out_point) {
+        let x0 = rect.min.x + inn.0 as f32 * ppf;
+        let x1 = rect.min.x + out.0 as f32 * ppf;
+        painter.rect_filled(
+            Rect::from_min_max(
+                pos2(x0, rect.bottom() - 3.0),
+                pos2(x1.max(x0 + 2.0), rect.bottom()),
+            ),
+            0.0,
+            THEME.accent,
+        );
+    }
+    let step = if ppf < 1.2 { major * 2 } else { major };
     let mut frame = 0;
     while frame <= end {
         let x = rect.min.x + frame as f32 * ppf;
-        if x > rect.max.x + 20.0 {
+        if x > rect.max.x + 40.0 {
             break;
         }
         let height = if frame % (major * 5) == 0 {
-            12.0
+            14.0
         } else if frame % major == 0 {
-            8.0
+            9.0
         } else {
             0.0
         };
@@ -243,32 +219,31 @@ fn ruler(
             painter.vline(
                 x,
                 rect.bottom() - height..=rect.bottom(),
-                Stroke::new(1.0_f32, theme::BORDER),
+                Stroke::new(1.0_f32, THEME.border),
             );
         }
-        if frame % major == 0 && ppf > 1.2 {
+        if frame % step == 0 && ppf > 0.8 {
             painter.text(
-                pos2(x + 3.0, rect.top() + 2.0),
-                egui::Align2::LEFT_TOP,
+                pos2(x + 4.0, rect.top() + 3.0),
+                Align2::LEFT_TOP,
                 format_tc(frame, sequence.timebase),
-                egui::FontId::monospace(10.0),
-                theme::DIM,
+                FontId::monospace(10.0),
+                THEME.text_mute,
             );
         }
-        frame += if ppf < 1.5 { major } else { major.max(1) };
-        if ppf >= 4.0 && frame % major != 0 {
-            // already stepping by major
-        }
+        frame += major.max(1);
     }
     for marker in &sequence.markers {
         let x = rect.min.x + marker.frame.0 as f32 * ppf;
-        painter.text(
-            pos2(x, rect.bottom() - 2.0),
-            egui::Align2::CENTER_BOTTOM,
-            "▼",
-            egui::FontId::proportional(10.0),
-            theme::AMBER,
-        );
+        painter.add(Shape::convex_polygon(
+            vec![
+                pos2(x, rect.bottom() - 8.0),
+                pos2(x + 4.0, rect.bottom() - 2.0),
+                pos2(x - 4.0, rect.bottom() - 2.0),
+            ],
+            THEME.amber,
+            Stroke::NONE,
+        ));
     }
     if response.dragged() || response.clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
@@ -306,12 +281,12 @@ fn lane(
                 pos2(x0, rect.min.y + 4.0),
                 pos2(x1.max(x0 + 4.0), rect.max.y - 4.0),
             );
-            painter.rect_filled(crect, 2.0, theme::CAPTION);
-            painter.with_clip_rect(crect).text(
-                crect.left_center() + Vec2::new(4.0, 0.0),
-                egui::Align2::LEFT_CENTER,
+            paint_clip_body(&painter, crect, theme::CAPTION, false, false);
+            painter.with_clip_rect(crect.shrink(4.0)).text(
+                crect.left_center() + Vec2::new(6.0, 0.0),
+                Align2::LEFT_CENTER,
                 &cue.text,
-                egui::FontId::proportional(11.0),
+                FontId::new(11.0, egui::FontFamily::Proportional),
                 Color32::WHITE,
             );
         }
@@ -326,20 +301,19 @@ fn lane(
             pos2(x1.max(x0 + 3.0), rect.max.y - 3.0),
         );
         let selected = app.selected.contains(&clip.id);
-        painter.rect_filled(crect, 2.0, theme::label_fill(clip.label, track.kind));
-        if selected {
-            painter.rect_stroke(
-                crect,
-                2.0,
-                Stroke::new(1.5_f32, theme::AMBER),
-                egui::StrokeKind::Inside,
-            );
-        }
-        painter.with_clip_rect(crect.shrink(3.0)).text(
-            crect.left_center() + Vec2::new(5.0, 0.0),
-            egui::Align2::LEFT_CENTER,
+        let fill = theme::label_fill(clip.label, track.kind);
+        paint_clip_body(
+            &painter,
+            crect,
+            fill,
+            selected,
+            track.kind == TrackKind::Audio,
+        );
+        painter.with_clip_rect(crect.shrink(4.0)).text(
+            crect.left_center() + Vec2::new(7.0, 0.0),
+            Align2::LEFT_CENTER,
             &clip.name,
-            egui::FontId::proportional(11.0),
+            FontId::new(11.0, egui::FontFamily::Proportional),
             Color32::WHITE,
         );
     }
@@ -352,14 +326,25 @@ fn lane(
         let x0 = rect.min.x + start.0 as f32 * ppf;
         let x1 = rect.min.x + end.0 as f32 * ppf;
         let mid_y = rect.center().y;
-        painter.line_segment(
-            [pos2(x0, rect.min.y + 4.0), pos2((x0 + x1) * 0.5, mid_y)],
-            Stroke::new(1.0_f32, theme::TEXT),
-        );
-        painter.line_segment(
-            [pos2((x0 + x1) * 0.5, mid_y), pos2(x1, rect.min.y + 4.0)],
-            Stroke::new(1.0_f32, theme::TEXT),
-        );
+        let mid_x = (x0 + x1) * 0.5;
+        painter.add(Shape::convex_polygon(
+            vec![
+                pos2(x0, rect.min.y + 5.0),
+                pos2(mid_x, mid_y),
+                pos2(x0, rect.max.y - 5.0),
+            ],
+            Color32::from_white_alpha(50),
+            Stroke::new(1.0_f32, Color32::from_white_alpha(140)),
+        ));
+        painter.add(Shape::convex_polygon(
+            vec![
+                pos2(x1, rect.min.y + 5.0),
+                pos2(mid_x, mid_y),
+                pos2(x1, rect.max.y - 5.0),
+            ],
+            Color32::from_white_alpha(50),
+            Stroke::new(1.0_f32, Color32::from_white_alpha(140)),
+        ));
     }
 
     paint_playhead(&painter, rect, app.playhead, ppf);
@@ -634,7 +619,65 @@ fn kind_name(kind: DragKind) -> &'static str {
 
 fn paint_playhead(painter: &egui::Painter, rect: Rect, frame: i64, ppf: f32) {
     let x = rect.min.x + frame as f32 * ppf;
-    painter.vline(x, rect.y_range(), Stroke::new(1.0_f32, theme::PLAYHEAD));
+    painter.vline(x, rect.y_range(), Stroke::new(1.5_f32, THEME.playhead));
+    if rect.height() <= RULER_H + 2.0 {
+        painter.add(Shape::convex_polygon(
+            vec![
+                pos2(x - 5.5, rect.top()),
+                pos2(x + 5.5, rect.top()),
+                pos2(x, rect.top() + 8.0),
+            ],
+            THEME.playhead,
+            Stroke::NONE,
+        ));
+    }
+}
+
+fn paint_clip_body(
+    painter: &egui::Painter,
+    rect: Rect,
+    fill: Color32,
+    selected: bool,
+    waveform: bool,
+) {
+    if rect.width() < 1.0 {
+        return;
+    }
+    painter.rect_filled(rect, 3.0, fill);
+    let sheen = Rect::from_min_max(
+        rect.min,
+        pos2(rect.right(), rect.top() + rect.height() * 0.42),
+    );
+    painter.rect_filled(sheen, 3.0, Color32::from_white_alpha(28));
+    painter.rect_filled(
+        Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height())),
+        0.0,
+        Color32::from_white_alpha(50),
+    );
+    if waveform {
+        let mut x = rect.left() + 8.0;
+        let mut seed = (rect.left() as u32)
+            .wrapping_mul(1664525)
+            .wrapping_add(1013904223);
+        while x < rect.right() - 4.0 {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let h = 3.0 + ((seed >> 16) % 100) as f32 / 100.0 * (rect.height() * 0.28);
+            painter.vline(
+                x,
+                (rect.center().y - h)..=(rect.center().y + h),
+                Stroke::new(1.0_f32, Color32::from_white_alpha(70)),
+            );
+            x += 3.5;
+        }
+    }
+    if selected {
+        painter.rect_stroke(
+            rect,
+            3.0,
+            Stroke::new(1.6_f32, THEME.selection),
+            egui::StrokeKind::Inside,
+        );
+    }
 }
 
 fn x_to_frame(x: f32, origin: f32, ppf: f32) -> i64 {

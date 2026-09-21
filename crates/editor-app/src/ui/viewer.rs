@@ -2,40 +2,47 @@
 //! for a GPU viewer. Colour, opacity, dissolves, wipes, and pushes are real.
 
 use editor_core::{clip_relative, color_grade, transform, ColorGrade, Frame, TrackKind, Transform};
-use egui::{Color32, Painter, Pos2, Rect, Sense, Shape, Stroke, Vec2};
+use egui::{Color32, FontId, Painter, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 
 use crate::app::MeridianApp;
-use crate::theme;
+use crate::theme::THEME;
 use crate::ui::format_tc;
+use crate::ui::widgets;
 
 pub fn viewer_panel(ui: &mut egui::Ui, app: &MeridianApp) {
     let Some(sequence) = app.session.project().active().cloned() else {
         ui.label("No sequence.");
         return;
     };
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("PROGRAM").small().color(theme::DIM));
-        ui.label(egui::RichText::new(&sequence.name).strong());
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(
-                egui::RichText::new(format_tc(app.playhead, sequence.timebase))
-                    .monospace()
-                    .color(theme::AMBER),
-            );
-            ui.label(
-                egui::RichText::new(format!("{}×{}", sequence.width, sequence.height))
-                    .small()
-                    .color(theme::DIM),
-            );
-        });
+    widgets::panel_header(ui, "Program", |ui| {
+        ui.label(
+            egui::RichText::new(&sequence.name)
+                .size(12.0)
+                .color(THEME.text_dim),
+        );
+        ui.add_space(8.0);
+        widgets::readout(
+            ui,
+            &format!("{}×{}", sequence.width, sequence.height),
+            92.0,
+            false,
+        );
+        ui.add_space(6.0);
+        widgets::readout(ui, &format_tc(app.playhead, sequence.timebase), 118.0, true);
     });
     let (rect, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, Color32::from_rgb(8, 9, 11));
+    painter.rect_filled(rect, 0.0, THEME.stage);
     let frame = letterbox(
-        rect.shrink(16.0),
+        rect.shrink(18.0),
         sequence.width as f32,
         sequence.height as f32,
+    );
+    painter.rect_stroke(
+        frame.expand(1.0),
+        0.0,
+        Stroke::new(1.0_f32, THEME.border),
+        egui::StrokeKind::Outside,
     );
     checker(&painter, frame);
     painter.rect_filled(frame, 0.0, Color32::BLACK);
@@ -80,22 +87,28 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &MeridianApp) {
             Pos2::new(frame.left() + 16.0, frame.bottom() - 42.0),
             Pos2::new(frame.right() - 16.0, frame.bottom() - 12.0),
         );
-        painter.rect_filled(box_rect, 2.0, Color32::from_rgba_unmultiplied(0, 0, 0, 170));
+        painter.rect_filled(box_rect, 3.0, Color32::from_rgba_unmultiplied(0, 0, 0, 180));
         painter.text(
             box_rect.center(),
             egui::Align2::CENTER_CENTER,
             text,
-            egui::FontId::proportional(15.0),
+            FontId::new(15.0, egui::FontFamily::Proportional),
             Color32::WHITE,
         );
     }
 
+    let tc = format_tc(app.playhead, sequence.timebase);
+    let pill = Rect::from_min_size(
+        frame.left_top() + Vec2::new(8.0, 8.0),
+        Vec2::new(108.0, 20.0),
+    );
+    painter.rect_filled(pill, 3.0, Color32::from_rgba_unmultiplied(0, 0, 0, 160));
     painter.text(
-        frame.left_top() + Vec2::new(8.0, 6.0),
-        egui::Align2::LEFT_TOP,
-        format_tc(app.playhead, sequence.timebase),
-        egui::FontId::monospace(13.0),
-        Color32::from_rgba_unmultiplied(255, 220, 160, 220),
+        pill.center(),
+        egui::Align2::CENTER_CENTER,
+        tc,
+        FontId::monospace(12.0),
+        Color32::from_rgb(255, 214, 160),
     );
 }
 

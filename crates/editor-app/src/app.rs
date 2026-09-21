@@ -833,9 +833,10 @@ impl eframe::App for MeridianApp {
 
         egui::TopBottomPanel::bottom("timeline")
             .resizable(true)
-            .default_height(340.0)
-            .min_height(200.0)
-            .show_separator_line(true)
+            .default_height(360.0)
+            .min_height(220.0)
+            .frame(theme::panel_frame())
+            .show_separator_line(false)
             .show(ctx, |ui| {
                 ui::timeline_panel(ui, self);
             });
@@ -844,34 +845,45 @@ impl eframe::App for MeridianApp {
             Workspace::Edit => {
                 egui::SidePanel::left("library")
                     .resizable(true)
-                    .default_width(292.0)
-                    .width_range(220.0..=460.0)
+                    .default_width(300.0)
+                    .width_range(240.0..=460.0)
+                    .frame(theme::panel_frame())
+                    .show_separator_line(false)
                     .show(ctx, |ui| {
                         let height = ui.available_height();
-                        egui::ScrollArea::vertical()
-                            .id_salt("pool_scroll")
-                            .max_height(height * 0.58)
-                            .show(ui, |ui| ui::media_pool(ui, self));
-                        ui.separator();
+                        ui.allocate_ui(egui::vec2(ui.available_width(), height * 0.56), |ui| {
+                            ui::media_pool(ui, self);
+                        });
+                        ui::widgets::hairline(ui);
                         ui::captions_panel(ui, self);
                     });
                 egui::SidePanel::right("inspector")
                     .resizable(true)
-                    .default_width(320.0)
-                    .width_range(260.0..=460.0)
+                    .default_width(332.0)
+                    .width_range(280.0..=480.0)
+                    .frame(theme::panel_frame())
+                    .show_separator_line(false)
                     .show(ctx, |ui| ui::inspector_panel(ui, self));
-                egui::CentralPanel::default().show(ctx, |ui| ui::viewer_panel(ui, self));
+                egui::CentralPanel::default()
+                    .frame(theme::chrome_frame().fill(theme::THEME.stage))
+                    .show(ctx, |ui| ui::viewer_panel(ui, self));
             }
             Workspace::Colour => {
                 egui::SidePanel::right("colour_inspector")
                     .resizable(true)
-                    .default_width(360.0)
-                    .width_range(280.0..=520.0)
+                    .default_width(380.0)
+                    .width_range(300.0..=520.0)
+                    .frame(theme::panel_frame())
+                    .show_separator_line(false)
                     .show(ctx, |ui| ui::inspector_panel(ui, self));
-                egui::CentralPanel::default().show(ctx, |ui| ui::viewer_panel(ui, self));
+                egui::CentralPanel::default()
+                    .frame(theme::chrome_frame().fill(theme::THEME.stage))
+                    .show(ctx, |ui| ui::viewer_panel(ui, self));
             }
             Workspace::Deliver => {
-                egui::CentralPanel::default().show(ctx, |ui| ui::deliver_panel(ui, self));
+                egui::CentralPanel::default()
+                    .frame(theme::chrome_frame().fill(theme::THEME.stage))
+                    .show(ctx, |ui| ui::deliver_panel(ui, self));
             }
         }
 
@@ -881,201 +893,282 @@ impl eframe::App for MeridianApp {
 
 impl MeridianApp {
     fn menu_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("menu").show(ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
-                ui.menu_button("File", |ui| {
-                    if ui.button("New Project…").clicked() {
-                        self.modal = Modal::NewProject {
-                            name: "Untitled".into(),
-                            template: 1,
-                        };
-                        ui.close_menu();
-                    }
-                    if ui.button("Open…").clicked() {
-                        self.modal = Modal::Open {
-                            path: self.path.clone().unwrap_or_else(|| "/tmp/".into()),
-                            error: String::new(),
-                        };
-                        ui.close_menu();
-                    }
-                    if ui.button("Open Example").clicked() {
-                        self.open_example();
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Save").clicked() {
-                        self.save_or_prompt();
-                        ui.close_menu();
-                    }
-                    if ui.button("Save As…").clicked() {
-                        self.modal = Modal::SaveAs {
-                            path: self
-                                .path
-                                .clone()
-                                .unwrap_or_else(|| suggested_path(&self.session.project().name)),
-                            error: String::new(),
-                        };
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Quit").clicked() {
-                        ctx.send_viewport_cmd(ViewportCommand::Close);
-                    }
-                });
-                ui.menu_button("Edit", |ui| {
-                    let undo = self
-                        .session
-                        .undo_label()
-                        .map(|l| format!("Undo {l}"))
-                        .unwrap_or_else(|| "Undo".into());
-                    if ui
-                        .add_enabled(self.session.can_undo(), egui::Button::new(undo))
-                        .clicked()
-                    {
-                        self.session.undo();
-                        ui.close_menu();
-                    }
-                    let redo = self
-                        .session
-                        .redo_label()
-                        .map(|l| format!("Redo {l}"))
-                        .unwrap_or_else(|| "Redo".into());
-                    if ui
-                        .add_enabled(self.session.can_redo(), egui::Button::new(redo))
-                        .clicked()
-                    {
-                        self.session.redo();
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Lift Delete").clicked() {
-                        self.delete_selection(false);
-                        ui.close_menu();
-                    }
-                    if ui.button("Ripple Delete").clicked() {
-                        self.delete_selection(true);
-                        ui.close_menu();
-                    }
-                    if ui.button("Split at Playhead").clicked() {
-                        self.split_at_playhead();
-                        ui.close_menu();
-                    }
-                });
-                ui.menu_button("Sequence", |ui| {
-                    if ui.button("Mark In").clicked() {
-                        self.mark_in();
-                        ui.close_menu();
-                    }
-                    if ui.button("Mark Out").clicked() {
-                        self.mark_out();
-                        ui.close_menu();
-                    }
-                    if ui.button("Clear In/Out").clicked() {
-                        self.clear_marks();
-                        ui.close_menu();
-                    }
-                    if ui.button("Add Marker").clicked() {
-                        self.add_marker();
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Add Video Track").clicked() {
-                        self.add_track(TrackKind::Video);
-                        ui.close_menu();
-                    }
-                    if ui.button("Add Audio Track").clicked() {
-                        self.add_track(TrackKind::Audio);
-                        ui.close_menu();
-                    }
-                    if ui.button("Add Caption Track").clicked() {
-                        self.add_track(TrackKind::Caption);
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Cross Dissolve at Cut").clicked() {
-                        self.add_transition_at_selection(TransitionKind::CrossDissolve);
-                        ui.close_menu();
-                    }
-                    if ui.button("Wipe at Cut").clicked() {
-                        self.add_transition_at_selection(TransitionKind::Wipe { angle_deg: 90.0 });
-                        ui.close_menu();
-                    }
-                    if ui.button("Push Slide at Cut").clicked() {
-                        self.add_transition_at_selection(TransitionKind::PushSlide {
-                            direction: Direction::Left,
-                        });
-                        ui.close_menu();
-                    }
-                });
-                ui.menu_button("Help", |ui| {
-                    if ui.button("Keyboard Shortcuts").clicked() {
-                        self.modal = Modal::Shortcuts;
-                        ui.close_menu();
-                    }
-                    if ui.button("About Meridian").clicked() {
-                        self.status =
-                            "Meridian 0.1 — frame-accurate editorial and finishing.".into();
-                        ui.close_menu();
-                    }
-                });
-                ui.separator();
-                brand_mark(ui);
-                ui.label(RichText::new("Meridian").strong());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    workspace_switch(ui, &mut self.workspace);
+        egui::TopBottomPanel::top("menu")
+            .frame(theme::chrome_frame())
+            .exact_height(36.0)
+            .show_separator_line(false)
+            .show(ctx, |ui| {
+                egui::menu::bar(ui, |ui| {
+                    brand_mark(ui);
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("Meridian")
+                            .strong()
+                            .size(13.0)
+                            .color(theme::THEME.text),
+                    );
+                    ui.add_space(10.0);
+                    ui.menu_button("File", |ui| {
+                        if ui.button("New Project…").clicked() {
+                            self.modal = Modal::NewProject {
+                                name: "Untitled".into(),
+                                template: 1,
+                            };
+                            ui.close_menu();
+                        }
+                        if ui.button("Open…").clicked() {
+                            self.modal = Modal::Open {
+                                path: self.path.clone().unwrap_or_else(|| "/tmp/".into()),
+                                error: String::new(),
+                            };
+                            ui.close_menu();
+                        }
+                        if ui.button("Open Example").clicked() {
+                            self.open_example();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Save").clicked() {
+                            self.save_or_prompt();
+                            ui.close_menu();
+                        }
+                        if ui.button("Save As…").clicked() {
+                            self.modal = Modal::SaveAs {
+                                path: self.path.clone().unwrap_or_else(|| {
+                                    suggested_path(&self.session.project().name)
+                                }),
+                                error: String::new(),
+                            };
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Quit").clicked() {
+                            ctx.send_viewport_cmd(ViewportCommand::Close);
+                        }
+                    });
+                    ui.menu_button("Edit", |ui| {
+                        let undo = self
+                            .session
+                            .undo_label()
+                            .map(|l| format!("Undo {l}"))
+                            .unwrap_or_else(|| "Undo".into());
+                        if ui
+                            .add_enabled(self.session.can_undo(), egui::Button::new(undo))
+                            .clicked()
+                        {
+                            self.session.undo();
+                            ui.close_menu();
+                        }
+                        let redo = self
+                            .session
+                            .redo_label()
+                            .map(|l| format!("Redo {l}"))
+                            .unwrap_or_else(|| "Redo".into());
+                        if ui
+                            .add_enabled(self.session.can_redo(), egui::Button::new(redo))
+                            .clicked()
+                        {
+                            self.session.redo();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Lift Delete").clicked() {
+                            self.delete_selection(false);
+                            ui.close_menu();
+                        }
+                        if ui.button("Ripple Delete").clicked() {
+                            self.delete_selection(true);
+                            ui.close_menu();
+                        }
+                        if ui.button("Split at Playhead").clicked() {
+                            self.split_at_playhead();
+                            ui.close_menu();
+                        }
+                    });
+                    ui.menu_button("Sequence", |ui| {
+                        if ui.button("Mark In").clicked() {
+                            self.mark_in();
+                            ui.close_menu();
+                        }
+                        if ui.button("Mark Out").clicked() {
+                            self.mark_out();
+                            ui.close_menu();
+                        }
+                        if ui.button("Clear In/Out").clicked() {
+                            self.clear_marks();
+                            ui.close_menu();
+                        }
+                        if ui.button("Add Marker").clicked() {
+                            self.add_marker();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Add Video Track").clicked() {
+                            self.add_track(TrackKind::Video);
+                            ui.close_menu();
+                        }
+                        if ui.button("Add Audio Track").clicked() {
+                            self.add_track(TrackKind::Audio);
+                            ui.close_menu();
+                        }
+                        if ui.button("Add Caption Track").clicked() {
+                            self.add_track(TrackKind::Caption);
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Cross Dissolve at Cut").clicked() {
+                            self.add_transition_at_selection(TransitionKind::CrossDissolve);
+                            ui.close_menu();
+                        }
+                        if ui.button("Wipe at Cut").clicked() {
+                            self.add_transition_at_selection(TransitionKind::Wipe {
+                                angle_deg: 90.0,
+                            });
+                            ui.close_menu();
+                        }
+                        if ui.button("Push Slide at Cut").clicked() {
+                            self.add_transition_at_selection(TransitionKind::PushSlide {
+                                direction: Direction::Left,
+                            });
+                            ui.close_menu();
+                        }
+                    });
+                    ui.menu_button("Help", |ui| {
+                        if ui.button("Keyboard Shortcuts").clicked() {
+                            self.modal = Modal::Shortcuts;
+                            ui.close_menu();
+                        }
+                        if ui.button("About Meridian").clicked() {
+                            self.status =
+                                "Meridian 0.1 — frame-accurate editorial and finishing.".into();
+                            ui.close_menu();
+                        }
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(10.0);
+                        workspace_switch(ui, &mut self.workspace);
+                    });
                 });
             });
-        });
     }
 
     fn toolbar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                for tool in [
-                    Tool::Select,
-                    Tool::Razor,
-                    Tool::Ripple,
-                    Tool::Roll,
-                    Tool::Slip,
-                    Tool::Slide,
-                ] {
-                    if ui
-                        .selectable_label(self.tool == tool, tool.label())
-                        .clicked()
-                    {
-                        self.tool = tool;
+        egui::TopBottomPanel::top("toolbar")
+            .frame(theme::chrome_frame().fill(theme::THEME.panel))
+            .exact_height(52.0)
+            .show_separator_line(false)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    ui.add_space(6.0);
+                    let tool = self.tool;
+                    if ui::widgets::tool_cell(
+                        ui,
+                        "select",
+                        "Select",
+                        tool == Tool::Select,
+                        Tool::Select.hint(),
+                        ui::widgets::paint_select,
+                    ) {
+                        self.tool = Tool::Select;
                     }
-                }
-                ui.separator();
-                ui.toggle_value(&mut self.snap_enabled, "Snap");
-                ui.toggle_value(&mut self.linked_selection, "Linked");
-                ui.separator();
-                if ui.button("Overwrite").clicked() {
-                    self.place_selected_media(false);
-                }
-                if ui.button("Insert").clicked() {
-                    self.place_selected_media(true);
-                }
-                ui.separator();
-                ui.label(RichText::new("Nudge").small().color(theme::DIM));
-                for step in [-5, -1, 1, 5] {
-                    if ui.small_button(format!("{step:+}")).clicked() {
-                        self.nudge = step;
-                        self.nudge_tool(step);
+                    if ui::widgets::tool_cell(
+                        ui,
+                        "razor",
+                        "Razor",
+                        tool == Tool::Razor,
+                        Tool::Razor.hint(),
+                        ui::widgets::paint_razor,
+                    ) {
+                        self.tool = Tool::Razor;
                     }
-                }
-                ui.separator();
-                ui.label(RichText::new(self.tool.hint()).small().color(theme::DIM));
+                    if ui::widgets::tool_cell(
+                        ui,
+                        "ripple",
+                        "Ripple",
+                        tool == Tool::Ripple,
+                        Tool::Ripple.hint(),
+                        ui::widgets::paint_ripple,
+                    ) {
+                        self.tool = Tool::Ripple;
+                    }
+                    if ui::widgets::tool_cell(
+                        ui,
+                        "roll",
+                        "Roll",
+                        tool == Tool::Roll,
+                        Tool::Roll.hint(),
+                        ui::widgets::paint_roll,
+                    ) {
+                        self.tool = Tool::Roll;
+                    }
+                    if ui::widgets::tool_cell(
+                        ui,
+                        "slip",
+                        "Slip",
+                        tool == Tool::Slip,
+                        Tool::Slip.hint(),
+                        ui::widgets::paint_slip,
+                    ) {
+                        self.tool = Tool::Slip;
+                    }
+                    if ui::widgets::tool_cell(
+                        ui,
+                        "slide",
+                        "Slide",
+                        tool == Tool::Slide,
+                        Tool::Slide.hint(),
+                        ui::widgets::paint_slide,
+                    ) {
+                        self.tool = Tool::Slide;
+                    }
+                    ui.add_space(8.0);
+                    if ui::widgets::chip(ui, "Snap", self.snap_enabled) {
+                        self.snap_enabled = !self.snap_enabled;
+                    }
+                    if ui::widgets::chip(ui, "Linked", self.linked_selection) {
+                        self.linked_selection = !self.linked_selection;
+                    }
+                    ui.add_space(8.0);
+                    if ui::widgets::action_button(ui, "Overwrite", true) {
+                        self.place_selected_media(false);
+                    }
+                    if ui::widgets::action_button(ui, "Insert", false) {
+                        self.place_selected_media(true);
+                    }
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Nudge")
+                            .size(11.0)
+                            .color(theme::THEME.text_mute),
+                    );
+                    for step in [-5_i64, -1, 1, 5] {
+                        if ui::widgets::ghost_button(ui, &format!("{step:+}")) {
+                            self.nudge = step;
+                            self.nudge_tool(step);
+                        }
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(10.0);
+                        ui.label(
+                            RichText::new(self.tool.hint())
+                                .size(11.0)
+                                .color(theme::THEME.text_mute),
+                        );
+                    });
+                });
             });
-        });
     }
 
     fn status_bar(&self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("status")
-            .exact_height(24.0)
+            .exact_height(26.0)
+            .frame(theme::chrome_frame())
+            .show_separator_line(false)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    ui.add_space(8.0);
                     let sequence = self.session.project().active();
                     let res = sequence
                         .map(|s| format!("{}×{}", s.width, s.height))
@@ -1085,27 +1178,39 @@ impl MeridianApp {
                         .unwrap_or_default();
                     ui.label(
                         RichText::new(self.tool.label())
-                            .small()
-                            .color(theme::ACCENT),
+                            .size(11.0)
+                            .color(theme::THEME.accent),
                     );
-                    ui.separator();
                     ui.label(
                         RichText::new(if self.snap_enabled { "Snap" } else { "Free" })
-                            .small()
-                            .color(theme::DIM),
+                            .size(11.0)
+                            .color(theme::THEME.text_mute),
                     );
-                    ui.separator();
-                    ui.label(RichText::new(&self.status).small());
+                    ui.label(
+                        RichText::new(&self.status)
+                            .size(11.0)
+                            .color(theme::THEME.text_dim),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(8.0);
                         if self.session.is_dirty() {
-                            ui.label(RichText::new("Unsaved").small().color(theme::AMBER));
+                            ui.label(
+                                RichText::new("Unsaved")
+                                    .size(11.0)
+                                    .color(theme::THEME.amber),
+                            );
                         }
-                        ui.label(RichText::new(fps).small().color(theme::DIM));
-                        ui.label(RichText::new(res).small().color(theme::DIM));
+                        ui.label(
+                            RichText::new(format!("{res}   {fps}"))
+                                .size(11.0)
+                                .monospace()
+                                .color(theme::THEME.text_dim),
+                        );
                         ui.label(
                             RichText::new(format!("{:.1} px/f", self.pixels_per_frame))
-                                .small()
-                                .color(theme::DIM),
+                                .size(11.0)
+                                .monospace()
+                                .color(theme::THEME.text_mute),
                         );
                     });
                 });
@@ -1131,6 +1236,7 @@ impl MeridianApp {
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(theme::dialog_frame())
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.set_min_width(460.0);
@@ -1149,33 +1255,26 @@ impl MeridianApp {
                 });
                 ui.add_space(4.0);
                 for (index, preset) in templates.iter().enumerate() {
-                    let selected = template == index;
-                    let response = ui.selectable_label(
-                        selected,
-                        format!(
-                            "{}    {}×{}  {} fps    V{} A{} C{}",
-                            preset.name,
-                            preset.width,
-                            preset.height,
-                            Timebase::new(preset.fps_num, preset.fps_den).fps_f64(),
-                            preset.video_tracks,
-                            preset.audio_tracks,
-                            preset.caption_tracks
-                        ),
+                    let meta = format!(
+                        "{}×{}   {:.3} fps   V{} A{} C{}",
+                        preset.width,
+                        preset.height,
+                        Timebase::new(preset.fps_num, preset.fps_den).fps_f64(),
+                        preset.video_tracks,
+                        preset.audio_tracks,
+                        preset.caption_tracks
                     );
-                    if response.clicked() {
+                    if ui::widgets::choice_card(ui, &preset.name, &meta, template == index).clicked()
+                    {
                         template = index;
-                    }
-                    if selected {
-                        ui.label(RichText::new(&preset.description).small().color(theme::DIM));
                     }
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Create").clicked() {
+                    if ui::widgets::action_button(ui, "Create", true) {
                         self.new_from_template(template, &name);
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui::widgets::action_button(ui, "Cancel", false) {
                         self.modal = Modal::None;
                     }
                 });
@@ -1204,6 +1303,7 @@ impl MeridianApp {
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(theme::dialog_frame())
             .open(&mut shown)
             .show(ctx, |ui| {
                 ui.set_min_width(460.0);
@@ -1250,6 +1350,7 @@ impl MeridianApp {
         egui::Window::new("Import Media")
             .collapsible(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(theme::dialog_frame())
             .open(&mut shown)
             .show(ctx, |ui| {
                 ui.set_min_width(480.0);
@@ -1298,6 +1399,7 @@ impl MeridianApp {
         egui::Window::new("Keyboard Shortcuts")
             .collapsible(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(theme::dialog_frame())
             .open(&mut shown)
             .show(ctx, |ui| {
                 ui.set_min_width(420.0);
@@ -1334,40 +1436,30 @@ const SHORTCUTS: &[(&str, &str)] = &[
 ];
 
 fn brand_mark(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, 2.0, theme::ACCENT);
+    painter.rect_filled(rect, 3.0, theme::THEME.accent);
     painter.hline(
-        rect.x_range(),
+        (rect.left() + 3.0)..=(rect.right() - 3.0),
         rect.center().y,
-        egui::Stroke::new(1.5_f32, theme::BG),
+        egui::Stroke::new(1.6_f32, theme::THEME.accent_text),
     );
 }
 
 fn workspace_switch(ui: &mut egui::Ui, workspace: &mut Workspace) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 2.0;
-        for (mode, label) in [
-            (Workspace::Edit, "Edit"),
-            (Workspace::Colour, "Colour"),
-            (Workspace::Deliver, "Deliver"),
-        ] {
-            let selected = *workspace == mode;
-            let text = if selected {
-                RichText::new(label).color(theme::BG).strong()
-            } else {
-                RichText::new(label).color(theme::TEXT)
-            };
-            let response = ui.add(egui::Button::new(text).fill(if selected {
-                theme::ACCENT
-            } else {
-                theme::PANEL_RAISED
-            }));
-            if response.clicked() {
-                *workspace = mode;
-            }
-        }
-    });
+    let labels = ["Edit", "Colour", "Deliver"];
+    let selected = match *workspace {
+        Workspace::Edit => 0,
+        Workspace::Colour => 1,
+        Workspace::Deliver => 2,
+    };
+    if let Some(index) = ui::widgets::workspace_modes(ui, selected, &labels) {
+        *workspace = match index {
+            0 => Workspace::Edit,
+            1 => Workspace::Colour,
+            _ => Workspace::Deliver,
+        };
+    }
 }
 
 pub fn note_track_flag(app: &mut MeridianApp, track: TrackId, flag: TrackFlag, value: bool) {

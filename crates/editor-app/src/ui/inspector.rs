@@ -1,20 +1,20 @@
 use editor_core::{
     clip_relative, color_grade, set_grade_at, set_transform_at, toggle_grade_key,
-    toggle_transform_key, transform, ClipId, EditError, Effect, GradeParam, TransformParam,
+    toggle_transform_key, transform, ClipId, GradeParam, TransformParam,
 };
-use egui::{RichText, Slider};
+use egui::{Color32, RichText, Sense, Shape, Stroke, Vec2};
 
 use crate::app::MeridianApp;
-use crate::theme;
+use crate::theme::THEME;
 use crate::ui::format_tc;
+use crate::ui::widgets;
 
 pub fn inspector_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
     let title = match app.workspace {
-        crate::app::Workspace::Colour => "COLOUR",
-        _ => "INSPECTOR",
+        crate::app::Workspace::Colour => "Colour",
+        _ => "Inspector",
     };
-    ui.label(RichText::new(title).small().strong());
-    ui.add_space(4.0);
+    widgets::panel_header(ui, title, |_| {});
 
     let Some(clip_id) = app.selected.first().copied() else {
         sequence_summary(ui, app);
@@ -25,29 +25,46 @@ pub fn inspector_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
         return;
     };
 
-    ui.label(RichText::new(&snapshot.name).strong());
-    ui.label(
-        RichText::new(format!(
-            "{}   {} – {}   {} frames",
-            snapshot.track_name,
-            format_tc(snapshot.timeline_in, snapshot.timebase),
-            format_tc(snapshot.timeline_out, snapshot.timebase),
-            snapshot.timeline_out - snapshot.timeline_in
-        ))
-        .small()
-        .color(theme::DIM),
-    );
-    ui.label(
-        RichText::new(format!(
-            "Source {} – {}   head {}   tail {}",
-            format_tc(snapshot.source_in, snapshot.media_tb),
-            format_tc(snapshot.source_out, snapshot.media_tb),
-            snapshot.head_handle,
-            snapshot.tail_handle
-        ))
-        .small()
-        .color(theme::DIM),
-    );
+    egui::ScrollArea::vertical()
+        .id_salt("inspector_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            inspector_body(ui, app, clip_id, &snapshot);
+        });
+}
+
+fn inspector_body(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId, snapshot: &ClipSnap) {
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.add_space(10.0);
+        ui.vertical(|ui| {
+            ui.label(RichText::new(&snapshot.name).size(15.0).strong());
+            ui.label(
+                RichText::new(format!(
+                    "{}    {} – {}    {} frames",
+                    snapshot.track_name,
+                    format_tc(snapshot.timeline_in, snapshot.timebase),
+                    format_tc(snapshot.timeline_out, snapshot.timebase),
+                    snapshot.timeline_out - snapshot.timeline_in
+                ))
+                .size(11.0)
+                .monospace()
+                .color(THEME.text_dim),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "Source {} – {}    head {}    tail {}",
+                    format_tc(snapshot.source_in, snapshot.media_tb),
+                    format_tc(snapshot.source_out, snapshot.media_tb),
+                    snapshot.head_handle,
+                    snapshot.tail_handle
+                ))
+                .size(11.0)
+                .monospace()
+                .color(THEME.text_mute),
+            );
+        });
+    });
 
     let rel = clip_relative(
         editor_core::Frame(app.playhead),
@@ -59,12 +76,13 @@ pub fn inspector_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
         colour_wheel(ui, app, clip_id, rel);
     }
 
-    ui.add_space(6.0);
-    ui.label(
-        RichText::new("LIGHTING / COLOUR")
-            .small()
-            .color(theme::ACCENT),
-    );
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add_space(2.0);
+        ui.vertical(|ui| {
+            widgets::section_label(ui, "Lighting");
+        });
+    });
     grade_slider(
         ui,
         app,
@@ -121,8 +139,12 @@ pub fn inspector_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
         0.0..=2.0,
     );
 
-    ui.add_space(6.0);
-    ui.label(RichText::new("TRANSFORM").small().color(theme::ACCENT));
+    ui.horizontal(|ui| {
+        ui.add_space(2.0);
+        ui.vertical(|ui| {
+            widgets::section_label(ui, "Transform");
+        });
+    });
     xform_slider(
         ui,
         app,
@@ -196,24 +218,18 @@ pub fn inspector_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
         0.0..=1.0,
     );
 
-    ui.add_space(6.0);
-    ui.label(
-        RichText::new("Diamond adds or removes a keyframe at the playhead. Sliders write the constant until a key exists, then they key the current frame.")
-            .small()
-            .color(theme::DIM),
-    );
-
-    if !snapshot.effects.is_empty() {
-        ui.add_space(4.0);
-        ui.label(RichText::new("EFFECTS").small().color(theme::DIM));
-        for effect in &snapshot.effects {
-            let name = match effect {
-                Effect::Color(_) => "Colour",
-                Effect::Transform(_) => "Transform",
-            };
-            ui.label(name);
-        }
-    }
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new(
+                "A diamond sets a key at the playhead. Until then, the slider is a constant.",
+            )
+            .size(11.0)
+            .color(THEME.text_mute),
+        );
+    });
+    ui.add_space(8.0);
 }
 
 struct ClipSnap {
@@ -227,7 +243,6 @@ struct ClipSnap {
     tail_handle: i64,
     timebase: editor_core::Timebase,
     media_tb: editor_core::Timebase,
-    effects: Vec<Effect>,
 }
 
 fn clip_snapshot(app: &MeridianApp, id: ClipId) -> Option<ClipSnap> {
@@ -245,27 +260,38 @@ fn clip_snapshot(app: &MeridianApp, id: ClipId) -> Option<ClipSnap> {
         tail_handle: clip.tail_handle(),
         timebase: sequence.timebase,
         media_tb: clip.media_timebase,
-        effects: clip.effects.clone(),
     })
 }
 
 fn sequence_summary(ui: &mut egui::Ui, app: &MeridianApp) {
     let Some(sequence) = app.session.project().active() else {
-        ui.label("No sequence.");
+        widgets::empty_note(ui, "No sequence is open.");
         return;
     };
-    ui.label(RichText::new(&sequence.name).strong());
-    ui.label(format!(
-        "{}×{}   {:.3} fps",
-        sequence.width,
-        sequence.height,
-        sequence.timebase.fps_f64()
-    ));
-    ui.label(
-        RichText::new("Select a clip to grade, transform, or keyframe it.")
-            .small()
-            .color(theme::DIM),
-    );
+    ui.add_space(16.0);
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        ui.vertical(|ui| {
+            ui.label(RichText::new(&sequence.name).size(15.0).strong());
+            ui.label(
+                RichText::new(format!(
+                    "{}×{}    {:.3} fps",
+                    sequence.width,
+                    sequence.height,
+                    sequence.timebase.fps_f64()
+                ))
+                .monospace()
+                .size(12.0)
+                .color(THEME.text_dim),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("Select a clip to grade it, move it, or set keyframes.")
+                    .size(12.0)
+                    .color(THEME.text_mute),
+            );
+        });
+    });
 }
 
 fn grade_value(app: &MeridianApp, clip: ClipId, rel: i64, param: GradeParam) -> (f32, bool) {
@@ -297,26 +323,23 @@ fn grade_slider(
     range: std::ops::RangeInclusive<f32>,
 ) {
     let (current, keyed) = grade_value(app, clip, rel, param);
-    let mut value = current;
     ui.horizontal(|ui| {
-        let response = ui.add(Slider::new(&mut value, range).text(label));
-        if response.drag_started() {
-            app.session.begin_interactive(label);
-        }
-        if response.changed() {
-            apply_grade(app, clip, rel, param, value);
-        }
-        if response.drag_stopped() {
-            app.session.end_interactive();
-        }
-        let mark = if keyed { "◆" } else { "◇" };
-        if ui
-            .small_button(mark)
-            .on_hover_text("Keyframe at playhead")
-            .clicked()
-        {
-            toggle_grade(app, clip, rel, param);
-        }
+        ui.add_space(8.0);
+        ui.vertical(|ui| {
+            let edit = widgets::param_slider(ui, label, current, range, keyed);
+            if edit.started {
+                app.session.begin_interactive(label);
+            }
+            if edit.changed {
+                apply_grade(app, clip, rel, param, edit.value);
+            }
+            if edit.stopped {
+                app.session.end_interactive();
+            }
+            if edit.key_clicked {
+                toggle_grade(app, clip, rel, param);
+            }
+        });
     });
 }
 
@@ -372,82 +395,114 @@ fn xform_slider(
     range: std::ops::RangeInclusive<f32>,
 ) {
     let (current, keyed) = xform_value(app, clip, rel, param);
-    let mut value = current;
     ui.horizontal(|ui| {
-        let response = ui.add(Slider::new(&mut value, range).text(label));
-        if response.drag_started() {
-            app.session.begin_interactive(label);
+        ui.add_space(8.0);
+        ui.vertical(|ui| {
+            let edit = widgets::param_slider(ui, label, current, range, keyed);
+            if edit.started {
+                app.session.begin_interactive(label);
+            }
+            if edit.changed {
+                let Ok(seq) = app.session.active_id() else {
+                    return;
+                };
+                if let Err(err) = app.session.edit("Transform", |project| {
+                    set_transform_at(project, seq, clip, param, rel, edit.value)
+                }) {
+                    app.status = err.to_string();
+                }
+            }
+            if edit.stopped {
+                app.session.end_interactive();
+            }
+            if edit.key_clicked {
+                let Ok(seq) = app.session.active_id() else {
+                    return;
+                };
+                if let Err(err) = app.session.edit("Keyframe", |project| {
+                    toggle_transform_key(project, seq, clip, param, rel)
+                }) {
+                    app.status = err.to_string();
+                }
+            }
+        });
+    });
+}
+
+fn colour_wheel(ui: &mut egui::Ui, app: &mut MeridianApp, clip: ClipId, rel: i64) {
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        ui.label(RichText::new("Offset").size(11.0).color(THEME.text_dim));
+    });
+    let (temp, _) = grade_value(app, clip, rel, GradeParam::Temperature);
+    let (tint, _) = grade_value(app, clip, rel, GradeParam::Tint);
+    let size = egui::vec2(176.0, 176.0);
+    ui.horizontal(|ui| {
+        let spare = (ui.available_width() - size.x).max(0.0) * 0.5;
+        ui.add_space(spare);
+        let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+        let painter = ui.painter_at(rect);
+        let center = rect.center();
+        let radius = 72.0;
+        for step in 0..64 {
+            let a0 = step as f32 / 64.0 * std::f32::consts::TAU;
+            let a1 = (step + 1) as f32 / 64.0 * std::f32::consts::TAU;
+            let p0 = center + Vec2::new(a0.cos(), a0.sin()) * radius;
+            let p1 = center + Vec2::new(a1.cos(), a1.sin()) * radius;
+            painter.add(Shape::convex_polygon(
+                vec![center, p0, p1],
+                wheel_color(a0),
+                Stroke::NONE,
+            ));
         }
-        if response.changed() {
-            let Ok(seq) = app.session.active_id() else {
-                return;
-            };
-            if let Err(err) = app.session.edit("Transform", |project| {
-                set_transform_at(project, seq, clip, param, rel, value)
-            }) {
-                app.status = err.to_string();
+        painter.circle_filled(center, 28.0, THEME.inset);
+        painter.circle_stroke(center, radius, Stroke::new(1.0_f32, THEME.border));
+        painter.hline(
+            (center.x - radius)..=(center.x + radius),
+            center.y,
+            Stroke::new(1.0_f32, Color32::from_white_alpha(28)),
+        );
+        painter.vline(
+            center.x,
+            (center.y - radius)..=(center.y + radius),
+            Stroke::new(1.0_f32, Color32::from_white_alpha(28)),
+        );
+        let point = center + egui::vec2(temp * radius, -tint * radius);
+        painter.circle_filled(point, 6.0, Color32::WHITE);
+        painter.circle_stroke(point, 6.0, Stroke::new(2.0_f32, THEME.bg));
+        if response.drag_started() {
+            app.session.begin_interactive("Colour offset");
+        }
+        if response.dragged() || response.clicked() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let next_temp = ((pos.x - center.x) / radius).clamp(-1.0, 1.0);
+                let next_tint = (-(pos.y - center.y) / radius).clamp(-1.0, 1.0);
+                apply_grade(app, clip, rel, GradeParam::Temperature, next_temp);
+                apply_grade(app, clip, rel, GradeParam::Tint, next_tint);
             }
         }
         if response.drag_stopped() {
             app.session.end_interactive();
         }
-        let mark = if keyed { "◆" } else { "◇" };
-        if ui.small_button(mark).clicked() {
-            let Ok(seq) = app.session.active_id() else {
-                return;
-            };
-            if let Err(EditError::ClipNotFound) = app.session.edit("Keyframe", |project| {
-                toggle_transform_key(project, seq, clip, param, rel)
-            }) {
-                app.status = "Clip not found.".into();
-            }
-        }
+    });
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new(format!("Temp {temp:+.2}     Tint {tint:+.2}"))
+                .size(11.0)
+                .monospace()
+                .color(THEME.text_dim),
+        );
     });
 }
 
-fn colour_wheel(ui: &mut egui::Ui, app: &mut MeridianApp, clip: ClipId, rel: i64) {
-    ui.label(RichText::new("OFFSET").small().color(theme::DIM));
-    let (temp, _) = grade_value(app, clip, rel, GradeParam::Temperature);
-    let (tint, _) = grade_value(app, clip, rel, GradeParam::Tint);
-    let size = egui::vec2(168.0, 168.0);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
-    let painter = ui.painter_at(rect);
-    painter.circle_filled(rect.center(), 78.0, theme::PANEL_RAISED);
-    painter.circle_stroke(
-        rect.center(),
-        78.0,
-        egui::Stroke::new(1.0_f32, theme::BORDER),
-    );
-    painter.hline(
-        (rect.center().x - 70.0)..=(rect.center().x + 70.0),
-        rect.center().y,
-        egui::Stroke::new(1.0_f32, theme::BORDER),
-    );
-    painter.vline(
-        rect.center().x,
-        (rect.center().y - 70.0)..=(rect.center().y + 70.0),
-        egui::Stroke::new(1.0_f32, theme::BORDER),
-    );
-    let point = rect.center() + egui::vec2(temp * 70.0, -tint * 70.0);
-    painter.circle_filled(point, 6.0, theme::AMBER);
-    if response.drag_started() {
-        app.session.begin_interactive("Colour offset");
-    }
-    if response.dragged() {
-        if let Some(pos) = response.interact_pointer_pos() {
-            let next_temp = ((pos.x - rect.center().x) / 70.0).clamp(-1.0, 1.0);
-            let next_tint = (-(pos.y - rect.center().y) / 70.0).clamp(-1.0, 1.0);
-            apply_grade(app, clip, rel, GradeParam::Temperature, next_temp);
-            apply_grade(app, clip, rel, GradeParam::Tint, next_tint);
-        }
-    }
-    if response.drag_stopped() {
-        app.session.end_interactive();
-    }
-    ui.label(
-        RichText::new(format!("Temp {temp:+.2}   Tint {tint:+.2}"))
-            .small()
-            .monospace()
-            .color(theme::DIM),
-    );
+fn wheel_color(angle: f32) -> Color32 {
+    let warm = (angle.cos() * 0.5 + 0.5).clamp(0.0, 1.0);
+    let magenta = (angle.sin() * 0.5 + 0.5).clamp(0.0, 1.0);
+    Color32::from_rgb(
+        (40.0 + warm * 180.0) as u8,
+        (70.0 + (1.0 - magenta) * 90.0) as u8,
+        (50.0 + (1.0 - warm) * 140.0 + magenta * 40.0) as u8,
+    )
 }

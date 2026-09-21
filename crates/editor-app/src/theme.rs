@@ -1,82 +1,138 @@
-//! Dense dark chrome for Meridian. Teal is the editorial accent; amber marks
-//! the playhead, selection, and finishing controls.
+//! MeridianTheme — the only colour, radius, and type scale the shell should use.
+//!
+//! Teal is reserved for the active mode, selection accents, and primary actions.
+//! The playhead is the only red. Clip bodies carry their own label colours.
 
 use egui::{
-    Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Shadow, Stroke,
-    TextStyle, Visuals,
+    Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Frame, Margin, Shadow,
+    Stroke, TextStyle, Visuals,
 };
 
-pub const BG: Color32 = Color32::from_rgb(16, 17, 20);
-pub const PANEL: Color32 = Color32::from_rgb(24, 26, 30);
-pub const PANEL_RAISED: Color32 = Color32::from_rgb(32, 35, 40);
-pub const HEADER: Color32 = Color32::from_rgb(28, 31, 36);
-pub const BORDER: Color32 = Color32::from_rgb(48, 53, 60);
-pub const TEXT: Color32 = Color32::from_rgb(226, 228, 232);
-pub const DIM: Color32 = Color32::from_rgb(142, 150, 160);
-pub const ACCENT: Color32 = Color32::from_rgb(72, 196, 186);
-pub const ACCENT_DIM: Color32 = Color32::from_rgb(28, 78, 76);
-pub const AMBER: Color32 = Color32::from_rgb(224, 164, 90);
-pub const PLAYHEAD: Color32 = Color32::from_rgb(255, 92, 84);
-pub const VIDEO: Color32 = Color32::from_rgb(46, 96, 148);
-pub const AUDIO: Color32 = Color32::from_rgb(32, 110, 84);
-pub const CAPTION: Color32 = Color32::from_rgb(148, 112, 42);
-pub const DANGER: Color32 = Color32::from_rgb(196, 82, 74);
-pub const LANE: Color32 = Color32::from_rgb(20, 22, 26);
-pub const LANE_ALT: Color32 = Color32::from_rgb(26, 28, 33);
-pub const RULER: Color32 = Color32::from_rgb(18, 19, 22);
+use editor_core::{LabelColor, TrackKind};
+
+#[derive(Clone, Copy, Debug)]
+pub struct MeridianTheme {
+    pub bg: Color32,
+    pub stage: Color32,
+    pub panel: Color32,
+    pub header: Color32,
+    pub inset: Color32,
+    pub control: Color32,
+    pub control_hover: Color32,
+    pub hairline: Color32,
+    pub border: Color32,
+    pub text: Color32,
+    pub text_dim: Color32,
+    pub text_mute: Color32,
+    pub accent: Color32,
+    pub accent_dim: Color32,
+    pub accent_text: Color32,
+    pub amber: Color32,
+    pub playhead: Color32,
+    pub danger: Color32,
+    pub video: Color32,
+    pub audio: Color32,
+    pub caption: Color32,
+    pub lane: Color32,
+    pub lane_alt: Color32,
+    pub ruler: Color32,
+    pub selection: Color32,
+    pub radius: u8,
+}
+
+pub const THEME: MeridianTheme = MeridianTheme {
+    bg: Color32::from_rgb(12, 13, 16),
+    stage: Color32::from_rgb(7, 8, 10),
+    panel: Color32::from_rgb(22, 24, 28),
+    header: Color32::from_rgb(28, 31, 36),
+    inset: Color32::from_rgb(14, 15, 18),
+    control: Color32::from_rgb(36, 40, 46),
+    control_hover: Color32::from_rgb(48, 54, 62),
+    hairline: Color32::from_rgb(42, 46, 54),
+    border: Color32::from_rgb(58, 64, 74),
+    text: Color32::from_rgb(232, 234, 237),
+    text_dim: Color32::from_rgb(154, 163, 173),
+    text_mute: Color32::from_rgb(108, 116, 128),
+    accent: Color32::from_rgb(61, 214, 186),
+    accent_dim: Color32::from_rgb(18, 58, 54),
+    accent_text: Color32::from_rgb(10, 28, 26),
+    amber: Color32::from_rgb(232, 176, 92),
+    playhead: Color32::from_rgb(255, 78, 72),
+    danger: Color32::from_rgb(214, 92, 84),
+    video: Color32::from_rgb(47, 108, 176),
+    audio: Color32::from_rgb(36, 128, 96),
+    caption: Color32::from_rgb(176, 128, 48),
+    lane: Color32::from_rgb(16, 17, 20),
+    lane_alt: Color32::from_rgb(20, 22, 26),
+    ruler: Color32::from_rgb(18, 20, 24),
+    selection: Color32::from_rgb(242, 193, 78),
+    radius: 3,
+};
+
+pub const DIM: Color32 = THEME.text_dim;
+pub const AMBER: Color32 = THEME.amber;
+pub const CAPTION: Color32 = THEME.caption;
+pub const DANGER: Color32 = THEME.danger;
+pub const LANE: Color32 = THEME.lane;
+pub const LANE_ALT: Color32 = THEME.lane_alt;
+pub const RULER: Color32 = THEME.ruler;
 
 pub fn apply(ctx: &egui::Context) {
     install_fonts(ctx);
     let mut visuals = Visuals::dark();
-    visuals.window_fill = BG;
-    visuals.panel_fill = PANEL;
-    visuals.extreme_bg_color = BG;
-    visuals.faint_bg_color = PANEL_RAISED;
-    visuals.code_bg_color = Color32::from_rgb(14, 15, 18);
-    visuals.window_corner_radius = CornerRadius::same(3);
-    visuals.menu_corner_radius = CornerRadius::same(3);
+    visuals.window_fill = THEME.panel;
+    visuals.panel_fill = THEME.panel;
+    visuals.extreme_bg_color = THEME.bg;
+    visuals.faint_bg_color = THEME.header;
+    visuals.code_bg_color = THEME.inset;
+    visuals.window_corner_radius = CornerRadius::same(THEME.radius);
+    visuals.menu_corner_radius = CornerRadius::same(THEME.radius);
     visuals.window_shadow = Shadow::NONE;
     visuals.popup_shadow = Shadow::NONE;
-    visuals.window_stroke = Stroke::new(1.0_f32, BORDER);
-    visuals.widgets.noninteractive.bg_fill = PANEL;
-    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT);
-    visuals.widgets.noninteractive.corner_radius = CornerRadius::same(2);
-    visuals.widgets.inactive.bg_fill = PANEL_RAISED;
-    visuals.widgets.inactive.weak_bg_fill = HEADER;
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT);
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
-    visuals.widgets.inactive.corner_radius = CornerRadius::same(2);
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(42, 48, 56);
-    visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(40, 46, 54);
-    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, TEXT);
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT);
-    visuals.widgets.hovered.corner_radius = CornerRadius::same(2);
-    visuals.widgets.active.bg_fill = ACCENT_DIM;
-    visuals.widgets.active.weak_bg_fill = ACCENT_DIM;
-    visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, TEXT);
-    visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
-    visuals.widgets.active.corner_radius = CornerRadius::same(2);
-    visuals.widgets.open.bg_fill = PANEL_RAISED;
-    visuals.widgets.open.corner_radius = CornerRadius::same(2);
-    visuals.selection.bg_fill = ACCENT_DIM;
-    visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT);
-    visuals.hyperlink_color = ACCENT;
-    visuals.override_text_color = Some(TEXT);
+    visuals.window_stroke = Stroke::new(1.0_f32, THEME.border);
+    visuals.widgets.noninteractive.bg_fill = THEME.panel;
+    visuals.widgets.noninteractive.weak_bg_fill = THEME.panel;
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, THEME.text);
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, THEME.hairline);
+    visuals.widgets.noninteractive.corner_radius = CornerRadius::same(THEME.radius);
+    visuals.widgets.inactive.bg_fill = THEME.control;
+    visuals.widgets.inactive.weak_bg_fill = THEME.header;
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, THEME.text);
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, THEME.hairline);
+    visuals.widgets.inactive.corner_radius = CornerRadius::same(THEME.radius);
+    visuals.widgets.hovered.bg_fill = THEME.control_hover;
+    visuals.widgets.hovered.weak_bg_fill = THEME.control_hover;
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, THEME.text);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, THEME.border);
+    visuals.widgets.hovered.corner_radius = CornerRadius::same(THEME.radius);
+    visuals.widgets.active.bg_fill = THEME.accent_dim;
+    visuals.widgets.active.weak_bg_fill = THEME.accent_dim;
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, THEME.text);
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, THEME.accent);
+    visuals.widgets.active.corner_radius = CornerRadius::same(THEME.radius);
+    visuals.widgets.open.bg_fill = THEME.header;
+    visuals.widgets.open.fg_stroke = Stroke::new(1.0_f32, THEME.text);
+    visuals.widgets.open.corner_radius = CornerRadius::same(THEME.radius);
+    visuals.selection.bg_fill = THEME.accent_dim;
+    visuals.selection.stroke = Stroke::new(1.0_f32, THEME.accent);
+    visuals.hyperlink_color = THEME.accent;
+    visuals.override_text_color = Some(THEME.text);
     ctx.set_visuals(visuals);
 
     ctx.style_mut(|style| {
-        style.spacing.item_spacing = egui::vec2(6.0, 4.0);
-        style.spacing.button_padding = egui::vec2(7.0, 3.0);
-        style.spacing.interact_size.y = 20.0;
-        style.spacing.slider_width = 140.0;
-        style.spacing.window_margin = egui::Margin::same(8);
-        style.spacing.menu_margin = egui::Margin::same(6);
+        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        style.spacing.button_padding = egui::vec2(8.0, 4.0);
+        style.spacing.interact_size.y = 22.0;
+        style.spacing.slider_width = 160.0;
+        style.spacing.window_margin = Margin::same(10);
+        style.spacing.menu_margin = Margin::same(6);
+        style.spacing.indent = 12.0;
         style
             .text_styles
             .insert(TextStyle::Body, FontId::new(13.0, FontFamily::Proportional));
         style.text_styles.insert(
             TextStyle::Button,
-            FontId::new(12.5, FontFamily::Proportional),
+            FontId::new(12.0, FontFamily::Proportional),
         );
         style.text_styles.insert(
             TextStyle::Small,
@@ -84,13 +140,35 @@ pub fn apply(ctx: &egui::Context) {
         );
         style.text_styles.insert(
             TextStyle::Heading,
-            FontId::new(16.0, FontFamily::Proportional),
+            FontId::new(18.0, FontFamily::Proportional),
         );
         style.text_styles.insert(
             TextStyle::Monospace,
-            FontId::new(12.5, FontFamily::Monospace),
+            FontId::new(12.0, FontFamily::Monospace),
         );
     });
+}
+
+pub fn chrome_frame() -> Frame {
+    Frame::new()
+        .fill(THEME.bg)
+        .inner_margin(Margin::same(0))
+        .stroke(Stroke::NONE)
+}
+
+pub fn panel_frame() -> Frame {
+    Frame::new()
+        .fill(THEME.panel)
+        .inner_margin(Margin::same(0))
+        .stroke(Stroke::new(1.0_f32, THEME.hairline))
+}
+
+pub fn dialog_frame() -> Frame {
+    Frame::new()
+        .fill(THEME.panel)
+        .inner_margin(Margin::same(14))
+        .stroke(Stroke::new(1.0_f32, THEME.border))
+        .corner_radius(CornerRadius::same(6))
 }
 
 fn install_fonts(ctx: &egui::Context) {
@@ -132,22 +210,32 @@ fn first_font(paths: &[&str]) -> Option<Vec<u8>> {
     paths.iter().find_map(|path| std::fs::read(path).ok())
 }
 
-pub fn track_color(kind: editor_core::TrackKind) -> Color32 {
-    match kind {
-        editor_core::TrackKind::Video => VIDEO,
-        editor_core::TrackKind::Audio => AUDIO,
-        editor_core::TrackKind::Caption => CAPTION,
+impl MeridianTheme {
+    pub fn track_color(self, kind: TrackKind) -> Color32 {
+        match kind {
+            TrackKind::Video => self.video,
+            TrackKind::Audio => self.audio,
+            TrackKind::Caption => self.caption,
+        }
+    }
+
+    pub fn label_fill(self, label: LabelColor, kind: TrackKind) -> Color32 {
+        match label {
+            LabelColor::Neutral => self.track_color(kind),
+            LabelColor::Rose => Color32::from_rgb(168, 72, 88),
+            LabelColor::Amber => Color32::from_rgb(176, 122, 48),
+            LabelColor::Green => Color32::from_rgb(42, 138, 96),
+            LabelColor::Teal => Color32::from_rgb(32, 140, 146),
+            LabelColor::Blue => Color32::from_rgb(52, 112, 186),
+            LabelColor::Violet => Color32::from_rgb(118, 86, 184),
+        }
     }
 }
 
-pub fn label_fill(label: editor_core::LabelColor, kind: editor_core::TrackKind) -> Color32 {
-    match label {
-        editor_core::LabelColor::Neutral => track_color(kind),
-        editor_core::LabelColor::Rose => Color32::from_rgb(140, 64, 78),
-        editor_core::LabelColor::Amber => Color32::from_rgb(140, 104, 48),
-        editor_core::LabelColor::Green => Color32::from_rgb(36, 112, 78),
-        editor_core::LabelColor::Teal => Color32::from_rgb(32, 112, 118),
-        editor_core::LabelColor::Blue => Color32::from_rgb(46, 90, 150),
-        editor_core::LabelColor::Violet => Color32::from_rgb(96, 72, 150),
-    }
+pub fn track_color(kind: TrackKind) -> Color32 {
+    THEME.track_color(kind)
+}
+
+pub fn label_fill(label: LabelColor, kind: TrackKind) -> Color32 {
+    THEME.label_fill(label, kind)
 }
