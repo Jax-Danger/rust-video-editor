@@ -94,8 +94,8 @@ pub fn captions_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
                 );
                 if response.clicked() {
                     app.selected_cue = Some(id);
+                    app.halt_transport();
                     app.playhead = start;
-                    app.playing = false;
                 }
                 if selected {
                     ui.add_space(4.0);
@@ -107,6 +107,7 @@ pub fn captions_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
                                 .desired_rows(2)
                                 .desired_width(ui.available_width() - 8.0),
                         );
+                        app.note_text_focus(&response);
                         if response.gained_focus() {
                             app.session.begin_interactive("Edit caption");
                         }

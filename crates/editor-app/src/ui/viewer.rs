@@ -11,7 +11,7 @@ use editor_core::{
 use editor_media::{clamp_preview_time, fit_preview_size, resolve_media_path, PreviewBackend};
 use egui::{Color32, FontId, Painter, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 
-use crate::app::MeridianApp;
+use crate::app::{MeridianApp, ScrubSource};
 use crate::preview::{FrameView, PreviewImage, PreviewQuery};
 use crate::theme::THEME;
 use crate::ui::format_tc;
@@ -20,14 +20,22 @@ use crate::ui::widgets;
 const PREVIEW_MAX_W: u32 = 960;
 const PREVIEW_MAX_H: u32 = 540;
 const PLAY_BURST: u32 = 12;
+const SCRUB_BURST: u32 = 8;
+const SCRUB_H: f32 = 36.0;
 
 pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
     let Some(sequence) = app.session.project().active().cloned() else {
         ui.label("No sequence.");
         return;
     };
+    follow_viewer_scrub(ui, app);
     let playhead = app.playhead;
     let playing = app.playing;
+    let scrubbing = app.preview_scrub;
+    let reverse = app.play_rate < 0;
+    let peaks = app.audio.peaks();
+    let audio_badge = app.audio.badge();
+    let audio_status = app.audio.status().to_string();
     let media = app.session.project().media.clone();
     let source = top_picture(&sequence, playhead, &media);
     let backend = app.preview.backend().clone();
@@ -49,7 +57,7 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
                 if let Some(problem) = &source.problem {
                     banner = Some(problem.clone());
                 } else {
-                    let query = source.query(playing);
+                    let query = source.query(playing, scrubbing, reverse);
                     match app.preview.request(query) {
                         FrameView::Exact(image) | FrameView::Nearby(image) => {
                             picture = Some(image);
@@ -95,6 +103,8 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
         widgets::readout(ui, mode, 78.0, mode == "Preview");
         ui.add_space(6.0);
         widgets::readout(ui, &format_tc(playhead, sequence.timebase), 118.0, true);
+        ui.add_space(8.0);
+        audio_meters(ui, peaks, audio_badge, &audio_status);
     });
 
     let texture = picture.as_ref().map(|image| {
@@ -107,7 +117,8 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
         .filter(|_| picture.is_some())
         .map(|item| format!("{}  {}", item.track_name, item.clip_name));
 
-    let (rect, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
+    let monitor_h = (ui.available_height() - SCRUB_H).max(48.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), monitor_h), Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, THEME.stage);
     let frame = letterbox(
@@ -211,6 +222,137 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
     if let Some(text) = banner {
         overlay_note(&painter, frame, &text);
     }
+    program_scrubber(ui, app, sequence.end_frame().0.max(app.playhead));
+}
+
+fn follow_viewer_scrub(ui: &egui::Ui, app: &mut MeridianApp) {
+    let pointer = ui.input(|input| {
+        (
+            input.pointer.primary_down(),
+            input.pointer.primary_pressed(),
+            input.pointer.interact_pos(),
+        )
+    });
+    let (down, pressed, pos) = pointer;
+    if pressed {
+        if let (Some(pos), Some(bar)) = (pos, app.viewer_bar) {
+            if bar.contains(pos) {
+                app.scrub = Some(ScrubSource::Viewer);
+            }
+        }
+    }
+    if !down {
+        if app.scrub == Some(ScrubSource::Viewer) {
+            app.scrub = None;
+        }
+        return;
+    }
+    if app.scrub != Some(ScrubSource::Viewer) {
+        return;
+    }
+    let (Some(pos), Some(bar)) = (pos, app.viewer_bar) else {
+        return;
+    };
+    let span = bar.width().max(1.0);
+    let t = ((pos.x - bar.min.x) / span).clamp(0.0, 1.0);
+    let end = app.viewer_bar_end.max(0);
+    app.playhead = if end == 0 {
+        0
+    } else {
+        (t * end as f32).round() as i64
+    };
+    app.preview_scrub = true;
+    app.halt_transport();
+}
+
+fn program_scrubber(ui: &mut egui::Ui, app: &mut MeridianApp, end: i64) {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), SCRUB_H), Sense::click_and_drag());
+    let bar = rect.shrink2(Vec2::new(16.0, 14.0));
+    app.viewer_bar = Some(bar);
+    app.viewer_bar_end = end.max(0);
+    let painter = ui.painter();
+    painter.rect_filled(rect, 0.0, THEME.header);
+    painter.hline(rect.x_range(), rect.top(), Stroke::new(1.0_f32, THEME.hairline));
+    painter.rect_filled(bar, 2.0, THEME.inset);
+    if let Some(sequence) = app.session.project().active() {
+        if let (Some(inn), Some(out)) = (sequence.in_point, sequence.out_point) {
+            if end > 0 {
+                let x0 = bar.min.x + inn.0 as f32 / end as f32 * bar.width();
+                let x1 = bar.min.x + out.0 as f32 / end as f32 * bar.width();
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        Pos2::new(x0, bar.min.y),
+                        Pos2::new(x1.max(x0 + 2.0), bar.max.y),
+                    ),
+                    2.0,
+                    THEME.accent_dim,
+                );
+            }
+        }
+    }
+    let t = if end <= 0 {
+        0.0
+    } else {
+        (app.playhead as f32 / end as f32).clamp(0.0, 1.0)
+    };
+    let x = bar.min.x + t * bar.width();
+    painter.rect_filled(
+        Rect::from_min_max(bar.min, Pos2::new(x, bar.max.y)),
+        2.0,
+        Color32::from_white_alpha(28),
+    );
+    painter.vline(x, bar.y_range(), Stroke::new(2.0_f32, THEME.playhead));
+    if response.hovered() || response.dragged() {
+        response.clone().on_hover_cursor(egui::CursorIcon::PointingHand);
+    }
+    if response.is_pointer_button_down_on() {
+        app.scrub = Some(ScrubSource::Viewer);
+        if let Some(pos) = response.interact_pointer_pos() {
+            let span = bar.width().max(1.0);
+            let local = ((pos.x - bar.min.x) / span).clamp(0.0, 1.0);
+            app.playhead = if end <= 0 {
+                0
+            } else {
+                (local * end as f32).round() as i64
+            };
+            app.preview_scrub = true;
+            app.halt_transport();
+        }
+    }
+}
+
+fn audio_meters(ui: &mut egui::Ui, peaks: [f32; 2], badge: &str, status: &str) {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(28.0, 18.0), Sense::hover());
+    let painter = ui.painter();
+    for (index, peak) in peaks.iter().enumerate() {
+        let x = rect.left() + index as f32 * 8.0;
+        let column = Rect::from_min_size(Pos2::new(x, rect.top() + 1.0), Vec2::new(5.0, 16.0));
+        painter.rect_filled(column, 1.0, THEME.inset);
+        let level = peak.clamp(0.0, 1.0);
+        let fill_h = column.height() * level;
+        let color = if level > 0.92 {
+            THEME.danger
+        } else if level > 0.7 {
+            THEME.amber
+        } else {
+            THEME.audio
+        };
+        painter.rect_filled(
+            Rect::from_min_max(
+                Pos2::new(column.left(), column.bottom() - fill_h),
+                column.right_bottom(),
+            ),
+            1.0,
+            color,
+        );
+    }
+    response.on_hover_text(format!("{badge} — {status}"));
+    ui.label(
+        egui::RichText::new(badge)
+            .size(11.0)
+            .color(THEME.text_mute),
+    );
 }
 
 struct PictureSource {
@@ -228,7 +370,13 @@ struct PictureSource {
 }
 
 impl PictureSource {
-    fn query(&self, playing: bool) -> PreviewQuery {
+    fn query(&self, playing: bool, scrubbing: bool, reverse: bool) -> PreviewQuery {
+        let burst = if playing && !scrubbing {
+            PLAY_BURST
+        } else {
+            SCRUB_BURST
+        };
+        let lead = if scrubbing || reverse { burst / 3 } else { 0 };
         PreviewQuery {
             path: self.path.clone(),
             source_frame: self.source_frame,
@@ -237,7 +385,8 @@ impl PictureSource {
             time_secs: self.time_secs,
             frame_secs: self.frame_secs,
             last_source_frame: self.last_source_frame,
-            burst: if playing { PLAY_BURST } else { 1 },
+            burst,
+            lead,
         }
     }
 }

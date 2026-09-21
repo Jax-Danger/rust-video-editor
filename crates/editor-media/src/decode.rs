@@ -16,6 +16,51 @@ pub const MAX_PREVIEW_DIMENSION: u32 = 1920;
 /// Most frames one ffmpeg invocation will emit.
 pub const MAX_BURST: u32 = 16;
 
+/// Interleaved stereo rate used for timeline playback.
+pub const AUDIO_RATE: u32 = 48_000;
+pub const AUDIO_CHANNELS: u16 = 2;
+/// Longest PCM chunk one call will decode. The player asks for about two seconds.
+pub const MAX_AUDIO_SECONDS: f64 = 8.0;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioRequest {
+    pub path: String,
+    pub start_secs: f64,
+    pub duration_secs: f64,
+}
+
+impl AudioRequest {
+    pub fn new(
+        path: impl AsRef<str>,
+        start_secs: f64,
+        duration_secs: f64,
+    ) -> Result<Self, DecodeError> {
+        let request = Self {
+            path: path.as_ref().trim().to_string(),
+            start_secs,
+            duration_secs,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn validate(&self) -> Result<(), DecodeError> {
+        if self.path.is_empty() {
+            return Err(DecodeError::EmptyPath);
+        }
+        if !self.start_secs.is_finite() || self.start_secs < 0.0 {
+            return Err(DecodeError::TimeOutOfRange);
+        }
+        if !self.duration_secs.is_finite()
+            || self.duration_secs <= 0.0
+            || self.duration_secs > MAX_AUDIO_SECONDS
+        {
+            return Err(DecodeError::TimeOutOfRange);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct FrameRequest {
     pub path: String,
@@ -235,6 +280,88 @@ pub fn preview_backend() -> PreviewBackend {
     }
 }
 
+/// Decode interleaved stereo `f32` PCM at [`AUDIO_RATE`].
+///
+/// Without the `ffmpeg` feature this returns [`DecodeError::FeatureDisabled`]
+/// and does not spawn a process. A file with no audio stream fails the same
+/// way a bad video decode does.
+pub fn decode_audio(request: &AudioRequest) -> Result<Vec<f32>, DecodeError> {
+    request.validate()?;
+    #[cfg(not(feature = "ffmpeg"))]
+    {
+        Err(DecodeError::FeatureDisabled)
+    }
+    #[cfg(feature = "ffmpeg")]
+    {
+        decode_audio_cli(request)
+    }
+}
+
+#[cfg(feature = "ffmpeg")]
+fn decode_audio_cli(request: &AudioRequest) -> Result<Vec<f32>, DecodeError> {
+    let path = resolve_media_path(&request.path);
+    if !path.is_file() {
+        return Err(DecodeError::Offline);
+    }
+    let start = format!("{:.6}", request.start_secs);
+    let duration = format!("{:.6}", request.duration_secs);
+    let rate = AUDIO_RATE.to_string();
+    let channels = AUDIO_CHANNELS.to_string();
+    let output = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-ss",
+            &start,
+            "-i",
+        ])
+        .arg(&path)
+        .args([
+            "-t",
+            &duration,
+            "-map",
+            "0:a:0",
+            "-ac",
+            &channels,
+            "-ar",
+            &rate,
+            "-f",
+            "f32le",
+            "pipe:1",
+        ])
+        .output()
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                DecodeError::Unavailable("ffmpeg was not found on PATH".into())
+            } else {
+                DecodeError::Unavailable(brief(&err.to_string()))
+            }
+        })?;
+    if output.stdout.len() < 8 || !output.status.success() && output.stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let message = brief(&stderr);
+        return Err(DecodeError::Ffmpeg(if message.is_empty() {
+            format!("ffmpeg exited with {}", output.status)
+        } else {
+            message
+        }));
+    }
+    let bytes = &output.stdout[..output.stdout.len() - (output.stdout.len() % 4)];
+    let mut samples = Vec::with_capacity(bytes.len() / 4);
+    for chunk in bytes.chunks_exact(4) {
+        samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    if samples.len() < AUDIO_CHANNELS as usize {
+        return Err(DecodeError::UnexpectedSize {
+            got: output.stdout.len(),
+            frame_bytes: 8,
+        });
+    }
+    Ok(samples)
+}
+
 /// Decode `request.count` frames starting at `request.time_secs`.
 ///
 /// Without the `ffmpeg` feature this returns [`DecodeError::FeatureDisabled`]
@@ -449,12 +576,40 @@ mod tests {
     }
 
     #[test]
+    fn audio_request_rejects_bad_bounds() {
+        assert_eq!(
+            AudioRequest::new("", 0.0, 1.0).unwrap_err(),
+            DecodeError::EmptyPath
+        );
+        assert_eq!(
+            AudioRequest::new("clip.mp4", -0.1, 1.0).unwrap_err(),
+            DecodeError::TimeOutOfRange
+        );
+        assert_eq!(
+            AudioRequest::new("clip.mp4", 0.0, 0.0).unwrap_err(),
+            DecodeError::TimeOutOfRange
+        );
+        assert_eq!(
+            AudioRequest::new("clip.mp4", 0.0, MAX_AUDIO_SECONDS + 0.1).unwrap_err(),
+            DecodeError::TimeOutOfRange
+        );
+        let ok = AudioRequest::new("  clip.mp4 ", 1.25, 2.0).unwrap();
+        assert_eq!(ok.path, "clip.mp4");
+        assert!((ok.start_secs - 1.25).abs() < 1e-9);
+    }
+
+    #[test]
     fn disabled_feature_does_not_spawn_ffmpeg() {
         let request = FrameRequest::new("missing-preview.mp4", 0.0, 16, 16, 1).unwrap();
+        let audio = AudioRequest::new("missing-preview.mp4", 0.0, 0.5).unwrap();
         match preview_backend() {
             PreviewBackend::Disabled => {
                 assert_eq!(
                     decode_frames(&request).unwrap_err(),
+                    DecodeError::FeatureDisabled
+                );
+                assert_eq!(
+                    decode_audio(&audio).unwrap_err(),
                     DecodeError::FeatureDisabled
                 );
             }

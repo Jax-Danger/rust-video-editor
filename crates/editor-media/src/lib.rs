@@ -16,9 +16,9 @@ mod decode;
 mod probe;
 
 pub use decode::{
-    clamp_preview_time, decode_frames, ensure_time_in_range, fit_preview_size, preview_backend,
-    resolve_media_path, DecodeError, DecodedFrame, FrameRequest, PreviewBackend, MAX_BURST,
-    MAX_PREVIEW_DIMENSION,
+    clamp_preview_time, decode_audio, decode_frames, ensure_time_in_range, fit_preview_size,
+    preview_backend, resolve_media_path, AudioRequest, DecodeError, DecodedFrame, FrameRequest,
+    PreviewBackend, AUDIO_CHANNELS, AUDIO_RATE, MAX_AUDIO_SECONDS, MAX_BURST, MAX_PREVIEW_DIMENSION,
 };
 pub use probe::{parse_ffprobe_json, probe, probe_stub, ProbeError, ProbeResult};
 

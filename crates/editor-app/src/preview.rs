@@ -11,8 +11,24 @@ use std::thread::{self, JoinHandle};
 use editor_media::{decode_frames, preview_backend, FrameRequest, PreviewBackend, MAX_BURST};
 use egui::{ColorImage, Context, TextureHandle, TextureOptions};
 
-const CACHE_LIMIT: usize = 48;
+const CACHE_LIMIT: usize = 96;
 const LOOKAHEAD: i64 = 8;
+
+/// Where a decode burst should start so scrubbing reuses one ffmpeg invocation.
+///
+/// `lead` is how many frames before `source_frame` to include. Playback passes
+/// `0` (the burst runs forward from the playhead). Scrubbing and reverse pass
+/// a lead so the frames under the pointer are inside the cached window.
+pub fn burst_origin(source_frame: i64, last_source_frame: i64, burst: u32, lead: u32) -> (i64, u32) {
+    let last = last_source_frame.max(0);
+    let burst = burst.clamp(1, MAX_BURST);
+    if source_frame > last {
+        return (last, 1);
+    }
+    let start = source_frame.saturating_sub(i64::from(lead)).max(0);
+    let room = (last - start + 1).max(1) as u32;
+    (start, burst.min(room))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FrameKey {
@@ -48,8 +64,10 @@ pub struct PreviewQuery {
     pub time_secs: f64,
     pub frame_secs: f64,
     pub last_source_frame: i64,
-    /// Frames per ffmpeg invocation. `1` while scrubbing, a short run while playing.
+    /// Frames per ffmpeg invocation. A short run, never one process per pixel.
     pub burst: u32,
+    /// Frames of the burst that sit before [`Self::source_frame`].
+    pub lead: u32,
 }
 
 impl PreviewQuery {
@@ -187,9 +205,10 @@ impl PreviewEngine {
             return FrameView::Failed(message.clone());
         }
         if !self.covers(&query) {
-            self.schedule(query.clone(), query.burst);
+            self.schedule(query.clone());
         }
-        self.nearby(&query)
+        let slack = i64::from(query.burst.max(1)) + i64::from(query.lead);
+        self.nearby(&query, slack)
             .map(FrameView::Nearby)
             .unwrap_or(FrameView::Pending)
     }
@@ -237,30 +256,38 @@ impl PreviewEngine {
         let delta = (ahead - query.source_frame) as f64;
         next.source_frame = ahead;
         next.time_secs = (query.time_secs + delta * query.frame_secs.max(0.0)).max(0.0);
-        self.schedule(next, query.burst);
+        self.schedule(next);
     }
 
-    fn schedule(&mut self, query: PreviewQuery, burst: u32) {
+    fn schedule(&mut self, query: PreviewQuery) {
         let Some(tx) = self.tx.clone() else {
             return;
         };
         if query.source_frame > query.last_source_frame {
             return;
         }
-        let room = (query.last_source_frame - query.source_frame + 1).max(1) as u32;
-        let count = burst.clamp(1, MAX_BURST).min(room);
+        let (start_frame, count) = burst_origin(
+            query.source_frame,
+            query.last_source_frame,
+            query.burst,
+            query.lead,
+        );
+        let backed = (query.source_frame - start_frame).max(0) as f64;
+        let time_secs = (query.time_secs - backed * query.frame_secs.max(0.0)).max(0.0);
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         let job = Job {
             id,
             path: query.path,
-            start_frame: query.source_frame,
+            start_frame,
             width: query.width,
             height: query.height,
-            time_secs: query.time_secs,
+            time_secs,
             count,
         };
-        self.slots.insert(job.key(), Slot::Pending);
+        if !matches!(self.slots.get(&job.key()), Some(Slot::Ready(_))) {
+            self.slots.insert(job.key(), Slot::Pending);
+        }
         if self.inflight.is_some() {
             if let Some(previous) = self.queued.replace(job) {
                 self.forget_pending(&previous.key());
@@ -294,7 +321,7 @@ impl PreviewEngine {
                 .is_some_and(hit)
     }
 
-    fn nearby(&self, query: &PreviewQuery) -> Option<PreviewImage> {
+    fn nearby(&self, query: &PreviewQuery, max_distance: i64) -> Option<PreviewImage> {
         let mut best: Option<(i64, PreviewImage)> = None;
         for (key, slot) in &self.slots {
             if key.path != query.path || key.width != query.width || key.height != query.height {
@@ -304,6 +331,9 @@ impl PreviewEngine {
                 continue;
             };
             let distance = (key.source_frame - query.source_frame).abs();
+            if distance > max_distance {
+                continue;
+            }
             if best
                 .as_ref()
                 .is_none_or(|(best_distance, _)| distance < *best_distance)
@@ -396,6 +426,30 @@ impl Drop for PreviewEngine {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::burst_origin;
+
+    #[test]
+    fn scrub_burst_covers_the_playhead_without_a_job_per_frame() {
+        let (start, count) = burst_origin(100, 400, 8, 3);
+        assert_eq!(start, 97);
+        assert_eq!(count, 8);
+        assert!(100 >= start && 100 < start + i64::from(count));
+
+        let (start, count) = burst_origin(1, 400, 8, 3);
+        assert_eq!(start, 0);
+        assert_eq!(count, 8);
+
+        let (start, count) = burst_origin(398, 400, 8, 0);
+        assert_eq!(start, 398);
+        assert_eq!(count, 3);
+
+        let (start, count) = burst_origin(10, 10, 8, 0);
+        assert_eq!((start, count), (10, 1));
     }
 }
 

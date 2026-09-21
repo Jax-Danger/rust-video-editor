@@ -41,6 +41,7 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     libegl1-mesa-dev \
     libvulkan-dev \
     mesa-vulkan-drivers \
+    libgtk-3-dev \
     libasound2-dev \
     libudev-dev
 

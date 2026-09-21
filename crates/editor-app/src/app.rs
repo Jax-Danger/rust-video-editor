@@ -2,16 +2,24 @@
 
 use editor_core::{
     add_transition, builtin_templates, clip_from_media, expand_linked, link_clips, plan_export,
-    replace_captions, BinId, CaptionTranscriber, ClipId, CueId, Direction, EditError, ExportRange,
-    Frame, MediaAsset, MediaId, Project, Session, Timebase, Track, TrackFlag, TrackId, TrackKind,
-    TransitionKind, TrimEdge,
+    replace_captions, Bin, BinId, CaptionTranscriber, ClipId, CueId, Direction, EditError,
+    ExportRange, Frame, MediaAsset, MediaId, Project, Session, Timebase, Track, TrackFlag, TrackId,
+    TrackKind, TransitionKind, TrimEdge,
 };
-use editor_media::{duration_frames, probe};
-use egui::{Key, Modifiers, RichText, ViewportCommand};
+use editor_media::{duration_frames, probe, resolve_media_path};
+use egui::{Event, Key, Modifiers, RichText, ViewportCommand};
 
+use crate::audio::{collect_pieces, AudioEngine};
+use crate::dialogs;
 use crate::preview::PreviewEngine;
 use crate::theme;
 use crate::ui::{self, format_tc};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrubSource {
+    Ruler,
+    Viewer,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
@@ -38,7 +46,7 @@ impl Tool {
     pub fn hint(self) -> &'static str {
         match self {
             Self::Select => "V  ·  drag a clip to move, drag an edge to trim",
-            Self::Razor => "C  ·  click a clip to split it and its linked pair",
+            Self::Razor => "C  ·  split at the playhead; click a clip to split it",
             Self::Ripple => "B  ·  drag an edge; downstream clips follow",
             Self::Roll => "N  ·  drag a cut; the neighbour absorbs the change",
             Self::Slip => "Y  ·  drag to shift source without moving the clip",
@@ -141,6 +149,17 @@ pub struct MeridianApp {
     pub nudge: i64,
     pub transcriber: editor_core::StubTranscriber,
     pub preview: PreviewEngine,
+    pub play_rate: i32,
+    pub preview_scrub: bool,
+    pub scrub: Option<ScrubSource>,
+    pub reveal_playhead: bool,
+    pub text_editing: bool,
+    pub dragging_media: Option<MediaId>,
+    pub timeline_view: Option<egui::Rect>,
+    pub ruler_rect: Option<egui::Rect>,
+    pub viewer_bar: Option<egui::Rect>,
+    pub viewer_bar_end: i64,
+    pub audio: AudioEngine,
 }
 
 impl MeridianApp {
@@ -168,6 +187,17 @@ impl MeridianApp {
             nudge: 1,
             transcriber: editor_core::StubTranscriber::default(),
             preview: PreviewEngine::new(),
+            play_rate: 0,
+            preview_scrub: false,
+            scrub: None,
+            reveal_playhead: false,
+            text_editing: false,
+            dragging_media: None,
+            timeline_view: None,
+            ruler_rect: None,
+            viewer_bar: None,
+            viewer_bar_end: 0,
+            audio: AudioEngine::new(),
         };
         app.sync_title(&cc.egui_ctx);
         app
@@ -208,108 +238,251 @@ impl MeridianApp {
 
     fn tick_playback(&mut self, ctx: &egui::Context) {
         if !self.playing {
+            let _ = self.audio.pump();
             return;
         }
         ctx.request_repaint();
-        let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
-        self.play_accum += dt;
-        let frame_dur = self.timebase().frame_duration_secs().max(1.0 / 120.0) as f32;
         let end = self.sequence_end();
+        if self.play_rate == 1 && self.audio.drives_picture() {
+            if let Some(frame) = self.audio.pump() {
+                self.playhead = frame.clamp(0, end);
+                self.reveal_playhead = true;
+                if frame >= end {
+                    self.halt_transport();
+                    self.status = "End of sequence.".into();
+                }
+                return;
+            }
+            let _ = self.audio.pump();
+            return;
+        }
+        let _ = self.audio.pump();
+        let rate = if self.play_rate == 0 { 1 } else { self.play_rate };
+        let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
+        self.play_accum += dt * rate.unsigned_abs().max(1) as f32;
+        let frame_dur = self.timebase().frame_duration_secs().max(1.0 / 120.0) as f32;
         while self.play_accum >= frame_dur {
             self.play_accum -= frame_dur;
-            self.playhead += 1;
-            if self.playhead >= end {
-                self.playhead = end;
-                self.playing = false;
-                self.play_accum = 0.0;
-                break;
+            if rate < 0 {
+                if self.playhead <= 0 {
+                    self.playhead = 0;
+                    self.halt_transport();
+                    break;
+                }
+                self.playhead -= 1;
+            } else {
+                self.playhead += 1;
+                if self.playhead >= end {
+                    self.playhead = end;
+                    self.halt_transport();
+                    break;
+                }
             }
+            self.reveal_playhead = true;
         }
     }
 
+    pub fn halt_transport(&mut self) {
+        let running = self.playing || self.play_rate != 0;
+        self.playing = false;
+        self.play_rate = 0;
+        self.play_accum = 0.0;
+        if running {
+            self.audio.stop();
+        }
+    }
+
+    pub fn zoom_by(&mut self, factor: f32) {
+        self.pixels_per_frame = (self.pixels_per_frame * factor).clamp(0.2, 64.0);
+    }
+
+    pub fn note_text_focus(&mut self, response: &egui::Response) {
+        if response.has_focus() {
+            self.text_editing = true;
+        }
+    }
+
+    fn shuttle(&mut self, direction: i32) {
+        self.audio.stop();
+        if direction > 0 {
+            self.play_rate = if self.play_rate > 0 {
+                (self.play_rate.saturating_mul(2)).min(8)
+            } else {
+                1
+            };
+        } else {
+            self.play_rate = if self.play_rate < 0 {
+                (self.play_rate.saturating_mul(2)).max(-8)
+            } else {
+                -1
+            };
+        }
+        self.playing = true;
+        self.play_accum = 0.0;
+        if self.play_rate == 1 {
+            self.start_audio();
+        } else {
+            self.status = if self.play_rate < 0 {
+                format!("Shuttle {}× (reverse is silent).", self.play_rate)
+            } else {
+                format!("Shuttle {}× (audio plays at 1×).", self.play_rate)
+            };
+        }
+    }
+
+    pub(crate) fn toggle_play(&mut self) {
+        if self.playing {
+            self.halt_transport();
+            self.status = "Paused.".into();
+            return;
+        }
+        self.play_rate = 1;
+        self.playing = true;
+        self.play_accum = 0.0;
+        self.start_audio();
+        if self.audio.drives_picture() {
+            self.status = "Play.".into();
+        } else if self.audio.badge() == "No device" || self.audio.badge() == "No audio" {
+            self.status = self.audio.status().to_string();
+        } else {
+            self.status = "Play.".into();
+        }
+    }
+
+    fn start_audio(&mut self) {
+        let fps = self.timebase().fps_f64();
+        let end = self.sequence_end();
+        let pieces = self
+            .session
+            .project()
+            .active()
+            .map(|sequence| {
+                collect_pieces(
+                    sequence,
+                    &self.session.project().media,
+                    self.playhead,
+                    end,
+                )
+            })
+            .unwrap_or_default();
+        self.audio.begin(self.playhead, end, fps, pieces);
+    }
+
+    pub(crate) fn step_playhead(&mut self, delta: i64) {
+        self.halt_transport();
+        self.preview_scrub = true;
+        self.reveal_playhead = true;
+        self.playhead = (self.playhead + delta).max(0);
+    }
+
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        if ctx.wants_keyboard_input() {
+        if self.text_editing {
             return;
         }
         let mods = ctx.input(|i| i.modifiers);
-        let pressed = |key: Key| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, key));
-        let pressed_cmd = |key: Key| ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, key));
-        let pressed_shift = |key: Key| ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, key));
+        let pressed = |key: Key| consume_key(ctx, Modifiers::NONE, key, true);
+        let tap = |key: Key| consume_key(ctx, Modifiers::NONE, key, false);
+        let pressed_cmd = |key: Key| consume_key(ctx, Modifiers::COMMAND, key, false);
+        let held_cmd = |key: Key| consume_key(ctx, Modifiers::COMMAND, key, true);
+        let pressed_shift = |key: Key| consume_key(ctx, Modifiers::SHIFT, key, true);
         let pressed_cmd_shift =
-            |key: Key| ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, key));
+            |key: Key| consume_key(ctx, Modifiers::COMMAND | Modifiers::SHIFT, key, false);
+        let second = self.timebase().timecode_fps().max(1);
 
-        if pressed_cmd(Key::Z) {
-            if self.session.undo() {
-                self.status = "Undo.".into();
-            }
-        } else if pressed_cmd_shift(Key::Z) || pressed_cmd(Key::Y) {
+        if pressed_cmd_shift(Key::Z) || pressed_cmd(Key::Y) {
             if self.session.redo() {
                 self.status = "Redo.".into();
             }
+        } else if pressed_cmd(Key::Z) {
+            if self.session.undo() {
+                self.status = "Undo.".into();
+            }
         } else if pressed_cmd(Key::S) {
             self.save_or_prompt();
-        } else if pressed(Key::Space) {
-            self.playing = !self.playing;
-            self.play_accum = 0.0;
-        } else if pressed(Key::ArrowLeft) {
-            self.playing = false;
-            self.playhead = (self.playhead - 1).max(0);
-        } else if pressed(Key::ArrowRight) {
-            self.playing = false;
-            self.playhead += 1;
+        } else if pressed_cmd(Key::O) {
+            self.open_dialog();
+        } else if pressed_cmd(Key::N) {
+            self.modal = Modal::NewProject {
+                name: "Untitled".into(),
+                template: 1,
+            };
+        } else if pressed_cmd(Key::I) {
+            self.import_dialog();
+        } else if pressed_cmd(Key::K) || (tap(Key::C) && !mods.command) {
+            self.tool = Tool::Razor;
+            self.split_at_playhead();
+        } else if held_cmd(Key::ArrowLeft) {
+            self.step_playhead(-second);
+        } else if held_cmd(Key::ArrowRight) {
+            self.step_playhead(second);
+        } else if tap(Key::Space) {
+            self.toggle_play();
+        } else if tap(Key::J) {
+            self.shuttle(-1);
+        } else if tap(Key::K) {
+            self.halt_transport();
+            self.status = "Stop.".into();
+        } else if tap(Key::L) {
+            self.shuttle(1);
         } else if pressed_shift(Key::ArrowLeft) {
-            self.playing = false;
-            self.playhead = (self.playhead - self.timebase().timecode_fps()).max(0);
+            self.step_playhead(-10);
         } else if pressed_shift(Key::ArrowRight) {
-            self.playing = false;
-            self.playhead += self.timebase().timecode_fps();
+            self.step_playhead(10);
+        } else if pressed(Key::ArrowLeft) {
+            self.step_playhead(-1);
+        } else if pressed(Key::ArrowRight) {
+            self.step_playhead(1);
         } else if pressed(Key::ArrowUp) {
             self.jump_edit(-1);
         } else if pressed(Key::ArrowDown) {
             self.jump_edit(1);
         } else if pressed(Key::Home) {
+            self.halt_transport();
             self.playhead = 0;
-            self.playing = false;
+            self.reveal_playhead = true;
         } else if pressed(Key::End) {
+            self.halt_transport();
             self.playhead = self.sequence_end();
-            self.playing = false;
-        } else if pressed(Key::I) {
+            self.reveal_playhead = true;
+        } else if pressed(Key::I) && !mods.command {
             self.mark_in();
-        } else if pressed(Key::O) {
+        } else if pressed(Key::O) && !mods.command {
             self.mark_out();
-        } else if pressed(Key::M) {
+        } else if tap(Key::M) {
             self.add_marker();
-        } else if pressed(Key::S) && !mods.command {
+        } else if tap(Key::S) && !mods.command {
             self.snap_enabled = !self.snap_enabled;
             self.status = if self.snap_enabled {
                 "Snapping on.".into()
             } else {
                 "Snapping off.".into()
             };
-        } else if pressed(Key::V) {
+        } else if tap(Key::V) {
             self.tool = Tool::Select;
-        } else if pressed(Key::C) && !mods.command {
-            self.tool = Tool::Razor;
-        } else if pressed(Key::B) {
+        } else if tap(Key::B) {
             self.tool = Tool::Ripple;
-        } else if pressed(Key::N) {
+        } else if tap(Key::N) && !mods.command {
             self.tool = Tool::Roll;
-        } else if pressed(Key::Y) && !mods.command {
+        } else if tap(Key::Y) && !mods.command {
             self.tool = Tool::Slip;
-        } else if pressed(Key::U) {
+        } else if tap(Key::U) {
             self.tool = Tool::Slide;
-        } else if pressed(Key::Delete) || pressed(Key::Backspace) {
-            self.delete_selection(false);
         } else if pressed_shift(Key::Delete) || pressed_shift(Key::Backspace) {
             self.delete_selection(true);
-        } else if pressed_cmd(Key::K) {
-            self.split_at_playhead();
+        } else if pressed(Key::Delete) || pressed(Key::Backspace) {
+            self.delete_selection(false);
         } else if pressed(Key::Equals) || pressed(Key::Plus) {
-            self.pixels_per_frame = (self.pixels_per_frame * 1.25).min(24.0);
+            self.zoom_by(1.25);
         } else if pressed(Key::Minus) {
-            self.pixels_per_frame = (self.pixels_per_frame / 1.25).max(0.35);
+            self.zoom_by(1.0 / 1.25);
         } else if pressed_shift(Key::Z) && !mods.command {
             self.zoom_to_fit();
+            self.reveal_playhead = true;
+        } else if tap(Key::Escape) {
+            self.selected.clear();
+            self.selected_cue = None;
+            self.dragging_media = None;
+            self.status = "Selection cleared.".into();
         }
     }
 
@@ -325,7 +498,8 @@ impl MeridianApp {
         } else if let Some(frame) = points.iter().rev().find(|f| **f < self.playhead) {
             self.playhead = *frame;
         }
-        self.playing = false;
+        self.halt_transport();
+        self.reveal_playhead = true;
     }
 
     pub fn mark_in(&mut self) {
@@ -548,7 +722,87 @@ impl MeridianApp {
     pub fn zoom_to_fit(&mut self) {
         let frames = (self.sequence_end() + 24).max(48) as f32;
         let width = self.timeline_width.max(200.0);
-        self.pixels_per_frame = (width / frames).clamp(0.35, 24.0);
+        self.pixels_per_frame = (width / frames).clamp(0.2, 64.0);
+    }
+
+    pub fn import_dialog(&mut self) {
+        match dialogs::import_media_files() {
+            Some(paths) => self.import_paths(&paths),
+            None => self.status = "Import cancelled.".into(),
+        }
+    }
+
+    pub fn open_dialog(&mut self) {
+        match dialogs::open_project_file() {
+            Some(path) => self.open_path(&path.to_string_lossy()),
+            None => self.status = "Open cancelled.".into(),
+        }
+    }
+
+    pub fn save_dialog(&mut self) {
+        let name = dialogs::project_file_name(&self.session.project().name);
+        let directory = self.path.as_deref().and_then(|path| {
+            std::path::Path::new(path)
+                .parent()
+                .map(|dir| dir.to_path_buf())
+        });
+        match dialogs::save_project_file(&name, directory.as_deref()) {
+            Some(path) => self.save_to(&path.to_string_lossy()),
+            None => self.status = "Save cancelled.".into(),
+        }
+    }
+
+    pub fn import_paths(&mut self, paths: &[std::path::PathBuf]) {
+        let mut assets = Vec::new();
+        let mut errors = Vec::new();
+        for path in paths {
+            if dialogs::is_project_file(path) {
+                errors.push(format!(
+                    "{} is a project file — use File → Open",
+                    path.display()
+                ));
+                continue;
+            }
+            match probe(path.as_path()) {
+                Ok(mut result) => {
+                    result.path = canonical_media_path(path);
+                    result.offline = ui::media_missing(&result.path);
+                    assets.push(asset_from_probe(&result));
+                }
+                Err(err) => errors.push(format!("{}: {err}", path.display())),
+            }
+        }
+        if assets.is_empty() {
+            self.status = if errors.is_empty() {
+                "Nothing to import.".into()
+            } else {
+                errors.join("  ")
+            };
+            return;
+        }
+        let count = assets.len();
+        let result = self.session.edit("Import media", move |project| {
+            ensure_master_bin(project);
+            for asset in assets {
+                editor_core::import_media(project, asset);
+            }
+            Ok(())
+        });
+        match result {
+            Ok(()) => {
+                self.selected_media = self.session.project().media.last().map(|media| media.id);
+                let extra = if errors.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {}", errors.join("  "))
+                };
+                self.status = format!(
+                    "Imported {count} file(s). Double-click, drag onto the timeline, or use Overwrite / Insert.{extra}"
+                );
+                self.modal = Modal::None;
+            }
+            Err(err) => self.status = err.to_string(),
+        }
     }
 
     pub fn import_path(&mut self, path: &str) {
@@ -595,11 +849,7 @@ impl MeridianApp {
         if let Some(path) = self.path.clone() {
             self.save_to(&path);
         } else {
-            let suggested = suggested_path(&self.session.project().name);
-            self.modal = Modal::SaveAs {
-                path: suggested,
-                error: String::new(),
-            };
+            self.save_dialog();
         }
     }
 
@@ -617,12 +867,14 @@ impl MeridianApp {
 
     pub fn open_path(&mut self, path: &str) {
         match Project::load_file(std::path::Path::new(path)) {
-            Ok(project) => {
+            Ok(mut project) => {
+                refresh_offline(&mut project);
                 self.session.replace_project(project);
                 self.path = Some(path.to_string());
                 self.playhead = 0;
                 self.selected.clear();
-                self.playing = false;
+                self.selected_media = None;
+                self.halt_transport();
                 self.status = format!("Opened {path}.");
                 self.modal = Modal::None;
             }
@@ -647,7 +899,7 @@ impl MeridianApp {
                 self.playhead = 0;
                 self.selected.clear();
                 self.selected_media = None;
-                self.playing = false;
+                self.halt_transport();
                 self.workspace = Workspace::Edit;
                 self.status = format!("New project from {}.", template.name);
                 self.modal = Modal::None;
@@ -662,7 +914,7 @@ impl MeridianApp {
         self.playhead = 24;
         self.selected = vec![ClipId(301)];
         self.selected_media = Some(MediaId(10));
-        self.playing = false;
+        self.halt_transport();
         self.workspace = Workspace::Edit;
         self.status = "Opened example project — Northline — Opening.".into();
     }
@@ -817,18 +1069,81 @@ fn asset_from_probe(result: &editor_media::ProbeResult) -> MediaAsset {
     }
 }
 
-fn suggested_path(name: &str) -> String {
-    let slug: String = name
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    format!("/tmp/{slug}.meridian.json")
+fn ensure_master_bin(project: &mut Project) {
+    if project.bins.is_empty() {
+        let id = BinId(project.alloc());
+        project.bins.push(Bin {
+            id,
+            name: "Master".into(),
+            parent: None,
+        });
+    }
+}
+
+fn canonical_media_path(path: &std::path::Path) -> String {
+    let raw = path.to_string_lossy();
+    let resolved = resolve_media_path(&raw);
+    let target = if resolved.is_file() {
+        resolved
+    } else {
+        path.to_path_buf()
+    };
+    std::fs::canonicalize(&target)
+        .unwrap_or(target)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn refresh_offline(project: &mut Project) {
+    for media in &mut project.media {
+        media.offline = ui::media_missing(&media.path);
+    }
+}
+
+fn consume_key(ctx: &egui::Context, modifiers: Modifiers, key: Key, allow_repeat: bool) -> bool {
+    ctx.input_mut(|input| {
+        let mut matched = false;
+        input.events.retain(|event| {
+            let Event::Key {
+                key: ev_key,
+                modifiers: ev_mods,
+                pressed: true,
+                repeat,
+                ..
+            } = event
+            else {
+                return true;
+            };
+            if *ev_key != key || !ev_mods.matches_logically(modifiers) {
+                return true;
+            }
+            if *repeat && !allow_repeat {
+                return false;
+            }
+            matched = true;
+            false
+        });
+        matched
+    })
 }
 
 impl eframe::App for MeridianApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.preview_scrub = false;
         self.tick_playback(ctx);
         self.handle_keys(ctx);
+        self.text_editing = false;
+        let dropped: Vec<std::path::PathBuf> = ctx.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .filter_map(|file| file.path.clone())
+                .collect()
+        });
+        if !dropped.is_empty() {
+            self.import_paths(&dropped);
+        }
         self.sync_title(ctx);
         self.menu_bar(ctx);
         self.toolbar(ctx);
@@ -891,6 +1206,9 @@ impl eframe::App for MeridianApp {
         }
 
         self.modals(ctx);
+        if ctx.input(|input| input.pointer.any_released()) {
+            self.dragging_media = None;
+        }
     }
 }
 
@@ -919,11 +1237,8 @@ impl MeridianApp {
                             };
                             ui.close_menu();
                         }
-                        if ui.button("Open…").clicked() {
-                            self.modal = Modal::Open {
-                                path: self.path.clone().unwrap_or_else(|| "/tmp/".into()),
-                                error: String::new(),
-                            };
+                        if ui.button("Open…    Ctrl+O").clicked() {
+                            self.open_dialog();
                             ui.close_menu();
                         }
                         if ui.button("Open Example").clicked() {
@@ -931,17 +1246,21 @@ impl MeridianApp {
                             ui.close_menu();
                         }
                         ui.separator();
-                        if ui.button("Save").clicked() {
+                        if ui.button("Save    Ctrl+S").clicked() {
                             self.save_or_prompt();
                             ui.close_menu();
                         }
                         if ui.button("Save As…").clicked() {
-                            self.modal = Modal::SaveAs {
-                                path: self.path.clone().unwrap_or_else(|| {
-                                    suggested_path(&self.session.project().name)
-                                }),
-                                error: String::new(),
-                            };
+                            self.save_dialog();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Import Media…    Ctrl+I").clicked() {
+                            self.import_dialog();
+                            ui.close_menu();
+                        }
+                        if ui.button("Import from Path…").clicked() {
+                            open_import(self);
                             ui.close_menu();
                         }
                         ui.separator();
@@ -1254,7 +1573,8 @@ impl MeridianApp {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.label("Name");
-                    ui.add(egui::TextEdit::singleline(&mut name).desired_width(280.0));
+                    let response = ui.add(egui::TextEdit::singleline(&mut name).desired_width(280.0));
+                    self.note_text_focus(&response);
                 });
                 ui.add_space(4.0);
                 for (index, preset) in templates.iter().enumerate() {
@@ -1311,7 +1631,8 @@ impl MeridianApp {
             .show(ctx, |ui| {
                 ui.set_min_width(460.0);
                 ui.label("Project files are JSON.");
-                ui.add(egui::TextEdit::singleline(&mut path).desired_width(420.0));
+                let response = ui.add(egui::TextEdit::singleline(&mut path).desired_width(420.0));
+                self.note_text_focus(&response);
                 if !error.is_empty() {
                     ui.label(RichText::new(&error).color(theme::DANGER));
                 }
@@ -1358,7 +1679,8 @@ impl MeridianApp {
             .show(ctx, |ui| {
                 ui.set_min_width(480.0);
                 ui.label("With --features ffmpeg, Probe calls ffprobe and the program viewer decodes frames with ffmpeg. Otherwise files are classified by extension and the viewer draws placeholders.");
-                ui.add(egui::TextEdit::singleline(&mut path).desired_width(440.0));
+                let response = ui.add(egui::TextEdit::singleline(&mut path).desired_width(440.0));
+                self.note_text_focus(&response);
                 ui.horizontal(|ui| {
                     if ui.button("Probe").clicked() {
                         match probe(std::path::Path::new(path.trim())) {
@@ -1405,13 +1727,16 @@ impl MeridianApp {
             .frame(theme::dialog_frame())
             .open(&mut shown)
             .show(ctx, |ui| {
-                ui.set_min_width(420.0);
-                for (key, action) in SHORTCUTS {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(*key).monospace().color(theme::AMBER));
-                        ui.label(*action);
-                    });
-                }
+                ui.set_min_width(520.0);
+                ui.set_max_height(520.0);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for (key, action) in SHORTCUTS {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(*key).monospace().color(theme::AMBER));
+                            ui.label(*action);
+                        });
+                    }
+                });
             });
         if !shown {
             self.modal = Modal::None;
@@ -1420,21 +1745,31 @@ impl MeridianApp {
 }
 
 const SHORTCUTS: &[(&str, &str)] = &[
-    ("Space", "Play / pause"),
+    ("Space", "Play / pause at 1×"),
+    ("J  K  L", "Reverse shuttle, stop, forward shuttle (tap again to go faster)"),
     ("Left / Right", "Step one frame"),
-    ("Shift+Left / Right", "Step one second"),
+    ("Shift+Left / Right", "Jump 10 frames"),
+    ("Ctrl+Left / Right", "Jump one second"),
     ("Up / Down", "Previous / next edit"),
     ("Home / End", "Go to start / end"),
     ("I / O", "Mark in / out"),
     ("M", "Add marker"),
-    ("V C B N Y U", "Select, razor, ripple, roll, slip, slide"),
+    ("V", "Select tool"),
+    ("C  /  Ctrl+K", "Razor at the playhead"),
+    ("B  N  Y  U", "Ripple, roll, slip, slide tools"),
     ("S", "Toggle snapping"),
-    ("Delete", "Lift delete"),
+    ("Delete / Backspace", "Lift delete"),
     ("Shift+Delete", "Ripple delete"),
-    ("Ctrl+K", "Split at playhead"),
-    ("Ctrl+Z / Ctrl+Shift+Z", "Undo / redo"),
+    ("Esc", "Clear selection"),
+    ("Ctrl+Z", "Undo"),
+    ("Ctrl+Shift+Z  /  Ctrl+Y", "Redo"),
     ("Ctrl+S", "Save"),
+    ("Ctrl+O", "Open project"),
+    ("Ctrl+N", "New project"),
+    ("Ctrl+I", "Import media"),
     ("+ / −", "Zoom timeline"),
+    ("Ctrl+scroll  /  pinch", "Zoom timeline"),
+    ("Scroll", "Pan timeline"),
     ("Shift+Z", "Zoom timeline to fit"),
 ];
 
@@ -1473,7 +1808,7 @@ pub fn note_track_flag(app: &mut MeridianApp, track: TrackId, flag: TrackFlag, v
 
 pub fn open_import(app: &mut MeridianApp) {
     app.modal = Modal::Import {
-        path: "samples/media/interview.mp4".into(),
-        note: String::new(),
+        path: String::new(),
+        note: "Paste a path, or use File → Import for the system dialog.".into(),
     };
 }

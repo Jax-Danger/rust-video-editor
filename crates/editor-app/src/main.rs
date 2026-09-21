@@ -1,4 +1,6 @@
 mod app;
+mod audio;
+mod dialogs;
 mod preview;
 mod theme;
 mod ui;

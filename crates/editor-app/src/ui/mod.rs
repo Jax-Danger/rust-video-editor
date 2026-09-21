@@ -17,6 +17,10 @@ pub use pool::media_pool;
 pub use timeline::timeline_panel;
 pub use viewer::viewer_panel;
 
+pub(crate) fn media_missing(path: &str) -> bool {
+    path.is_empty() || !editor_media::resolve_media_path(path).is_file()
+}
+
 pub fn format_tc(frame: i64, timebase: Timebase) -> String {
     if timebase.timecode_fps() > 120 {
         format!("{:.3}s", Frame(frame).to_seconds(timebase))
