@@ -1,0 +1,12 @@
+{
+  "id": "vertical-9x16",
+  "name": "Vertical 9:16",
+  "description": "1080×1920, 30 fps. Three picture tracks, two audio tracks, one caption track.",
+  "width": 1080,
+  "height": 1920,
+  "fps_num": 30,
+  "fps_den": 1,
+  "video_tracks": 3,
+  "audio_tracks": 2,
+  "caption_tracks": 1
+}

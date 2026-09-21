@@ -1,0 +1,9 @@
+/target
+**/target
+**/*.rs.bk
+*.swp
+.DS_Store
+.idea/
+.vscode/
+/export
+*.meridian-export.json

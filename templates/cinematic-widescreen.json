@@ -1,0 +1,12 @@
+{
+  "id": "cinematic-widescreen",
+  "name": "Cinematic widescreen",
+  "description": "2048×858 (2.39:1), 24 fps. Three picture tracks, four audio tracks, one caption track.",
+  "width": 2048,
+  "height": 858,
+  "fps_num": 24,
+  "fps_den": 1,
+  "video_tracks": 3,
+  "audio_tracks": 4,
+  "caption_tracks": 1
+}

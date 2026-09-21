@@ -1,0 +1,625 @@
+//! Project, media pool, sequences, tracks, clips, and markers.
+
+use serde::{Deserialize, Serialize};
+
+use crate::effects::Effect;
+use crate::time::{Frame, Timebase};
+
+fn default_version() -> u32 {
+    1
+}
+fn default_true() -> bool {
+    true
+}
+fn default_label() -> LabelColor {
+    LabelColor::Neutral
+}
+
+macro_rules! id_newtype {
+    ($($name:ident),* $(,)?) => {
+        $(
+            #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+            pub struct $name(pub u64);
+
+            impl $name {
+                pub const fn new(value: u64) -> Self {
+                    Self(value)
+                }
+            }
+
+            impl std::fmt::Display for $name {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    write!(f, "{}", self.0)
+                }
+            }
+        )*
+    };
+}
+
+id_newtype!(
+    BinId,
+    MediaId,
+    SequenceId,
+    TrackId,
+    ClipId,
+    MarkerId,
+    CueId,
+    TransitionId,
+);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackKind {
+    Video,
+    Audio,
+    Caption,
+}
+
+impl TrackKind {
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Self::Video => "V",
+            Self::Audio => "A",
+            Self::Caption => "C",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LabelColor {
+    Neutral,
+    Rose,
+    Amber,
+    Green,
+    Teal,
+    Blue,
+    Violet,
+}
+
+impl Default for LabelColor {
+    fn default() -> Self {
+        Self::Neutral
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitionAlign {
+    Center,
+    StartOnCut,
+    EndOnCut,
+}
+
+impl Default for TransitionAlign {
+    fn default() -> Self {
+        Self::Center
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TransitionKind {
+    CrossDissolve,
+    Wipe { angle_deg: f32 },
+    PushSlide { direction: Direction },
+}
+
+impl TransitionKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::CrossDissolve => "Cross dissolve",
+            Self::Wipe { .. } => "Wipe",
+            Self::PushSlide { .. } => "Push",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Transition {
+    pub id: TransitionId,
+    pub kind: TransitionKind,
+    pub left_clip: ClipId,
+    pub right_clip: ClipId,
+    /// Duration in sequence frames.
+    pub duration: i64,
+    #[serde(default)]
+    pub alignment: TransitionAlign,
+}
+
+impl Transition {
+    /// Inclusive start, exclusive end, in sequence frames.
+    pub fn range(&self, cut: Frame) -> (Frame, Frame) {
+        let duration = self.duration.max(0);
+        let (start, _end_offset) = match self.alignment {
+            TransitionAlign::Center => (cut.0 - duration / 2, duration),
+            TransitionAlign::StartOnCut => (cut.0, duration),
+            TransitionAlign::EndOnCut => (cut.0 - duration, duration),
+        };
+        (Frame(start), Frame(start + duration))
+    }
+
+    pub fn progress(&self, cut: Frame, playhead: Frame) -> Option<f32> {
+        let (start, end) = self.range(cut);
+        if playhead.0 < start.0 || playhead.0 >= end.0 || end.0 <= start.0 {
+            return None;
+        }
+        Some((playhead.0 - start.0) as f32 / (end.0 - start.0) as f32)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CaptionCue {
+    pub id: CueId,
+    pub timeline_in: Frame,
+    pub timeline_out: Frame,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Clip {
+    pub id: ClipId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_id: Option<MediaId>,
+    pub name: String,
+    /// Inclusive sequence frame.
+    pub timeline_in: Frame,
+    /// Exclusive sequence frame.
+    pub timeline_out: Frame,
+    /// Inclusive source frame in [`Self::media_timebase`].
+    pub source_in: Frame,
+    /// Exclusive source frame in [`Self::media_timebase`].
+    pub source_out: Frame,
+    /// Inclusive media limit (usually 0).
+    #[serde(default)]
+    pub source_min: Frame,
+    /// Exclusive media limit (media duration in source frames).
+    pub source_max: Frame,
+    #[serde(default)]
+    pub media_timebase: Timebase,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linked: Vec<ClipId>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<Effect>,
+    #[serde(default = "default_label")]
+    pub label: LabelColor,
+}
+
+impl Clip {
+    pub fn duration(&self) -> i64 {
+        self.timeline_out.0 - self.timeline_in.0
+    }
+
+    pub fn source_duration(&self) -> i64 {
+        self.source_out.0 - self.source_in.0
+    }
+
+    pub fn head_handle(&self) -> i64 {
+        self.source_in.0 - self.source_min.0
+    }
+
+    pub fn tail_handle(&self) -> i64 {
+        self.source_max.0 - self.source_out.0
+    }
+
+    pub fn contains_frame(&self, frame: Frame) -> bool {
+        frame.0 > self.timeline_in.0 && frame.0 < self.timeline_out.0
+    }
+
+    pub fn covers(&self, frame: Frame) -> bool {
+        frame.0 >= self.timeline_in.0 && frame.0 < self.timeline_out.0
+    }
+
+    /// Test/helper constructor. Source starts at 0 with no handles.
+    pub fn basic(id: u64, start: i64, end: i64) -> Self {
+        let dur = end - start;
+        Self {
+            id: ClipId(id),
+            media_id: None,
+            name: format!("Clip {id}"),
+            timeline_in: Frame(start),
+            timeline_out: Frame(end),
+            source_in: Frame(0),
+            source_out: Frame(dur),
+            source_min: Frame(0),
+            source_max: Frame(dur),
+            media_timebase: Timebase::fps_24(),
+            linked: Vec::new(),
+            enabled: true,
+            effects: Vec::new(),
+            label: LabelColor::Neutral,
+        }
+    }
+
+    /// Give the clip unused media before (`head`) and after (`tail`) the current source.
+    pub fn with_handles(mut self, head: i64, tail: i64) -> Self {
+        let dur = self.source_duration();
+        self.source_in = Frame(head);
+        self.source_out = Frame(head + dur);
+        self.source_min = Frame(0);
+        self.source_max = Frame(head + dur + tail);
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Marker {
+    pub id: MarkerId,
+    pub frame: Frame,
+    #[serde(default)]
+    pub duration: i64,
+    pub name: String,
+    #[serde(default)]
+    pub color: LabelColor,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub comment: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Track {
+    pub id: TrackId,
+    pub kind: TrackKind,
+    pub name: String,
+    #[serde(default)]
+    pub locked: bool,
+    #[serde(default)]
+    pub muted: bool,
+    #[serde(default)]
+    pub solo: bool,
+    /// When set, insert and ripple edits on other sync-locked tracks move this track too.
+    #[serde(default = "default_true")]
+    pub sync_lock: bool,
+    #[serde(default)]
+    pub clips: Vec<Clip>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transitions: Vec<Transition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cues: Vec<CaptionCue>,
+}
+
+impl Track {
+    pub fn new(id: TrackId, kind: TrackKind, name: impl Into<String>) -> Self {
+        Self {
+            id,
+            kind,
+            name: name.into(),
+            locked: false,
+            muted: false,
+            solo: false,
+            sync_lock: true,
+            clips: Vec::new(),
+            transitions: Vec::new(),
+            cues: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Sequence {
+    pub id: SequenceId,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub timebase: Timebase,
+    #[serde(default = "default_pixel")]
+    pub pixel_aspect_num: u32,
+    #[serde(default = "default_pixel")]
+    pub pixel_aspect_den: u32,
+    #[serde(default)]
+    pub tracks: Vec<Track>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub markers: Vec<Marker>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_point: Option<Frame>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_point: Option<Frame>,
+}
+
+fn default_pixel() -> u32 {
+    1
+}
+
+impl Sequence {
+    pub fn new(
+        id: SequenceId,
+        name: impl Into<String>,
+        width: u32,
+        height: u32,
+        timebase: Timebase,
+    ) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            width,
+            height,
+            timebase,
+            pixel_aspect_num: 1,
+            pixel_aspect_den: 1,
+            tracks: Vec::new(),
+            markers: Vec::new(),
+            in_point: None,
+            out_point: None,
+        }
+    }
+
+    pub fn add_track(&mut self, id: TrackId, kind: TrackKind, name: impl Into<String>) -> TrackId {
+        self.tracks.push(Track::new(id, kind, name));
+        id
+    }
+
+    pub fn end_frame(&self) -> Frame {
+        let mut end = 0;
+        for track in &self.tracks {
+            for clip in &track.clips {
+                end = end.max(clip.timeline_out.0);
+            }
+            for cue in &track.cues {
+                end = end.max(cue.timeline_out.0);
+            }
+        }
+        Frame(end)
+    }
+
+    pub fn locate_clip(&self, id: ClipId) -> Option<(usize, usize)> {
+        for (ti, track) in self.tracks.iter().enumerate() {
+            if let Some(ci) = track.clips.iter().position(|c| c.id == id) {
+                return Some((ti, ci));
+            }
+        }
+        None
+    }
+
+    pub fn clip(&self, id: ClipId) -> Option<&Clip> {
+        self.locate_clip(id)
+            .map(|(ti, ci)| &self.tracks[ti].clips[ci])
+    }
+
+    pub fn track(&self, id: TrackId) -> Option<&Track> {
+        self.tracks.iter().find(|t| t.id == id)
+    }
+
+    pub fn track_index(&self, id: TrackId) -> Option<usize> {
+        self.tracks.iter().position(|t| t.id == id)
+    }
+
+    /// Video tracks drawn top-to-bottom (highest index first), then audio, then captions.
+    pub fn visual_track_indices(&self) -> Vec<usize> {
+        let mut video: Vec<usize> = self
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.kind == TrackKind::Video)
+            .map(|(i, _)| i)
+            .collect();
+        video.reverse();
+        let audio: Vec<usize> = self
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.kind == TrackKind::Audio)
+            .map(|(i, _)| i)
+            .collect();
+        let captions: Vec<usize> = self
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.kind == TrackKind::Caption)
+            .map(|(i, _)| i)
+            .collect();
+        video.into_iter().chain(audio).chain(captions).collect()
+    }
+
+    pub fn edit_points(&self) -> Vec<i64> {
+        let mut points = vec![0];
+        for track in &self.tracks {
+            for clip in &track.clips {
+                points.push(clip.timeline_in.0);
+                points.push(clip.timeline_out.0);
+            }
+        }
+        for marker in &self.markers {
+            points.push(marker.frame.0);
+        }
+        points.sort_unstable();
+        points.dedup();
+        points
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Bin {
+    pub id: BinId,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<BinId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MediaAsset {
+    pub id: MediaId,
+    pub bin_id: BinId,
+    pub name: String,
+    pub path: String,
+    /// Duration in [`Self::timebase`] frames.
+    pub duration: Frame,
+    pub timebase: Timebase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_codec: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_codec: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_channels: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_rate: Option<u32>,
+    #[serde(default)]
+    pub has_video: bool,
+    #[serde(default)]
+    pub has_audio: bool,
+    #[serde(default)]
+    pub offline: bool,
+}
+
+impl MediaAsset {
+    pub fn kind_label(&self) -> &'static str {
+        match (self.has_video, self.has_audio) {
+            (true, true) => "A/V",
+            (true, false) => "Video",
+            (false, true) => "Audio",
+            (false, false) => "File",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Project {
+    #[serde(default = "default_version")]
+    pub format_version: u32,
+    pub name: String,
+    #[serde(default)]
+    pub next_id: u64,
+    #[serde(default)]
+    pub bins: Vec<Bin>,
+    #[serde(default)]
+    pub media: Vec<MediaAsset>,
+    #[serde(default)]
+    pub sequences: Vec<Sequence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_sequence: Option<SequenceId>,
+}
+
+impl Project {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            format_version: 1,
+            name: name.into(),
+            next_id: 1,
+            bins: Vec::new(),
+            media: Vec::new(),
+            sequences: Vec::new(),
+            active_sequence: None,
+        }
+    }
+
+    pub fn alloc(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        id
+    }
+
+    pub fn sequence(&self, id: SequenceId) -> Option<&Sequence> {
+        self.sequences.iter().find(|s| s.id == id)
+    }
+
+    pub fn sequence_mut(&mut self, id: SequenceId) -> Option<&mut Sequence> {
+        self.sequences.iter_mut().find(|s| s.id == id)
+    }
+
+    pub fn active(&self) -> Option<&Sequence> {
+        self.active_sequence.and_then(|id| self.sequence(id))
+    }
+
+    pub fn active_mut(&mut self) -> Option<&mut Sequence> {
+        let id = self.active_sequence?;
+        self.sequence_mut(id)
+    }
+
+    pub fn media(&self, id: MediaId) -> Option<&MediaAsset> {
+        self.media.iter().find(|m| m.id == id)
+    }
+
+    pub fn max_assigned_id(&self) -> u64 {
+        let mut max_id = 0u64;
+        let bump = |max_id: &mut u64, value: u64| {
+            if value > *max_id {
+                *max_id = value;
+            }
+        };
+        for bin in &self.bins {
+            bump(&mut max_id, bin.id.0);
+        }
+        for media in &self.media {
+            bump(&mut max_id, media.id.0);
+        }
+        for seq in &self.sequences {
+            bump(&mut max_id, seq.id.0);
+            for marker in &seq.markers {
+                bump(&mut max_id, marker.id.0);
+            }
+            for track in &seq.tracks {
+                bump(&mut max_id, track.id.0);
+                for clip in &track.clips {
+                    bump(&mut max_id, clip.id.0);
+                }
+                for cue in &track.cues {
+                    bump(&mut max_id, cue.id.0);
+                }
+                for transition in &track.transitions {
+                    bump(&mut max_id, transition.id.0);
+                }
+            }
+        }
+        max_id
+    }
+
+    pub fn normalize(&mut self) {
+        let max_id = self.max_assigned_id();
+        if self.next_id <= max_id {
+            self.next_id = max_id.saturating_add(1);
+        }
+        if self.active_sequence.is_none() {
+            self.active_sequence = self.sequences.first().map(|s| s.id);
+        }
+        for seq in &mut self.sequences {
+            for track in &mut seq.tracks {
+                track.clips.sort_by_key(|c| (c.timeline_in.0, c.id.0));
+                track.cues.sort_by_key(|c| (c.timeline_in.0, c.id.0));
+            }
+        }
+    }
+
+    pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    pub fn from_json(text: &str) -> Result<Self, serde_json::Error> {
+        let mut project: Project = serde_json::from_str(text)?;
+        project.normalize();
+        Ok(project)
+    }
+
+    pub fn save_file(&self, path: &std::path::Path) -> Result<(), ProjectIoError> {
+        let json = self.to_json_pretty()?;
+        std::fs::write(path, json + "\n")?;
+        Ok(())
+    }
+
+    pub fn load_file(path: &std::path::Path) -> Result<Self, ProjectIoError> {
+        let text = std::fs::read_to_string(path)?;
+        Ok(Self::from_json(&text)?)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProjectIoError {
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Json(#[from] serde_json::Error),
+}

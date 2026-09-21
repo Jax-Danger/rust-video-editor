@@ -1,0 +1,12 @@
+{
+  "id": "blank",
+  "name": "Blank",
+  "description": "1920×1080, 24 fps. One picture track, one audio track, one caption track.",
+  "width": 1920,
+  "height": 1080,
+  "fps_num": 24,
+  "fps_den": 1,
+  "video_tracks": 1,
+  "audio_tracks": 1,
+  "caption_tracks": 1
+}
