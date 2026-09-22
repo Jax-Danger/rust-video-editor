@@ -1210,6 +1210,53 @@ pub fn set_track_pan(
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EqBand {
+    Low,
+    Mid,
+    High,
+}
+
+pub fn set_track_eq(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    track_id: TrackId,
+    band: EqBand,
+    gain_db: f32,
+) -> Result<(), EditError> {
+    map_sequence(project, sequence_id, |sequence, _alloc| {
+        let track = sequence
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .ok_or(EditError::TrackNotFound)?;
+        let value = crate::eq::clamp_eq_db(gain_db);
+        match band {
+            EqBand::Low => track.eq.low = value,
+            EqBand::Mid => track.eq.mid = value,
+            EqBand::High => track.eq.high = value,
+        }
+        Ok(())
+    })
+}
+
+pub fn set_track_eq_low_cut(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    track_id: TrackId,
+    enabled: bool,
+) -> Result<(), EditError> {
+    map_sequence(project, sequence_id, |sequence, _alloc| {
+        let track = sequence
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .ok_or(EditError::TrackNotFound)?;
+        track.eq.low_cut = enabled;
+        Ok(())
+    })
+}
+
 pub fn set_master_fader(
     project: &mut Project,
     sequence_id: SequenceId,

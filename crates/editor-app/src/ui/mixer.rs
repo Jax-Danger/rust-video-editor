@@ -1,13 +1,15 @@
 //! Fairlight-inspired mixer: one strip per audio track, plus the master bus.
 //!
 //! Faders are decibels (−∞…+12). Pan is constant-power and unity at center.
-//! Meters show peak, a brighter RMS fill, and a peak-hold tick. Mute, solo,
-//! fader, pan, and clip gain all feed the same bus playback and export use.
+//! Each strip has a 3-band EQ (L/M/H ±12 dB, optional low-cut). Meters show
+//! peak, a brighter RMS fill, and a peak-hold tick. Mute, solo, fader, pan,
+//! EQ, and clip gain all feed the same bus playback and export use.
 
 use editor_core::{
-    fader_pos_to_linear, format_db, format_pan, linear_to_fader_pos, meter_amount,
-    set_clip_gain_at, set_master_fader, set_track_fader, set_track_pan, toggle_volume_key, ClipId,
-    Frame, TrackId, TrackKind,
+    clamp_eq_db, fader_pos_to_linear, format_db, format_eq_db, format_pan, linear_to_fader_pos,
+    meter_amount, set_clip_gain_at, set_master_fader, set_track_eq, set_track_eq_low_cut,
+    set_track_fader, set_track_pan, toggle_volume_key, ClipId, EqBand, Frame, TrackEq3, TrackId,
+    TrackKind, EQ_DB_MAX, EQ_DB_MIN,
 };
 use egui::{pos2, Align2, Color32, Id, Rect, Sense, Shape, Stroke, Vec2};
 
@@ -23,6 +25,7 @@ struct StripSnap {
     name: String,
     fader: f32,
     pan: f32,
+    eq: TrackEq3,
     muted: bool,
     solo: bool,
     clip_id: Option<ClipId>,
@@ -90,6 +93,7 @@ fn snapshot(app: &MeridianApp, playhead: i64) -> Vec<StripSnap> {
             name: track.name.clone(),
             fader: track.fader,
             pan: track.pan,
+            eq: track.eq,
             muted: track.muted,
             solo: track.solo,
             clip_id: clip.map(|clip| clip.id),
@@ -185,7 +189,7 @@ fn channel_strip(ui: &mut egui::Ui, app: &mut MeridianApp, strip: &StripSnap, he
         );
     }
 
-    let gain_top = rect.bottom() - 78.0;
+    let gain_top = rect.bottom() - 112.0;
     let meter_top = db.bottom() + 8.0;
     let meter_rect = Rect::from_min_max(
         pos2(rect.left() + 14.0, meter_top),
@@ -241,12 +245,171 @@ fn channel_strip(ui: &mut egui::Ui, app: &mut MeridianApp, strip: &StripSnap, he
         THEME.text_dim,
     );
 
+    let eq_top = label.bottom() + 4.0;
+    let eq_rect = Rect::from_min_size(
+        pos2(rect.left() + 8.0, eq_top),
+        Vec2::new(rect.width() - 16.0, 54.0),
+    );
+    eq_section(ui, app, eq_rect, strip);
+
     if strip.clip_id.is_some() {
         let gain_rect = Rect::from_min_size(
-            pos2(rect.left() + 8.0, label.bottom() + 4.0),
+            pos2(rect.left() + 8.0, eq_rect.bottom() + 4.0),
             Vec2::new(rect.width() - 16.0, 28.0),
         );
         clip_gain_row(ui, app, gain_rect, strip);
+    }
+}
+
+fn eq_section(ui: &mut egui::Ui, app: &mut MeridianApp, rect: Rect, strip: &StripSnap) {
+    let painter = ui.painter();
+    painter.text(
+        rect.left_top(),
+        Align2::LEFT_TOP,
+        "EQ",
+        THEME.font(10.0),
+        THEME.text_mute,
+    );
+    let lc = Rect::from_min_size(
+        pos2(rect.right() - 24.0, rect.top()),
+        Vec2::new(24.0, 14.0),
+    );
+    if pill(
+        ui,
+        lc,
+        Id::new(("mix_eq_lc", strip.id.0)),
+        "LC",
+        strip.eq.low_cut,
+        THEME.audio,
+    ) {
+        let track = strip.id;
+        let enabled = !strip.eq.low_cut;
+        let _ = app.session.edit("EQ low cut", |project| {
+            let seq = project
+                .active_sequence
+                .ok_or(editor_core::EditError::NoActiveSequence)?;
+            set_track_eq_low_cut(project, seq, track, enabled)
+        });
+    }
+    let row_h = 14.0;
+    let start_y = rect.top() + 14.0;
+    eq_band_row(
+        ui,
+        app,
+        Rect::from_min_size(
+            pos2(rect.left(), start_y),
+            Vec2::new(rect.width(), row_h),
+        ),
+        strip,
+        EqBand::Low,
+        "L",
+        strip.eq.low,
+    );
+    eq_band_row(
+        ui,
+        app,
+        Rect::from_min_size(
+            pos2(rect.left(), start_y + row_h),
+            Vec2::new(rect.width(), row_h),
+        ),
+        strip,
+        EqBand::Mid,
+        "M",
+        strip.eq.mid,
+    );
+    eq_band_row(
+        ui,
+        app,
+        Rect::from_min_size(
+            pos2(rect.left(), start_y + row_h * 2.0),
+            Vec2::new(rect.width(), row_h),
+        ),
+        strip,
+        EqBand::High,
+        "H",
+        strip.eq.high,
+    );
+}
+
+fn eq_db_to_pos(db: f32) -> f32 {
+    (clamp_eq_db(db) - EQ_DB_MIN) / (EQ_DB_MAX - EQ_DB_MIN)
+}
+
+fn eq_pos_to_db(pos: f32) -> f32 {
+    EQ_DB_MIN + pos.clamp(0.0, 1.0) * (EQ_DB_MAX - EQ_DB_MIN)
+}
+
+fn eq_band_row(
+    ui: &mut egui::Ui,
+    app: &mut MeridianApp,
+    rect: Rect,
+    strip: &StripSnap,
+    band: EqBand,
+    label: &str,
+    gain_db: f32,
+) {
+    let painter = ui.painter();
+    painter.text(
+        rect.left_center(),
+        Align2::LEFT_CENTER,
+        label,
+        THEME.mono(10.0),
+        THEME.text_dim,
+    );
+    let track = Rect::from_min_max(
+        pos2(rect.left() + 14.0, rect.center().y - 2.0),
+        pos2(rect.right() - 24.0, rect.center().y + 2.0),
+    );
+    let response = ui.interact(
+        track.expand2(Vec2::new(0.0, 6.0)),
+        Id::new(("mix_eq", strip.id.0, label)),
+        Sense::click_and_drag(),
+    );
+    painter.rect_filled(track, 2.0, THEME.inset);
+    painter.vline(
+        track.center().x,
+        track.top()..=track.bottom(),
+        Stroke::new(1.0_f32, THEME.border),
+    );
+    let t = eq_db_to_pos(gain_db);
+    let knob = pos2(track.left() + track.width() * t, track.center().y);
+    painter.circle_filled(knob, 4.0, THEME.text);
+    painter.circle_stroke(knob, 4.0, Stroke::new(1.0_f32, THEME.audio));
+    painter.text(
+        pos2(rect.right(), rect.center().y),
+        Align2::RIGHT_CENTER,
+        format_eq_db(gain_db),
+        THEME.mono(9.0),
+        THEME.text_mute,
+    );
+    if response.double_clicked() {
+        app.session.end_interactive();
+        let track_id = strip.id;
+        let _ = app.session.edit("EQ", |project| {
+            let seq = project
+                .active_sequence
+                .ok_or(editor_core::EditError::NoActiveSequence)?;
+            set_track_eq(project, seq, track_id, band, 0.0)
+        });
+        return;
+    }
+    if response.drag_started() {
+        app.session.begin_interactive("EQ");
+    }
+    if response.dragged() || response.clicked() {
+        if let Some(pointer) = response.interact_pointer_pos() {
+            let next = eq_pos_to_db(((pointer.x - track.left()) / track.width()).clamp(0.0, 1.0));
+            let track_id = strip.id;
+            let _ = app.session.edit("EQ", |project| {
+                let seq = project
+                    .active_sequence
+                    .ok_or(editor_core::EditError::NoActiveSequence)?;
+                set_track_eq(project, seq, track_id, band, next)
+            });
+        }
+    }
+    if response.drag_stopped() {
+        app.session.end_interactive();
     }
 }
 

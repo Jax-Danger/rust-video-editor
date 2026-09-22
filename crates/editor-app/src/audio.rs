@@ -13,7 +13,7 @@ use editor_core::{
     Frame, MediaAsset, MulticamGroup, Sequence, TrackKind,
 };
 #[cfg(feature = "ffmpeg")]
-use editor_core::{channel_clips, mix_frame};
+use editor_core::{channel_clips, mix_frame, EqProcessor};
 use editor_media::resolve_media_path;
 
 #[cfg(feature = "ffmpeg")]
@@ -772,6 +772,7 @@ struct BusSource {
     pieces: Vec<DecodedPiece>,
     track_ids: Vec<u64>,
     acc: Vec<(u64, f32, f32)>,
+    eq: Vec<(u64, EqProcessor)>,
     control: std::sync::Arc<MixControl>,
     cached: std::sync::Arc<BusState>,
     fps: f64,
@@ -815,10 +816,23 @@ impl BusSource {
                     clips: Vec::new(),
                 })
             });
+        let mut eq = Vec::new();
+        for id in &track_ids {
+            let params = cached
+                .tracks
+                .iter()
+                .find(|track| track.id == *id)
+                .map(|track| track.eq)
+                .unwrap_or_default();
+            let mut processor = EqProcessor::new();
+            processor.set_params(params);
+            eq.push((*id, processor));
+        }
         Self {
             pieces,
             acc: track_ids.iter().map(|id| (*id, 0.0, 0.0)).collect(),
             track_ids,
+            eq,
             control,
             cached,
             fps: fps.max(1.0),
@@ -840,6 +854,21 @@ impl BusSource {
     fn refresh(&mut self) {
         if let Ok(guard) = self.control.params.try_lock() {
             self.cached = std::sync::Arc::clone(&guard);
+            for (id, processor) in &mut self.eq {
+                if let Some(track) = guard.tracks.iter().find(|track| track.id == *id) {
+                    processor.set_params(track.eq);
+                }
+            }
+        }
+    }
+
+    fn apply_track_eq(&mut self) {
+        for slot in &mut self.acc {
+            if let Some((_, processor)) = self.eq.iter_mut().find(|(id, _)| *id == slot.0) {
+                let (left, right) = processor.process(slot.1, slot.2);
+                slot.1 = left;
+                slot.2 = right;
+            }
         }
     }
 
@@ -869,6 +898,7 @@ impl BusSource {
             slot.1 += piece.samples[base] * gain;
             slot.2 += piece.samples[base + 1] * gain;
         }
+        self.apply_track_eq();
         let mixed = mix_frame(&self.acc, &bus);
         self.window = self.window.saturating_add(1);
         self.master_clip |= mixed.overload;

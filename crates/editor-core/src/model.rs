@@ -5,6 +5,7 @@ use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
 use crate::effects::{AnimatedF32, Effect};
+use crate::eq::TrackEq3;
 use crate::time::{Frame, Timebase};
 
 fn default_version() -> u32 {
@@ -713,6 +714,9 @@ pub struct Track {
     /// Stereo pan, −1 hard left, 0 center, +1 hard right.
     #[serde(default, skip_serializing_if = "is_center_pan")]
     pub pan: f32,
+    /// Three-band EQ applied pre-fader on this track.
+    #[serde(default, skip_serializing_if = "TrackEq3::is_bypass")]
+    pub eq: TrackEq3,
     #[serde(default)]
     pub clips: Vec<Clip>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -737,6 +741,7 @@ impl Track {
             sync_lock: true,
             fader: 1.0,
             pan: 0.0,
+            eq: TrackEq3::default(),
             clips: Vec::new(),
             transitions: Vec::new(),
             cues: Vec::new(),

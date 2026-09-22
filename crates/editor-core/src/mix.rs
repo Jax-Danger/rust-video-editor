@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::effects::Interpolation;
+use crate::eq::TrackEq3;
 use crate::model::{Clip, Sequence, Track, TrackKind};
 
 pub const GAIN_MIN: f32 = 0.0;
@@ -303,6 +304,7 @@ pub struct BusTrack {
     pub id: u64,
     pub fader: f32,
     pub pan: f32,
+    pub eq: TrackEq3,
     pub audible: bool,
 }
 
@@ -333,6 +335,7 @@ impl BusState {
                 id: track.id.0,
                 fader: clamp_gain(track.fader),
                 pan: clamp_pan(track.pan),
+                eq: track.eq,
                 audible: track_is_audible(track, solo),
             });
             for clip in &track.clips {
@@ -724,12 +727,14 @@ mod tests {
                     id: 1,
                     fader: 1.0,
                     pan: 0.0,
+                    eq: TrackEq3::default(),
                     audible: true,
                 },
                 BusTrack {
                     id: 2,
                     fader: 1.0,
                     pan: 0.0,
+                    eq: TrackEq3::default(),
                     audible: true,
                 },
             ],
@@ -781,6 +786,8 @@ mod tests {
         sequence.tracks[0].fader = 0.2;
         sequence.tracks[0].pan = 0.4;
         sequence.tracks[0].muted = true;
+        sequence.tracks[0].eq.low = 6.0;
+        sequence.tracks[0].eq.low_cut = true;
         sequence.tracks[0].clips[0].volume.base = 0.3;
         assert_eq!(audio_topology(&sequence), before);
         sequence.tracks[0].clips[0].timeline_out = Frame(12);
