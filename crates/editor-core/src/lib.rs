@@ -42,6 +42,7 @@ pub use edit::{
     ripple_delete, ripple_trim, ripple_trim_next_to_playhead, ripple_trim_prev_to_playhead,
     roll_cut, set_clip_gain_at, set_clip_speed, set_clip_title,
     set_clip_volume, set_filter_at, set_grade_at, set_in_point, set_luma_curve_point,
+    set_lut_look, clear_lut,
     set_master_fader, set_out_point, set_shape_mask_invert, set_shape_mask_shape,
     set_track_compressor, set_track_eq, set_track_eq_low_cut,
     set_track_fader, set_track_flag, set_track_matte, set_track_pan,
@@ -51,13 +52,13 @@ pub use edit::{
 };
 pub use effects::{
     blur, blur_mut, chroma_key, chroma_key_mut, clip_relative, color_grade, color_grade_mut, crop,
-    crop_mut, has_filter, shape_mask, shape_mask_mut, sharpen, sharpen_mut, stabilize,
+    crop_mut, has_filter, lut, lut_mut, shape_mask, shape_mask_mut, sharpen, sharpen_mut, stabilize,
     stabilize_mut, transform,
     transform_mut, vignette, vignette_mut, AnimatedF32, BlurFilter, ChromaKeyFilter, ColorGrade,
-    CropFilter, Effect, FilterKind, FilterParam, GradeParam, Interpolation, KeyframeF32, RgbWheel,
-    ShapeMaskFilter, ShapeMaskKind, SharpenFilter, StabilizeFilter, StabilizeKeyframe, ToneCurve,
-    Transform, TransformParam,
-    VignetteFilter, WheelChannel, WheelKind,
+    CropFilter, Effect, EmbeddedLut3D, FilterKind, FilterParam, GradeParam, Interpolation,
+    KeyframeF32, LutFilter, RgbWheel, ShapeMaskFilter, ShapeMaskKind, SharpenFilter,
+    StabilizeFilter, StabilizeKeyframe, ToneCurve, Transform, TransformParam, VignetteFilter,
+    WheelChannel, WheelKind,
 };
 pub use compressor::{
     clamp_attack_ms, clamp_makeup_db, clamp_ratio, clamp_release_ms, clamp_threshold_db,

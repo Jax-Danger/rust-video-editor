@@ -3,7 +3,7 @@ use editor_core::{
     set_clip_title, set_filter_at, set_grade_at, set_shape_mask_invert, set_shape_mask_shape,
     set_track_matte, set_transform_at, shape_mask, sharpen, stabilize, source_frame_at,
     toggle_filter_key, toggle_grade_key, toggle_transform_key, toggle_volume_key, transform,
-    vignette, ClipId, ClipSpeed, FilterParam, GradeParam, LabelColor, MarkerId, ShapeMaskKind,
+    lut, vignette, ClipId, ClipSpeed, FilterParam, GradeParam, LabelColor, MarkerId, ShapeMaskKind,
     TextAlign, Title, TrackKind, TrackMatteBinding, TrackMatteMode, TransformParam,
 };
 use egui::{pos2, Align2, Rect, RichText, Sense, TextEdit, Vec2};
@@ -1564,6 +1564,7 @@ fn filter_value(app: &MeridianApp, clip: ClipId, rel: i64, param: FilterParam) -
         FilterParam::ShapeMaskWidth => shape_mask(&clip.effects).map(|f| &f.width),
         FilterParam::ShapeMaskHeight => shape_mask(&clip.effects).map(|f| &f.height),
         FilterParam::ShapeMaskFeather => shape_mask(&clip.effects).map(|f| &f.feather),
+        FilterParam::LutMix => lut(&clip.effects).map(|f| &f.mix),
     };
     if let Some(anim) = anim {
         (anim.value_at(rel), anim.has_key(rel))

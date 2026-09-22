@@ -77,3 +77,11 @@ pub fn is_project_file(path: &Path) -> bool {
             .and_then(|name| name.to_str())
             .is_some_and(|name| !name.ends_with(".probe.json"))
 }
+
+pub fn pick_lut_file() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Import 3D LUT")
+        .add_filter("3D LUT", &["cube"])
+        .add_filter("All files", &["*"])
+        .pick_file()
+}

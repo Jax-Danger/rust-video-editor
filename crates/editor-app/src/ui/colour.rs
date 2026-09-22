@@ -1,7 +1,8 @@
 //! Lift / gamma / gain wheels and the luma curve editor for the Colour workspace.
 
 use editor_core::{
-    color_grade, set_luma_curve_point, set_wheel_offsets_at, WheelKind,
+    clear_lut, color_grade, lut, set_filter_at, set_luma_curve_point, set_lut_look,
+    set_wheel_offsets_at, toggle_filter_key, FilterParam, WheelKind,
 };
 use egui::{Color32, RichText, Sense, Shape, Stroke, Vec2};
 
@@ -26,6 +27,9 @@ pub fn colour_controls(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: editor
 
     widgets::section_label(ui, "White balance");
     temp_tint_wheel(ui, app, clip_id, rel);
+
+    widgets::section_label(ui, "3D LUT");
+    lut_controls(ui, app, clip_id, rel);
 }
 
 fn offset_wheel(
@@ -396,4 +400,158 @@ fn temp_tint_hue(angle: f32) -> Color32 {
         (70.0 + (1.0 - magenta) * 90.0) as u8,
         (50.0 + (1.0 - warm) * 140.0 + magenta * 40.0) as u8,
     )
+}
+
+fn lut_controls(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: editor_core::ClipId, rel: i64) {
+    let (label, path, offline) = lut_status(app, clip_id);
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(label)
+                .size(11.0)
+                .color(if offline {
+                    THEME.amber
+                } else if path.is_some() {
+                    THEME.text_dim
+                } else {
+                    THEME.text_mute
+                }),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        if ui.button("Choose LUT…").clicked() {
+            if let Some(file) = crate::dialogs::pick_lut_file() {
+                match editor_media::parse_cube_file(&file) {
+                    Ok(parsed) => {
+                        let embedded = parsed.should_embed().then(|| parsed.to_embedded());
+                        let title = parsed.title.clone();
+                        let path = file.to_string_lossy().into_owned();
+                        let Ok(seq) = app.session.active_id() else {
+                            return;
+                        };
+                        if let Err(err) = app.session.edit("3D LUT", |project| {
+                            set_lut_look(project, seq, clip_id, path, title, embedded)
+                        }) {
+                            app.status = err.to_string();
+                        }
+                    }
+                    Err(err) => app.status = err.to_string(),
+                }
+            }
+        }
+        if path.is_some() && ui.button("Clear").clicked() {
+            let Ok(seq) = app.session.active_id() else {
+                return;
+            };
+            if let Err(err) = app.session.edit("Clear LUT", |project| {
+                clear_lut(project, seq, clip_id)
+            }) {
+                app.status = err.to_string();
+            }
+        }
+    });
+    lut_mix_slider(ui, app, clip_id, rel);
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new("Tetrahedral sampling in the shared compositor. Small LUTs embed in the project JSON.")
+                .size(10.0)
+                .color(THEME.text_mute),
+        );
+    });
+}
+
+fn lut_status(app: &MeridianApp, clip_id: editor_core::ClipId) -> (String, Option<String>, bool) {
+    let Some(sequence) = app.session.project().active() else {
+        return ("No LUT".into(), None, false);
+    };
+    let Some(clip) = sequence.clip(clip_id) else {
+        return ("No LUT".into(), None, false);
+    };
+    let Some(filter) = lut(&clip.effects) else {
+        return ("No LUT".into(), None, false);
+    };
+    if !filter.has_source() {
+        return ("No LUT".into(), None, false);
+    }
+    let title = filter
+        .title
+        .clone()
+        .or_else(|| {
+            if filter.path.is_empty() {
+                None
+            } else {
+                std::path::Path::new(&filter.path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+            }
+        })
+        .unwrap_or_else(|| "LUT".into());
+    let offline = filter.embedded.is_none()
+        && !filter.path.is_empty()
+        && !std::path::Path::new(&filter.path).is_file();
+    let detail = if offline {
+        format!("{title} (offline)")
+    } else if filter.path.is_empty() {
+        format!("{title} (embedded)")
+    } else {
+        title
+    };
+    (detail, Some(filter.path.clone()), offline)
+}
+
+fn lut_mix_slider(
+    ui: &mut egui::Ui,
+    app: &mut MeridianApp,
+    clip_id: editor_core::ClipId,
+    rel: i64,
+) {
+    let (current, keyed) = lut_mix_value(app, clip_id, rel);
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        ui.vertical(|ui| {
+            let edit = widgets::param_slider(ui, "LUT mix", current, 0.0..=1.0, keyed);
+            if edit.started {
+                app.session.begin_interactive("LUT mix");
+            }
+            if edit.changed {
+                let Ok(seq) = app.session.active_id() else {
+                    return;
+                };
+                if let Err(err) = app.session.edit("LUT mix", |project| {
+                    set_filter_at(project, seq, clip_id, FilterParam::LutMix, rel, edit.value)
+                }) {
+                    app.status = err.to_string();
+                }
+            }
+            if edit.stopped {
+                app.session.end_interactive();
+            }
+            if edit.key_clicked {
+                let Ok(seq) = app.session.active_id() else {
+                    return;
+                };
+                if let Err(err) = app.session.edit("LUT mix key", |project| {
+                    toggle_filter_key(project, seq, clip_id, FilterParam::LutMix, rel)
+                }) {
+                    app.status = err.to_string();
+                }
+            }
+        });
+    });
+}
+
+fn lut_mix_value(app: &MeridianApp, clip_id: editor_core::ClipId, rel: i64) -> (f32, bool) {
+    let Some(sequence) = app.session.project().active() else {
+        return (1.0, false);
+    };
+    let Some(clip) = sequence.clip(clip_id) else {
+        return (1.0, false);
+    };
+    if let Some(filter) = lut(&clip.effects) {
+        return (filter.mix.value_at(rel), filter.mix.has_key(rel));
+    }
+    (1.0, false)
 }
