@@ -16,6 +16,7 @@ mod composite;
 mod decode;
 mod export;
 mod frame_cache;
+mod lut;
 mod probe;
 mod proxy;
 mod stabilize;
@@ -44,6 +45,7 @@ pub use export::{spawn_export, write_timeline_wav, ExportJob, ExportSnapshot};
 pub use frame_cache::{
     source_stamp, FrameCache, FrameCacheKey, DEFAULT_FRAME_CACHE_BYTES, DEFAULT_FRAME_CACHE_FILES,
 };
+pub use lut::{parse_cube_file, resolve_lut, Lut3D, LutError, LUT_EMBED_MAX_SIZE};
 pub use probe::{parse_ffprobe_json, probe, probe_stub, ProbeError, ProbeResult};
 pub use proxy::{
     cache_root, frame_cache_dir, generate_proxy, preview_file, project_proxy_dir,

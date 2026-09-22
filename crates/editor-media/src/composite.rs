@@ -15,11 +15,15 @@
 //! decodes, so a ramp or a constant rate is the same picture in both.
 
 use editor_core::{
-    blur, chroma_key, clip_relative, color_grade, crop, picture_at, shape_mask, sharpen,
+    blur, chroma_key, clip_relative, color_grade, crop, lut, picture_at, shape_mask, sharpen,
     stabilize, source_frame_at, transform, vignette, Clip, ColorGrade, Direction, Frame,
     MediaAsset, MulticamGroup, Sequence, SequenceId, ShapeMaskKind, Title, ToneCurve, Track,
     TrackKind, TrackMatteBinding, TrackMatteMode, Transform, TransitionKind, MAX_NEST_DEPTH,
 };
+
+use std::sync::Arc;
+
+use crate::lut::{resolve_lut as load_lut, Lut3D};
 
 use crate::stabilize::{baked_correction, load_sidecar, stabilize_runtime, MotionSample};
 use font8x8::UnicodeFonts;
@@ -37,6 +41,8 @@ pub struct GradeSample {
     pub gamma: [f32; 3],
     pub gain: [f32; 3],
     pub luma_curve: ToneCurve,
+    pub lut: Option<Arc<Lut3D>>,
+    pub lut_mix: f32,
 }
 
 impl GradeSample {
@@ -53,6 +59,8 @@ impl GradeSample {
             gamma: [0.0, 0.0, 0.0],
             gain: [0.0, 0.0, 0.0],
             luma_curve: ToneCurve::identity(),
+            lut: None,
+            lut_mix: 0.0,
         }
     }
 
@@ -69,13 +77,22 @@ impl GradeSample {
             gamma: grade.gamma.values_at(rel),
             gain: grade.gain.values_at(rel),
             luma_curve: grade.luma_curve.clone(),
+            lut: None,
+            lut_mix: 0.0,
         }
     }
 
     pub fn from_effects(effects: &[editor_core::Effect], rel: i64) -> Self {
-        color_grade(effects)
+        let mut sample = color_grade(effects)
             .map(|grade| Self::from_grade(grade, rel))
-            .unwrap_or_else(Self::neutral)
+            .unwrap_or_else(Self::neutral);
+        if let Some(lut_filter) = lut(effects) {
+            sample.lut_mix = lut_filter.mix.value_at(rel).clamp(0.0, 1.0);
+            if lut_filter.is_active(rel) {
+                sample.lut = load_lut(&lut_filter.path, lut_filter.embedded.as_ref()).map(Arc::new);
+            }
+        }
+        sample
     }
 
     pub fn is_neutral(&self) -> bool {
@@ -90,6 +107,7 @@ impl GradeSample {
             && self.gamma.iter().all(|v| v.abs() < 1.0e-4)
             && self.gain.iter().all(|v| v.abs() < 1.0e-4)
             && self.luma_curve == ToneCurve::identity()
+            && self.lut.is_none()
     }
 
     fn apply_luma_curve(rgb: [f32; 3], curve: &ToneCurve) -> [f32; 3] {
@@ -157,7 +175,11 @@ impl GradeSample {
         c[0] = (c[0] + self.tint * 0.06).clamp(0.0, 1.5);
         c[2] = (c[2] + self.tint * 0.06).clamp(0.0, 1.5);
         let luma = rec709_luma(c);
-        c.map(|channel| (luma + (channel - luma) * self.saturation).clamp(0.0, 1.0))
+        let mut out = c.map(|channel| (luma + (channel - luma) * self.saturation).clamp(0.0, 1.0));
+        if let Some(lut) = &self.lut {
+            out = lut.apply(out, self.lut_mix);
+        }
+        out
     }
 }
 
@@ -2946,6 +2968,50 @@ mod tests {
         let corner = (2 * 32 + 2) * 4 + 3;
         assert!(src[centre] < 128, "inverted centre is keyed out");
         assert_eq!(src[corner], 255, "inverted outside stays opaque");
+    }
+
+    #[test]
+    fn lut_look_runs_after_grade_in_shared_path() {
+        let lut = Lut3D::from_cube_str(
+            "LUT_3D_SIZE 2\n\
+             0.0 0.0 0.0\n1.0 0.0 0.0\n\
+             0.0 1.0 0.0\n1.0 1.0 0.0\n\
+             0.0 0.0 1.0\n1.0 0.0 1.0\n\
+             0.0 1.0 1.0\n1.0 1.0 1.0\n",
+        )
+        .unwrap();
+        let grade = GradeSample {
+            exposure: 0.0,
+            lut: Some(Arc::new(lut)),
+            lut_mix: 1.0,
+            ..GradeSample::neutral()
+        };
+        let out = grade.apply([0.5, 0.5, 0.5]);
+        assert!((out[0] - 0.5).abs() < 0.06);
+        assert!((out[1] - 0.5).abs() < 0.06);
+        assert!((out[2] - 0.5).abs() < 0.06);
+    }
+
+    #[test]
+    fn lut_mix_at_half_blends_with_input() {
+        let mut table = Vec::new();
+        for _ in 0..8 {
+            table.push([1.0, 0.0, 0.0]);
+        }
+        let lut = Lut3D {
+            size: 2,
+            domain_min: [0.0, 0.0, 0.0],
+            domain_max: [1.0, 1.0, 1.0],
+            title: None,
+            table,
+        };
+        let grade = GradeSample {
+            lut: Some(Arc::new(lut)),
+            lut_mix: 0.5,
+            ..GradeSample::neutral()
+        };
+        let out = grade.apply([0.0, 0.0, 0.0]);
+        assert!((out[0] - 0.5).abs() < 0.06, "{out:?}");
     }
 
     #[test]

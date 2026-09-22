@@ -12,7 +12,7 @@ use thiserror::Error;
 
 use crate::caption::CaptionDraft;
 use crate::effects::{
-    blur_mut, chroma_key_mut, color_grade_mut, crop_mut, shape_mask_mut, sharpen_mut,
+    blur_mut, chroma_key_mut, color_grade_mut, crop_mut, lut_mut, shape_mask_mut, sharpen_mut,
     stabilize_mut, transform_mut, vignette_mut, GradeParam, TransformParam,
 };
 use crate::model::{
@@ -1155,7 +1155,48 @@ pub fn set_filter_at(
                     .feather
                     .write_at(clip_relative_frame, value.clamp(0.0, 0.5));
             }
+            crate::effects::FilterParam::LutMix => {
+                lut_mut(effects)
+                    .mix
+                    .write_at(clip_relative_frame, value.clamp(0.0, 1.0));
+            }
         }
+        Ok(())
+    })
+}
+
+pub fn set_lut_look(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    clip_id: ClipId,
+    path: String,
+    title: Option<String>,
+    embedded: Option<crate::effects::EmbeddedLut3D>,
+) -> Result<(), EditError> {
+    map_sequence(project, sequence_id, |sequence, _alloc| {
+        let (ti, ci) = sequence
+            .locate_clip(clip_id)
+            .ok_or(EditError::ClipNotFound)?;
+        let filter = lut_mut(&mut sequence.tracks[ti].clips[ci].effects);
+        filter.path = path;
+        filter.title = title;
+        filter.embedded = embedded;
+        Ok(())
+    })
+}
+
+pub fn clear_lut(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    clip_id: ClipId,
+) -> Result<(), EditError> {
+    map_sequence(project, sequence_id, |sequence, _alloc| {
+        let (ti, ci) = sequence
+            .locate_clip(clip_id)
+            .ok_or(EditError::ClipNotFound)?;
+        sequence.tracks[ti].clips[ci]
+            .effects
+            .retain(|effect| !matches!(effect, crate::effects::Effect::Lut(_)));
         Ok(())
     })
 }
@@ -1243,6 +1284,7 @@ pub fn toggle_filter_key(
             crate::effects::FilterParam::ShapeMaskWidth => &mut shape_mask_mut(effects).width,
             crate::effects::FilterParam::ShapeMaskHeight => &mut shape_mask_mut(effects).height,
             crate::effects::FilterParam::ShapeMaskFeather => &mut shape_mask_mut(effects).feather,
+            crate::effects::FilterParam::LutMix => &mut lut_mut(effects).mix,
         };
         if anim.has_key(clip_relative_frame) {
             anim.remove_key(clip_relative_frame);

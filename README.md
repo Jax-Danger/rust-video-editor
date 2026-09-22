@@ -178,8 +178,9 @@ The **Colour** workspace is Resolve-leaning without decorative chrome:
 - **Luma curve** — drag the interior control points; endpoints stay fixed at black and white
 - **White balance** — temperature / tint offset pad (same as before, now grouped with the wheels)
 - **Lighting** sliders — exposure, contrast, highlights, shadows, temperature, tint, saturation
+- **3D LUT** — import a `.cube` look, adjust mix/strength, and apply it after the parametric grade in the shared compositor
 
-Wheels, curve, and sliders all run through the shared `GradeSample` compositor, so preview and Deliver match.
+Wheels, curve, sliders, and LUT all run through the shared `GradeSample` compositor, so preview and Deliver match.
 
 Transitions are centered on a cut and consume head and tail handles. Duration is in sequence frames. **Timeline → Add Transition** (or the cut menu) can place:
 
@@ -204,6 +205,7 @@ The inspector **Effects** section (video clips) adds stackable filters that run 
 | Sharpen | Unsharp-mask strength |
 | Chroma Key | Key colour (RGB), tolerance, softness, spill suppression |
 | Stabilize | Strength (0…1) and smoothing (temporal low-pass width) |
+| 3D LUT | `.cube` file path (or embedded table for small LUTs) and mix (0…1) |
 
 Filter parameters are `AnimatedF32` like grade and transform.
 
@@ -255,7 +257,7 @@ Preview (`--features ffmpeg`) and Deliver call one compositor in `editor-media`.
 
 | Piece | Shared? | Notes |
 | --- | --- | --- |
-| Grade | Yes, one formula | Luma curve, exposure in stops, contrast about mid grey, lift/gamma/gain wheel offsets by tonal region, split shadow/highlight lift, temperature, tint, then Rec.709 luma saturation. Evaluated on the decoded RGB values as stored — not scene-linear, and not a film print |
+| Grade | Yes, one formula | Luma curve, exposure in stops, contrast about mid grey, lift/gamma/gain wheel offsets by tonal region, split shadow/highlight lift, temperature, tint, then Rec.709 luma saturation. Optional `.cube` 3D LUT runs after the parametric grade with tetrahedral sampling and a mix slider. Evaluated on the decoded RGB values as stored — not scene-linear, and not a film print |
 | Opacity, scale, position, rotation, anchor | Yes | Straight alpha over. Anchor is the normalized point that sits on the position |
 | Cross dissolve | Yes | Incoming blends over an opaque outgoing plate, which is a linear mix when that plate is opaque |
 | Wipe | Yes | `angle_deg` is the direction the reveal travels: 0° left to right, 90° top to bottom, 180° from the right, 270° from the bottom. Other angles use the same half-plane per pixel. The proxy only clips axis-aligned wipes; a diagonal wipe on the proxy is a stand-in |
@@ -315,6 +317,38 @@ The mask is stored as a tagged effect on the clip:
 ```
 
 Preview and Deliver both read these fields through the shared compositor in `editor-media`.
+
+## 3D LUT / Look
+
+Select a video clip (or an adjustment layer). The **Colour** workspace and inspector expose a **3D LUT** section:
+
+- **Choose LUT…** opens a native file picker for `.cube` files
+- **LUT mix** blends between the graded picture and the LUT result (0 = bypass, 1 = full strength). The diamond keys mix at the playhead like other filter parameters
+- **Clear** removes the look from the clip
+
+The LUT is stored as a tagged effect on the clip. Meridian writes the absolute path to the `.cube` file. LUTs with edge length 17 or smaller also embed the parsed table in project JSON so the look survives when the file moves:
+
+```json
+{
+  "type": "lut",
+  "path": "/looks/warm-print.cube",
+  "title": "Warm Print",
+  "mix": { "base": 0.85 },
+  "embedded": {
+    "size": 2,
+    "domain_min": [0.0, 0.0, 0.0],
+    "domain_max": [1.0, 1.0, 1.0],
+    "table": [
+      [0.0, 0.0, 0.0],
+      [1.0, 0.0, 0.0]
+    ]
+  }
+}
+```
+
+When only the path is stored, a missing file shows as offline in the inspector; preview and export skip the LUT until the file is found again. Sampling uses tetrahedral interpolation in the shared `GradeSample` path, so preview and Deliver match.
+
+A tiny identity LUT for tests lives at [`samples/luts/identity-2.cube`](samples/luts/identity-2.cube).
 
 ## Templates
 
@@ -489,7 +523,7 @@ A progress bar follows ffmpeg's `out_time`. **Cancel** sends `SIGTERM`. A failed
 
 ## Tests
 
-`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, deliver presets (apply, custom JSON, last-settings round-trip), the sample project round-trip, imported media paths in JSON, media-pool bins (create, rename, move, delete, JSON round-trip), sequence markers (add, edit, delete, JSON round-trip), proxy attach and relink, timeline culling on an 800-clip sequence, ruler spacing across an hour, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, proxy argument planning and preview fallback, the disk frame cache, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, pan, fader, burned captions, deliver bitrate hints, audio-only WAV planning, retimed source frames, muted retimed audio), multicam sync offsets, razor angle switches, group-time cuts, JSON round-trip, and raster frames that follow the active angle, nested sequence create/frame mapping/JSON round-trip/export raster, the mix bus (pan law, mute, solo, keyframed gain, 3-band EQ, peak and RMS), clip speed (constant 25–400%, reverse, a linear ramp, JSON round-trip, and duration ripple), adjustment layers (JSON round-trip, track placement, composite stacking), shape mask and track matte JSON round-trip, and the shared composite (luma curve, lift/gamma/gain wheels, grade split, dissolve mix, wipe angle, push, dip, slide, blur dissolve, iris, clip filters including shape mask alpha, track matte alpha multiply, stabilize on synthetic shake, anchor, caption burn-in, adjustment grade-below). It does not spawn ffmpeg or whisper.
+`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, deliver presets (apply, custom JSON, last-settings round-trip), the sample project round-trip, imported media paths in JSON, media-pool bins (create, rename, move, delete, JSON round-trip), sequence markers (add, edit, delete, JSON round-trip), proxy attach and relink, timeline culling on an 800-clip sequence, ruler spacing across an hour, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, proxy argument planning and preview fallback, the disk frame cache, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, pan, fader, burned captions, deliver bitrate hints, audio-only WAV planning, retimed source frames, muted retimed audio), multicam sync offsets, razor angle switches, group-time cuts, JSON round-trip, and raster frames that follow the active angle, nested sequence create/frame mapping/JSON round-trip/export raster, the mix bus (pan law, mute, solo, keyframed gain, 3-band EQ, peak and RMS), clip speed (constant 25–400%, reverse, a linear ramp, JSON round-trip, and duration ripple), adjustment layers (JSON round-trip, track placement, composite stacking), shape mask and track matte JSON round-trip, 3D LUT `.cube` parse/tetrahedral sampling/JSON round-trip/mix, and the shared composite (luma curve, lift/gamma/gain wheels, grade split, dissolve mix, wipe angle, push, dip, slide, blur dissolve, iris, clip filters including shape mask alpha, track matte alpha multiply, stabilize on synthetic shake, 3D LUT look after grade, anchor, caption burn-in, adjustment grade-below). It does not spawn ffmpeg or whisper.
 
 `cargo test -p editor-media --features ffmpeg` also encodes a short H.264/AAC mp4 when `ffmpeg` is on `PATH`. `cargo test -p editor-app --features whisper` builds the local speech-to-text path; the binary and model are resolved at runtime, not at compile time.
 

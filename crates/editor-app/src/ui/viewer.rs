@@ -1299,6 +1299,21 @@ impl DecodePlan {
                 bits(mask.feather).hash(&mut hasher);
                 mask.invert.hash(&mut hasher);
             }
+            bits(layer.grade.lut_mix).hash(&mut hasher);
+            if let Some(lut) = &layer.grade.lut {
+                lut.size.hash(&mut hasher);
+                for channel in lut.domain_min {
+                    bits(channel).hash(&mut hasher);
+                }
+                for channel in lut.domain_max {
+                    bits(channel).hash(&mut hasher);
+                }
+                for sample in &lut.table {
+                    for channel in *sample {
+                        bits(channel).hash(&mut hasher);
+                    }
+                }
+            }
             if let Some(matte) = &layer.track_matte {
                 matte.source_track.hash(&mut hasher);
                 match matte.mode {

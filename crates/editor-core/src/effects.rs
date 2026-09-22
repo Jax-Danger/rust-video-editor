@@ -614,6 +614,58 @@ impl StabilizeFilter {
     }
 }
 
+/// Compact 3D LUT table stored inline in project JSON for small `.cube` files.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EmbeddedLut3D {
+    pub size: u32,
+    #[serde(default)]
+    pub domain_min: [f32; 3],
+    #[serde(default = "default_domain_max")]
+    pub domain_max: [f32; 3],
+    pub table: Vec<[f32; 3]>,
+}
+
+fn default_domain_max() -> [f32; 3] {
+    [1.0, 1.0, 1.0]
+}
+
+/// Imported `.cube` look. Large LUTs store the path only; small LUTs may also
+/// embed the parsed table so the project stays portable.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LutFilter {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
+    #[serde(default = "default_lut_mix")]
+    pub mix: AnimatedF32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedded: Option<EmbeddedLut3D>,
+}
+
+fn default_lut_mix() -> AnimatedF32 {
+    AnimatedF32::constant(1.0)
+}
+
+impl LutFilter {
+    pub fn off() -> Self {
+        Self {
+            path: String::new(),
+            mix: AnimatedF32::constant(1.0),
+            title: None,
+            embedded: None,
+        }
+    }
+
+    pub fn has_source(&self) -> bool {
+        !self.path.is_empty() || self.embedded.is_some()
+    }
+
+    pub fn is_active(&self, rel: i64) -> bool {
+        self.has_source() && self.mix.value_at(rel) > 1.0e-4
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FilterParam {
@@ -638,6 +690,7 @@ pub enum FilterParam {
     ShapeMaskWidth,
     ShapeMaskHeight,
     ShapeMaskFeather,
+    LutMix,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -652,6 +705,7 @@ pub enum Effect {
     ChromaKey(ChromaKeyFilter),
     Stabilize(StabilizeFilter),
     ShapeMask(ShapeMaskFilter),
+    Lut(LutFilter),
 }
 
 pub fn color_grade_mut(effects: &mut Vec<Effect>) -> &mut ColorGrade {
@@ -757,6 +811,16 @@ pub fn stabilize_mut(effects: &mut Vec<Effect>) -> &mut StabilizeFilter {
     }
 }
 
+pub fn lut_mut(effects: &mut Vec<Effect>) -> &mut LutFilter {
+    if !effects.iter().any(|e| matches!(e, Effect::Lut(_))) {
+        effects.push(Effect::Lut(LutFilter::off()));
+    }
+    match effects.iter_mut().find(|e| matches!(e, Effect::Lut(_))) {
+        Some(Effect::Lut(filter)) => filter,
+        _ => unreachable!("LUT filter just inserted"),
+    }
+}
+
 pub fn shape_mask_mut(effects: &mut Vec<Effect>) -> &mut ShapeMaskFilter {
     if !effects.iter().any(|e| matches!(e, Effect::ShapeMask(_))) {
         effects.push(Effect::ShapeMask(ShapeMaskFilter::off()));
@@ -819,6 +883,13 @@ pub fn shape_mask(effects: &[Effect]) -> Option<&ShapeMaskFilter> {
     })
 }
 
+pub fn lut(effects: &[Effect]) -> Option<&LutFilter> {
+    effects.iter().find_map(|e| match e {
+        Effect::Lut(filter) => Some(filter),
+        _ => None,
+    })
+}
+
 pub fn has_filter(effects: &[Effect], kind: FilterKind) -> bool {
     effects.iter().any(|e| match (kind, e) {
         (FilterKind::Blur, Effect::Blur(f)) => f.radius.base > 1.0e-4 || !f.radius.keys.is_empty(),
@@ -853,6 +924,7 @@ pub fn has_filter(effects: &[Effect], kind: FilterKind) -> bool {
                 || !f.height.keys.is_empty()
                 || !f.feather.keys.is_empty()
         }
+        (FilterKind::Lut, Effect::Lut(f)) => f.has_source(),
         _ => false,
     })
 }
@@ -866,6 +938,7 @@ pub enum FilterKind {
     ChromaKey,
     Stabilize,
     ShapeMask,
+    Lut,
 }
 
 impl FilterKind {
@@ -878,6 +951,7 @@ impl FilterKind {
             Self::ChromaKey => "Chroma Key",
             Self::Stabilize => "Stabilize",
             Self::ShapeMask => "Shape Mask",
+            Self::Lut => "3D LUT",
         }
     }
 }
@@ -962,6 +1036,26 @@ mod tests {
                 feather: AnimatedF32::constant(0.08),
                 invert: false,
             }),
+            Effect::Lut(LutFilter {
+                path: "/looks/warm.cube".into(),
+                mix: AnimatedF32::constant(0.75),
+                title: Some("Warm Print".into()),
+                embedded: Some(EmbeddedLut3D {
+                    size: 2,
+                    domain_min: [0.0, 0.0, 0.0],
+                    domain_max: [1.0, 1.0, 1.0],
+                    table: vec![
+                        [0.0, 0.0, 0.0],
+                        [1.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0],
+                        [1.0, 1.0, 0.0],
+                        [0.0, 0.0, 1.0],
+                        [1.0, 0.0, 1.0],
+                        [0.0, 1.0, 1.0],
+                        [1.0, 1.0, 1.0],
+                    ],
+                }),
+            }),
         ];
         let json = serde_json::to_string(&effects).unwrap();
         let parsed: Vec<Effect> = serde_json::from_str(&json).unwrap();
@@ -971,6 +1065,14 @@ mod tests {
         assert!(has_filter(&effects, FilterKind::ChromaKey));
         assert!(has_filter(&effects, FilterKind::Stabilize));
         assert!(has_filter(&effects, FilterKind::ShapeMask));
+        assert!(has_filter(&effects, FilterKind::Lut));
+    }
+
+    #[test]
+    fn lut_filter_defaults_to_full_mix() {
+        let filter = LutFilter::off();
+        assert!((filter.mix.base - 1.0).abs() < 1.0e-6);
+        assert!(!filter.has_source());
     }
 
     #[test]
