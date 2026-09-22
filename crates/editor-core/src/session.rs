@@ -89,6 +89,7 @@ impl Session {
         if self.interactive.is_some() {
             let result = f(&mut self.project);
             if result.is_ok() {
+                self.project.normalize();
                 self.dirty = true;
                 self.generation = self.generation.saturating_add(1);
             }
@@ -97,6 +98,7 @@ impl Session {
         let before = self.project.clone();
         match f(&mut self.project) {
             Ok(()) => {
+                self.project.normalize();
                 self.push_undo(label, before);
                 Ok(())
             }

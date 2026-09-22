@@ -45,9 +45,9 @@ pub use mix::{
 };
 pub use model::*;
 pub use scale::{
-    align_frame, clamp_timeline_zoom, clip_index_at, ruler_mark_count, ruler_step,
-    timeline_scale_label, visible_clip_span, visible_span, RulerStep, MAX_PIXELS_PER_FRAME,
-    MIN_PIXELS_PER_FRAME,
+    align_frame, clamp_timeline_zoom, clip_index_at, frame_at_x, ruler_mark_count, ruler_step,
+    stacked_clip_indices, stacked_hits, timeline_scale_label, timeline_x, visible_clip_span,
+    visible_span, zoom_origin, RulerStep, MAX_PIXELS_PER_FRAME, MIN_PIXELS_PER_FRAME,
 };
 pub use session::Session;
 pub use template::{builtin_templates, project_from_template, ProjectTemplate};

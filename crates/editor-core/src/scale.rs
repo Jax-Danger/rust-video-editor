@@ -162,22 +162,143 @@ pub fn visible_span<T>(
 
 /// Clip under `frame`, preferring the later start when two clips share an edge.
 ///
-/// This is a binary search. It matches a reverse linear scan for a
-/// non-overlapping, `timeline_in`-sorted track.
-pub fn clip_index_at(clips: &[Clip], frame: i64) -> Option<usize> {
+/// The latest clip that starts at or before `frame` is a binary search. On a
+/// normal cut that clip is the only candidate. `stacked` lists clips that end
+/// after a later clip (a title or another angle on the same track); those are
+/// checked only when the top candidate does not cover `frame`.
+pub fn clip_index_at(clips: &[Clip], frame: i64, stacked: &[u32]) -> Option<usize> {
     if clips.is_empty() {
         return None;
     }
     let idx = clips.partition_point(|clip| clip.timeline_in.0 <= frame);
-    if idx == 0 {
-        return None;
+    if idx > 0 && clips[idx - 1].covers(Frame(frame)) {
+        return Some(idx - 1);
     }
-    let index = idx - 1;
-    if clips[index].covers(Frame(frame)) {
-        Some(index)
+    let mut best = None;
+    for &raw in stacked {
+        let index = raw as usize;
+        if index < clips.len() && clips[index].covers(Frame(frame)) {
+            best = Some(index);
+        }
+    }
+    best
+}
+
+/// Clips that end after some later clip on the same track.
+///
+/// A non-overlapping cut returns an empty list, so drawing stays a binary
+/// search. The list is short: one entry per clip that sticks out past a shot
+/// placed after it.
+pub fn stacked_clip_indices(clips: &[Clip]) -> Vec<u32> {
+    let mut min_after = i64::MAX;
+    let mut stacked = Vec::new();
+    for (index, clip) in clips.iter().enumerate().rev() {
+        if clip.timeline_out.0 > min_after {
+            stacked.push(index as u32);
+        }
+        min_after = min_after.min(clip.timeline_out.0);
+    }
+    stacked.reverse();
+    stacked
+}
+
+/// Stacked clips that intersect `[start, end)` and start before `span_start`.
+///
+/// [`visible_clip_span`] stops at the first later clip that has already ended,
+/// which is exact when nothing underneath runs longer. These indices are the
+/// underneath clips the search does not return.
+pub fn stacked_hits(
+    clips: &[Clip],
+    stacked: &[u32],
+    start: i64,
+    end: i64,
+    span_start: usize,
+) -> Vec<usize> {
+    let mut hits = Vec::new();
+    for &raw in stacked {
+        let index = raw as usize;
+        if index >= span_start || index >= clips.len() {
+            continue;
+        }
+        let clip = &clips[index];
+        if clip.timeline_in.0 < end && clip.timeline_out.0 > start {
+            hits.push(index);
+        }
+    }
+    hits
+}
+
+/// Pixel X of `frame` in a viewport whose left edge is `origin_frame`.
+///
+/// The frame delta is computed in f64. An hour-long sequence zoomed to single
+/// frames stays a viewport coordinate instead of a multi-million-pixel strip.
+pub fn timeline_x(frame: i64, origin_frame: f64, view_left: f32, pixels_per_frame: f32) -> f32 {
+    let ppf = if pixels_per_frame.is_finite() && pixels_per_frame > 0.0 {
+        pixels_per_frame as f64
     } else {
-        None
+        1.0
+    };
+    let origin = if origin_frame.is_finite() {
+        origin_frame
+    } else {
+        0.0
+    };
+    (view_left as f64 + (frame as f64 - origin) * ppf) as f32
+}
+
+/// Scroll origin after a zoom that keeps `anchor_px` on the same frame.
+///
+/// The anchor frame is clamped to the sequence, and a zoom that still fits the
+/// whole sequence pins the origin at 0. That stops an overview from jumping to
+/// the tail when the panel center sits in the empty space after the last clip.
+pub fn zoom_origin(
+    origin: f64,
+    old_ppf: f32,
+    new_ppf: f32,
+    anchor_px: f32,
+    sequence_end: i64,
+    view_width: f32,
+) -> f64 {
+    let new = if new_ppf.is_finite() && new_ppf > 0.0 {
+        new_ppf
+    } else {
+        1.0
+    };
+    let old = if old_ppf.is_finite() && old_ppf > 0.0 {
+        old_ppf
+    } else {
+        new
+    };
+    let anchor = anchor_px.max(0.0) as f64;
+    let origin = if origin.is_finite() { origin } else { 0.0 };
+    let end = sequence_end.max(0) as f64;
+    let frame = (origin + anchor / f64::from(old)).clamp(0.0, end);
+    let width = if view_width.is_finite() {
+        view_width.max(1.0)
+    } else {
+        1.0
+    };
+    let view_frames = f64::from(width) / f64::from(new);
+    if view_frames + 1.0 >= end {
+        return 0.0;
     }
+    let max_origin = (end - view_frames).max(0.0);
+    (frame - anchor / f64::from(new)).clamp(0.0, max_origin)
+}
+
+/// Frame under a viewport pixel. Inverse of [`timeline_x`].
+pub fn frame_at_x(x: f32, origin_frame: f64, view_left: f32, pixels_per_frame: f32) -> i64 {
+    let ppf = if pixels_per_frame.is_finite() && pixels_per_frame > 0.0 {
+        pixels_per_frame as f64
+    } else {
+        1.0
+    };
+    let origin = if origin_frame.is_finite() {
+        origin_frame
+    } else {
+        0.0
+    };
+    (origin + (x - view_left) as f64 / ppf).round() as i64
 }
 
 #[cfg(test)]
@@ -255,14 +376,73 @@ mod tests {
         let long = Clip::basic(9, 0, 50_000);
         let span = visible_clip_span(&[long.clone()], 40_000, 40_100);
         assert_eq!(span, 0..1);
-        assert_eq!(clip_index_at(&[long], 40_050), Some(0));
+        assert_eq!(clip_index_at(&[long], 40_050, &[]), Some(0));
 
         for frame in (0..800 * 48).step_by(113) {
-            let fast = clip_index_at(&clips, frame);
+            let fast = clip_index_at(&clips, frame, &[]);
             let slow = clips.iter().rposition(|clip| clip.covers(Frame(frame)));
             assert_eq!(fast, slow, "frame {frame}");
         }
-        assert_eq!(clip_index_at(&clips, -4), None);
+        assert_eq!(clip_index_at(&clips, -4, &[]), None);
         assert_eq!(visible_clip_span(&clips, 10, 10), 0..0);
+    }
+
+    #[test]
+    fn stacked_clip_is_drawn_and_hit_under_later_shots() {
+        let clips = vec![
+            Clip::basic(1, 0, 50_000),
+            Clip::basic(2, 0, 100),
+            Clip::basic(3, 20_000, 20_048),
+        ];
+        let stacked = stacked_clip_indices(&clips);
+        assert_eq!(stacked, vec![0]);
+        let span = visible_clip_span(&clips, 5_000, 5_100);
+        assert!(
+            !clips[span.clone()].iter().any(|clip| clip.id.0 == 1),
+            "the binary search window is the later shots, not the long clip"
+        );
+        let hits = stacked_hits(&clips, &stacked, 5_000, 5_100, span.start);
+        assert_eq!(hits, vec![0]);
+        assert_eq!(clip_index_at(&clips, 5_050, &stacked), Some(0));
+        assert_eq!(
+            clip_index_at(&clips, 50, &stacked).map(|i| clips[i].id.0),
+            Some(2)
+        );
+        assert!(stacked_clip_indices(&wall(40, 24)).is_empty());
+    }
+
+    #[test]
+    fn frame_zoom_an_hour_in_stays_inside_the_viewport() {
+        let hour = 24 * 60 * 60;
+        let origin = hour as f64 - 12.0;
+        let x = timeline_x(hour, origin, 80.0, 64.0);
+        assert!((x - (80.0 + 12.0 * 64.0)).abs() < 0.5, "viewport x {x}");
+        assert!(x < 2_000.0, "hour at frame zoom landed at {x}px");
+        assert_eq!(frame_at_x(x, origin, 80.0, 64.0), hour);
+        let fitted = timeline_x(hour, 0.0, 0.0, MIN_PIXELS_PER_FRAME);
+        assert!(fitted < 1_200.0, "overview of an hour is {fitted}px");
+    }
+
+    #[test]
+    fn zoom_in_from_an_overview_does_not_jump_to_the_tail() {
+        let end = 400 * 48;
+        let width = 1_600.0;
+        let stayed = zoom_origin(0.0, 0.05, 4.0, 0.0, end, width);
+        assert!(
+            stayed < 50.0,
+            "playhead at frame 0 should stay at the start, origin {stayed}"
+        );
+        let middle = zoom_origin(0.0, 0.05, 4.0, width * 0.5, end, width);
+        let anchor_frame = (width * 0.5) as f64 / 0.05;
+        assert!(
+            (middle - (anchor_frame.min(end as f64) - (width * 0.5) as f64 / 4.0)).abs() < 2.0,
+            "origin {middle}"
+        );
+        assert!(middle < end as f64);
+        let fitted = zoom_origin(8_000.0, 4.0, width / end as f32, 100.0, end, width);
+        assert!(
+            fitted.abs() < 1.0,
+            "a zoom that fits the sequence pins to the start, origin {fitted}"
+        );
     }
 }

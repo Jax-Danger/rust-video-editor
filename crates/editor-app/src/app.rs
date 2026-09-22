@@ -172,8 +172,9 @@ pub struct MeridianApp {
     pub text_editing: bool,
     pub dragging_media: Option<MediaId>,
     pub timeline_view: Option<egui::Rect>,
-    /// Fit should scroll the timeline back to frame 0 after the zoom changes.
-    pub scroll_timeline_home: bool,
+    /// Frame at the left edge of the timeline viewport. Scrolling changes this,
+    /// not a pixel strip as wide as the sequence.
+    pub timeline_origin: f64,
     pub ruler_rect: Option<egui::Rect>,
     pub viewer_bar: Option<egui::Rect>,
     pub viewer_bar_end: i64,
@@ -220,7 +221,7 @@ impl MeridianApp {
             text_editing: false,
             dragging_media: None,
             timeline_view: None,
-            scroll_timeline_home: false,
+            timeline_origin: 0.0,
             ruler_rect: None,
             viewer_bar: None,
             viewer_bar_end: 0,
@@ -336,7 +337,59 @@ impl MeridianApp {
     }
 
     pub fn zoom_by(&mut self, factor: f32) {
-        self.pixels_per_frame = editor_core::clamp_timeline_zoom(self.pixels_per_frame * factor);
+        let old = self.pixels_per_frame;
+        let new = editor_core::clamp_timeline_zoom(old * factor);
+        self.rebase_timeline_zoom(old, new, self.zoom_anchor_px());
+    }
+
+    /// Pixel in the timeline view that should stay on the same frame while zooming.
+    /// The playhead wins when it is on screen. Otherwise the anchor is the center
+    /// of the clips actually visible, not the empty area past the last clip.
+    pub fn zoom_anchor_px(&self) -> f32 {
+        let width = self
+            .timeline_view
+            .map(|rect| rect.width())
+            .unwrap_or(900.0)
+            .max(1.0);
+        let ppf = f64::from(self.pixels_per_frame.max(editor_core::MIN_PIXELS_PER_FRAME));
+        let playhead_x = (self.playhead as f64 - self.timeline_origin) * ppf;
+        if playhead_x >= 0.0 && playhead_x <= f64::from(width) {
+            return playhead_x as f32;
+        }
+        let end = self.sequence_end().max(0) as f64;
+        let content_right = ((end - self.timeline_origin).max(0.0) * ppf) as f32;
+        (width * 0.5).min(content_right.max(0.0))
+    }
+
+    /// Keep `anchor_px` (distance from the left of the timeline view) on the same frame.
+    pub fn rebase_timeline_zoom(&mut self, old: f32, new: f32, anchor_px: f32) {
+        let width = self.timeline_view.map(|rect| rect.width()).unwrap_or(900.0);
+        self.pixels_per_frame = new;
+        self.timeline_origin = editor_core::zoom_origin(
+            self.timeline_origin,
+            old,
+            new,
+            anchor_px,
+            self.sequence_end(),
+            width,
+        );
+    }
+
+    pub fn clamp_timeline_origin(&mut self, end: i64) {
+        let width = self
+            .timeline_view
+            .map(|rect| rect.width())
+            .unwrap_or(900.0)
+            .max(80.0) as f64;
+        let ppf = f64::from(self.pixels_per_frame.max(editor_core::MIN_PIXELS_PER_FRAME));
+        let view_frames = width / ppf;
+        let max_origin = (end as f64 - view_frames).max(0.0);
+        if !self.timeline_origin.is_finite() || self.timeline_origin < 0.0 {
+            self.timeline_origin = 0.0;
+        }
+        if self.timeline_origin > max_origin {
+            self.timeline_origin = max_origin;
+        }
     }
 
     pub fn note_text_focus(&mut self, response: &egui::Response) {
@@ -976,7 +1029,7 @@ impl MeridianApp {
             .unwrap_or(900.0)
             .max(80.0);
         self.pixels_per_frame = editor_core::clamp_timeline_zoom(width / frames);
-        self.scroll_timeline_home = true;
+        self.timeline_origin = 0.0;
     }
 
     pub fn toggle_proxies(&mut self) {
@@ -1091,7 +1144,7 @@ impl MeridianApp {
         self.selected.clear();
         self.selected_media = Some(MediaId(10));
         self.pixels_per_frame = editor_core::clamp_timeline_zoom(0.05);
-        self.scroll_timeline_home = true;
+        self.timeline_origin = 0.0;
         self.halt_transport();
         self.workspace = Workspace::Edit;
         self.status = "Opened a 400-clip sequence. Fit shows minutes; zoom in to frames.".into();

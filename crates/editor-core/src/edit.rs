@@ -255,7 +255,7 @@ pub fn insert_clips(
                 .find(|t| t.id == track_id)
                 .ok_or(EditError::TrackNotFound)?;
             track.clips.push(clip);
-            track.clips.sort_by_key(|c| (c.timeline_in.0, c.id.0));
+            track.reindex();
         }
         cleanup_transitions(sequence);
         Ok(())

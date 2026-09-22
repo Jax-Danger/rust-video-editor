@@ -78,7 +78,7 @@ The toolbar exposes Select, Razor, Ripple, Roll, Slip, and Slide, plus Overwrite
 
 Linked selection is on by default so picture and sound move together. Inserting a linked pair is one ripple, not two.
 
-Click or drag the timeline ruler, or the bar under the program monitor, to scrub. The decoded preview follows the playhead. Playback and scrubbing reuse one ffmpeg job for a short burst of frames, then a memory cache and a disk cache (see [Long projects](#long-projects)) so a second pass over the same frames does not spawn ffmpeg again. The timeline scrolls horizontally. Scroll pans; Ctrl+scroll or a pinch zooms around the cursor. `+` / `−` zoom. The zoom slider is logarithmic, from single frames (64 px/frame) out to about 12 px per minute at 24 fps, which fits an hour in the panel. Shift+Z fits the sequence and scrolls back to the start. Off-screen clips are not drawn, and the clip under the pointer is a binary search on the sorted track.
+Click or drag the timeline ruler, or the bar under the program monitor, to scrub. The decoded preview follows the playhead. Playback and scrubbing reuse one ffmpeg job for a short burst of frames, then a memory cache and a disk cache (see [Long projects](#long-projects)) so a second pass over the same frames does not spawn ffmpeg again. The timeline scrolls horizontally by a frame origin, so an hour zoomed to single frames stays a viewport-sized strip instead of a multi-million-pixel layout. Scroll pans; Ctrl+scroll or a pinch zooms around the cursor. `+` / `−` and the slider zoom around the center of the panel. The zoom slider is logarithmic, from single frames (64 px/frame) out to about 12 px per minute at 24 fps, which fits an hour in the panel. Shift+Z fits the sequence and scrolls back to the start. Off-screen clips are not drawn. The clip under the pointer is a binary search on the sorted track, plus any clip that runs underneath later shots.
 
 ## Keyboard
 
@@ -241,7 +241,7 @@ The disk key also includes the source file's modification time, so replacing a f
 
 ### Timeline scale
 
-Tracks are sorted by start frame. Painting and hit-testing use a binary search for the clips that intersect the viewport, including a clip that starts off-screen and runs into view. The ruler spaces ticks from single frames out to hours, and only for the visible range. At the overview zoom, clips thinner than a couple of pixels draw as a solid mark instead of a labelled block. **Fit** (Shift+Z) uses the panel width, so a long sequence actually fits.
+Tracks are sorted by start frame. Painting and hit-testing use a binary search for the clips that intersect the viewport, including a clip that starts off-screen and runs into view. A clip that ends after a later clip — a title or another angle on the same track — is indexed when the project is normalized and is still drawn and hit-tested when the search window starts after it. The ruler spaces ticks from single frames out to hours, and only for the visible range. Scroll position is a frame number, not a pixel offset into a strip as wide as the sequence, so frame zoom an hour in stays precise. At the overview zoom, clips thinner than a couple of pixels draw as a solid mark instead of a labelled block. **Fit** (Shift+Z) uses the panel width, so a long sequence actually fits. `+` / `−` and the zoom slider keep the playhead where it is, so an overview does not jump to the tail.
 
 ### Relink
 

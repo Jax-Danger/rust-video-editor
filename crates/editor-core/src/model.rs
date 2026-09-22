@@ -361,6 +361,10 @@ pub struct Track {
     pub transitions: Vec<Transition>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cues: Vec<CaptionCue>,
+    /// Indices of clips that end after a later clip. Empty on a normal cut.
+    /// Rebuilt by [`Self::reindex`]. Not saved; the list is derived from the clips.
+    #[serde(skip)]
+    pub stacked_clips: Vec<u32>,
 }
 
 impl Track {
@@ -378,7 +382,15 @@ impl Track {
             clips: Vec::new(),
             transitions: Vec::new(),
             cues: Vec::new(),
+            stacked_clips: Vec::new(),
         }
+    }
+
+    /// Sort clips and cues, then record which clips run underneath later ones.
+    pub fn reindex(&mut self) {
+        self.clips.sort_by_key(|c| (c.timeline_in.0, c.id.0));
+        self.cues.sort_by_key(|c| (c.timeline_in.0, c.id.0));
+        self.stacked_clips = crate::scale::stacked_clip_indices(&self.clips);
     }
 }
 
@@ -680,8 +692,7 @@ impl Project {
         }
         for seq in &mut self.sequences {
             for track in &mut seq.tracks {
-                track.clips.sort_by_key(|c| (c.timeline_in.0, c.id.0));
-                track.cues.sort_by_key(|c| (c.timeline_in.0, c.id.0));
+                track.reindex();
             }
         }
     }
