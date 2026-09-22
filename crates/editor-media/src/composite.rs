@@ -10,7 +10,9 @@
 //!
 //! The raster size may differ (the monitor fits inside 960×540, export uses the
 //! sequence size, capped at the preview decoder's 1920-pixel edge). The mapping
-//! is the same, so the pictures agree up to that scale and the codec.
+//! is the same, so the pictures agree up to that scale and the codec. Clip
+//! speed chooses the source frame in `source_frame_at` before either path
+//! decodes, so a ramp or a constant rate is the same picture in both.
 
 use editor_core::{
     blur, clip_relative, color_grade, crop, sharpen, source_frame_at, transform, vignette, Clip,
@@ -193,10 +195,18 @@ impl FilterSample {
             crop: {
                 let c = crop(effects);
                 [
-                    c.map(|f| f.left.value_at(rel)).unwrap_or(0.0).clamp(0.0, 0.45),
-                    c.map(|f| f.right.value_at(rel)).unwrap_or(0.0).clamp(0.0, 0.45),
-                    c.map(|f| f.top.value_at(rel)).unwrap_or(0.0).clamp(0.0, 0.45),
-                    c.map(|f| f.bottom.value_at(rel)).unwrap_or(0.0).clamp(0.0, 0.45),
+                    c.map(|f| f.left.value_at(rel))
+                        .unwrap_or(0.0)
+                        .clamp(0.0, 0.45),
+                    c.map(|f| f.right.value_at(rel))
+                        .unwrap_or(0.0)
+                        .clamp(0.0, 0.45),
+                    c.map(|f| f.top.value_at(rel))
+                        .unwrap_or(0.0)
+                        .clamp(0.0, 0.45),
+                    c.map(|f| f.bottom.value_at(rel))
+                        .unwrap_or(0.0)
+                        .clamp(0.0, 0.45),
                 ]
             },
             sharpen: sharpen(effects)
@@ -249,7 +259,10 @@ pub enum CanvasMask {
         keep_below: bool,
     },
     /// Circular iris. `edge` is the reveal radius from the centre (0…1).
-    Iris { edge: f32, keep_below: bool },
+    Iris {
+        edge: f32,
+        keep_below: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -311,7 +324,11 @@ pub fn transition_motion(
         }
         TransitionKind::DipToBlack => TransitionMotion {
             opacity_scale: if outgoing {
-                if p <= 0.5 { 1.0 - 2.0 * p } else { 0.0 }
+                if p <= 0.5 {
+                    1.0 - 2.0 * p
+                } else {
+                    0.0
+                }
             } else if p <= 0.5 {
                 0.0
             } else {
@@ -324,14 +341,14 @@ pub fn transition_motion(
             dip_plate: None,
         },
         TransitionKind::DipToWhite => {
-            let plate_opacity = if p <= 0.5 {
-                2.0 * p
-            } else {
-                2.0 * (1.0 - p)
-            };
+            let plate_opacity = if p <= 0.5 { 2.0 * p } else { 2.0 * (1.0 - p) };
             TransitionMotion {
                 opacity_scale: if outgoing {
-                    if p <= 0.5 { 1.0 - 2.0 * p } else { 0.0 }
+                    if p <= 0.5 {
+                        1.0 - 2.0 * p
+                    } else {
+                        0.0
+                    }
                 } else if p <= 0.5 {
                     0.0
                 } else {
@@ -457,57 +474,57 @@ pub fn mask_window(mask: CanvasMask) -> MaskWindow {
             edge,
             keep_below,
         } => {
-    let edge = edge.clamp(0.0, 1.0);
-    if keep_below && edge <= 1.0e-4 {
-        return MaskWindow::Empty;
-    }
-    if !keep_below && edge >= 1.0 - 1.0e-4 {
-        return MaskWindow::Empty;
-    }
-    if keep_below && edge >= 1.0 - 1.0e-4 {
-        return MaskWindow::All;
-    }
-    if !keep_below && edge <= 1.0e-4 {
-        return MaskWindow::All;
-    }
-    let angle = angle_deg.rem_euclid(360.0);
-    let rect = if angle < 0.51 || angle > 359.49 {
-        if keep_below {
-            (0.0, 0.0, edge, 1.0)
-        } else {
-            (edge, 0.0, 1.0, 1.0)
-        }
-    } else if (angle - 90.0).abs() < 0.51 {
-        if keep_below {
-            (0.0, 0.0, 1.0, edge)
-        } else {
-            (0.0, edge, 1.0, 1.0)
-        }
-    } else if (angle - 180.0).abs() < 0.51 {
-        if keep_below {
-            (1.0 - edge, 0.0, 1.0, 1.0)
-        } else {
-            (0.0, 0.0, 1.0 - edge, 1.0)
-        }
-    } else if (angle - 270.0).abs() < 0.51 {
-        if keep_below {
-            (0.0, 1.0 - edge, 1.0, 1.0)
-        } else {
-            (0.0, 0.0, 1.0, 1.0 - edge)
-        }
-    } else {
-        return MaskWindow::PerPixel;
-    };
-    if rect.2 - rect.0 < 1.0e-4 || rect.3 - rect.1 < 1.0e-4 {
-        MaskWindow::Empty
-    } else {
-        MaskWindow::Uv {
-            u0: rect.0,
-            v0: rect.1,
-            u1: rect.2,
-            v1: rect.3,
-        }
-    }
+            let edge = edge.clamp(0.0, 1.0);
+            if keep_below && edge <= 1.0e-4 {
+                return MaskWindow::Empty;
+            }
+            if !keep_below && edge >= 1.0 - 1.0e-4 {
+                return MaskWindow::Empty;
+            }
+            if keep_below && edge >= 1.0 - 1.0e-4 {
+                return MaskWindow::All;
+            }
+            if !keep_below && edge <= 1.0e-4 {
+                return MaskWindow::All;
+            }
+            let angle = angle_deg.rem_euclid(360.0);
+            let rect = if angle < 0.51 || angle > 359.49 {
+                if keep_below {
+                    (0.0, 0.0, edge, 1.0)
+                } else {
+                    (edge, 0.0, 1.0, 1.0)
+                }
+            } else if (angle - 90.0).abs() < 0.51 {
+                if keep_below {
+                    (0.0, 0.0, 1.0, edge)
+                } else {
+                    (0.0, edge, 1.0, 1.0)
+                }
+            } else if (angle - 180.0).abs() < 0.51 {
+                if keep_below {
+                    (1.0 - edge, 0.0, 1.0, 1.0)
+                } else {
+                    (0.0, 0.0, 1.0 - edge, 1.0)
+                }
+            } else if (angle - 270.0).abs() < 0.51 {
+                if keep_below {
+                    (0.0, 1.0 - edge, 1.0, 1.0)
+                } else {
+                    (0.0, 0.0, 1.0, 1.0 - edge)
+                }
+            } else {
+                return MaskWindow::PerPixel;
+            };
+            if rect.2 - rect.0 < 1.0e-4 || rect.3 - rect.1 < 1.0e-4 {
+                MaskWindow::Empty
+            } else {
+                MaskWindow::Uv {
+                    u0: rect.0,
+                    v0: rect.1,
+                    u1: rect.2,
+                    v1: rect.3,
+                }
+            }
         }
     }
 }
@@ -627,7 +644,9 @@ pub enum LayerSource {
     },
     Title(Title),
     /// Solid colour plate (dip-to-white and similar).
-    Solid { rgb: [f32; 3] },
+    Solid {
+        rgb: [f32; 3],
+    },
 }
 
 /// One layer, bottom to top. Higher timeline tracks are later.
@@ -845,7 +864,7 @@ fn layer_from_clip(
             grade: GradeSample::from_effects(&clip.effects, rel),
             filters: FilterSample::from_effects(&clip.effects, rel),
             place,
-            label: format!("{}  {}", track.name, clip.name),
+            label: layer_label(track, clip),
             using_proxy: false,
             clip_id: clip.id.0,
         }));
@@ -888,10 +907,19 @@ fn layer_from_clip(
         grade: GradeSample::from_effects(&clip.effects, rel),
         filters: FilterSample::from_effects(&clip.effects, rel),
         place,
-        label: format!("{}  {}", track.name, clip.name),
+        label: layer_label(track, clip),
         using_proxy,
         clip_id: clip.id.0,
     }))
+}
+
+fn layer_label(track: &Track, clip: &Clip) -> String {
+    let mut label = format!("{}  {}", track.name, clip.name);
+    if let Some(badge) = clip.speed.badge() {
+        label.push_str("  ");
+        label.push_str(&badge);
+    }
+    label
 }
 
 fn layer_pixel_size(canvas_w: u32, canvas_h: u32, place: &Place) -> (u32, u32) {
@@ -982,7 +1010,13 @@ fn solid_rgba(width: u32, height: u32, rgb: [f32; 3]) -> Vec<u8> {
     rgba
 }
 
-fn apply_filters(rgba: &mut [u8], width: u32, height: u32, filters: &FilterSample, extra_blur: f32) {
+fn apply_filters(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    filters: &FilterSample,
+    extra_blur: f32,
+) {
     let blur_radius = filters.blur_radius.max(extra_blur);
     if blur_radius >= 0.5 {
         box_blur(rgba, width, height, blur_radius);
@@ -994,7 +1028,13 @@ fn apply_filters(rgba: &mut [u8], width: u32, height: u32, filters: &FilterSampl
         apply_crop(rgba, width, height, filters.crop);
     }
     if filters.vignette_amount > 1.0e-4 {
-        apply_vignette(rgba, width, height, filters.vignette_amount, filters.vignette_softness);
+        apply_vignette(
+            rgba,
+            width,
+            height,
+            filters.vignette_amount,
+            filters.vignette_softness,
+        );
     }
 }
 
@@ -1132,7 +1172,13 @@ pub fn compose_layers(
             continue;
         }
         if !layer.filters.is_neutral() || layer.place.blur_radius >= 0.5 {
-            apply_filters(&mut rgba, layer.width, layer.height, &layer.filters, layer.place.blur_radius);
+            apply_filters(
+                &mut rgba,
+                layer.width,
+                layer.height,
+                &layer.filters,
+                layer.place.blur_radius,
+            );
         }
         owned.push((
             rgba,

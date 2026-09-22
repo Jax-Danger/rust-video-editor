@@ -167,14 +167,20 @@ impl Default for TransitionAlign {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TransitionKind {
     CrossDissolve,
-    Wipe { angle_deg: f32 },
-    PushSlide { direction: Direction },
+    Wipe {
+        angle_deg: f32,
+    },
+    PushSlide {
+        direction: Direction,
+    },
     /// Outgoing fades to black, then incoming fades from black.
     DipToBlack,
     /// Outgoing fades to white, then incoming fades from white.
     DipToWhite,
     /// Outgoing stays put; incoming slides over it.
-    Slide { direction: Direction },
+    Slide {
+        direction: Direction,
+    },
     /// Cross dissolve with a blur peak at the midpoint.
     BlurDissolve,
     /// Circular iris open/close centred on the frame.
@@ -345,6 +351,79 @@ impl Title {
     }
 }
 
+/// Inclusive playback-rate range. 1.0 is realtime. 0.25 is 25%, 4.0 is 400%.
+pub const SPEED_MIN: f32 = 0.25;
+pub const SPEED_MAX: f32 = 4.0;
+
+pub fn clamp_speed(value: f32) -> f32 {
+    if !value.is_finite() {
+        return 1.0;
+    }
+    value.clamp(SPEED_MIN, SPEED_MAX)
+}
+
+fn unity_rate() -> AnimatedF32 {
+    AnimatedF32::constant(1.0)
+}
+
+/// How fast source time moves relative to the sequence.
+///
+/// `rate` is an [`AnimatedF32`] in clip-relative sequence frames. No keys means
+/// a constant `rate.base`. A linear ramp is a key at frame 0 and a key at frame
+/// `-1`. The negative frame means the clip's current out point, so the ramp
+/// stays stretched across the clip when its duration changes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ClipSpeed {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reverse: bool,
+    #[serde(default = "unity_rate")]
+    pub rate: AnimatedF32,
+}
+
+impl Default for ClipSpeed {
+    fn default() -> Self {
+        Self::normal()
+    }
+}
+
+impl ClipSpeed {
+    pub fn normal() -> Self {
+        Self {
+            reverse: false,
+            rate: unity_rate(),
+        }
+    }
+
+    pub fn is_identity(&self) -> bool {
+        !self.reverse && self.rate.keys.is_empty() && (self.rate.base - 1.0).abs() < 1.0e-4
+    }
+
+    pub fn constant(rate: f32, reverse: bool) -> Self {
+        Self {
+            reverse,
+            rate: AnimatedF32::constant(clamp_speed(rate)),
+        }
+    }
+
+    /// Linear ramp from `start` at the first frame to `end` at the out point.
+    pub fn ramp(start: f32, end: f32, reverse: bool) -> Self {
+        let start = clamp_speed(start);
+        let end = clamp_speed(end);
+        let mut rate = AnimatedF32::constant(start);
+        rate.set_key(0, start);
+        rate.set_key(-1, end);
+        Self { reverse, rate }
+    }
+
+    pub fn sanitized(mut self) -> Self {
+        self.rate.base = clamp_speed(self.rate.base);
+        for key in &mut self.rate.keys {
+            key.value = clamp_speed(key.value);
+        }
+        self
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Clip {
     pub id: ClipId,
@@ -387,6 +466,10 @@ pub struct Clip {
     /// compositor rasterizes [`Title`] into the frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<Title>,
+    /// Playback rate. Omitted from JSON at 100% forward. Preview and export
+    /// both read it through [`crate::source_frame_at`].
+    #[serde(default, skip_serializing_if = "ClipSpeed::is_identity")]
+    pub speed: ClipSpeed,
 }
 
 impl Clip {
@@ -434,6 +517,7 @@ impl Clip {
             label: LabelColor::Neutral,
             volume: AnimatedF32::constant(1.0),
             title: None,
+            speed: ClipSpeed::normal(),
         }
     }
 
@@ -460,6 +544,7 @@ impl Clip {
             label: LabelColor::Rose,
             volume: AnimatedF32::constant(1.0),
             title: Some(title),
+            speed: ClipSpeed::normal(),
         }
     }
 

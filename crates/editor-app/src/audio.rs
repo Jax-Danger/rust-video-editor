@@ -510,6 +510,9 @@ fn collect_filtered(
         if !resolved.is_file() {
             continue;
         }
+        if clip.speed.mutes_audio() {
+            continue;
+        }
         let at_in = source_frame_at(clip, clip.timeline_in, sequence.timebase);
         let at_next = source_frame_at(clip, Frame(clip.timeline_in.0 + 1), sequence.timebase);
         let mut seconds_per_frame =
