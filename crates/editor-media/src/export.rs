@@ -17,6 +17,8 @@ use editor_core::{
 };
 
 use crate::composite::{active_captions, program_stack, ProgramLayer};
+#[cfg(feature = "ffmpeg")]
+use crate::composite::{compose_layers, LayerSource};
 
 /// One audible region. Times are sequence frames; `source_at_in` is seconds
 /// into the media at `timeline_in`.
@@ -533,30 +535,14 @@ fn render_frame(
     plan: &RasterPlan,
     cache: &mut DecodeCache,
 ) -> Result<Vec<u8>, String> {
-    let mut owned = Vec::with_capacity(frame.layers.len());
-    for layer in &frame.layers {
-        if !layer.place.contributes() {
-            continue;
-        }
-        owned.push((cache.load(layer)?, layer));
-    }
-    let blits: Vec<crate::composite::BlitLayer<'_>> = owned
-        .iter()
-        .map(|(pixels, layer)| crate::composite::BlitLayer {
-            rgba: pixels,
-            width: layer.width,
-            height: layer.height,
-            grade: layer.grade,
-            place: layer.place,
-        })
-        .collect();
-    let mut rgba = crate::composite::composite(
+    let mut rgba = compose_layers(
         plan.width,
         plan.height,
         plan.seq_width,
         plan.seq_height,
-        &blits,
-    );
+        &frame.layers,
+        |layer| cache.load(layer).map(|pixels| pixels.to_vec()),
+    )?;
     crate::composite::burn_captions(&mut rgba, plan.width, plan.height, &frame.captions);
     Ok(rgba)
 }
@@ -571,39 +557,38 @@ struct DecodeCache {
 #[cfg(feature = "ffmpeg")]
 impl DecodeCache {
     fn load(&mut self, layer: &ProgramLayer) -> Result<std::sync::Arc<[u8]>, String> {
-        let key = (
-            layer.path.clone(),
-            layer.width,
-            layer.height,
-            layer.source_frame,
-        );
+        let LayerSource::Media {
+            path,
+            source_frame,
+            time_secs,
+            frame_secs: _,
+            last_source_frame: _,
+        } = &layer.source
+        else {
+            return Err(format!("{} is a title and is not decoded", layer.label));
+        };
+        let key = (path.clone(), layer.width, layer.height, *source_frame);
         if let Some(hit) = self.map.get(&key) {
             return Ok(hit.clone());
         }
         let count = 8.min(crate::MAX_BURST);
-        let request = crate::FrameRequest::new(
-            &layer.path,
-            layer.time_secs,
-            layer.width,
-            layer.height,
-            count,
-        )
-        .map_err(|err| err.to_string())?;
+        let request = crate::FrameRequest::new(path, *time_secs, layer.width, layer.height, count)
+            .map_err(|err| err.to_string())?;
         let decoded = crate::decode_frames(&request).map_err(|err| err.to_string())?;
         if decoded.is_empty() {
-            return Err(format!("ffmpeg returned no frame for {}", layer.path));
+            return Err(format!("ffmpeg returned no frame for {path}"));
         }
         let mut first = None;
         for (offset, frame) in decoded.into_iter().enumerate() {
-            let src = layer.source_frame.saturating_add(offset as i64);
-            let key = (layer.path.clone(), layer.width, layer.height, src);
+            let src = source_frame.saturating_add(offset as i64);
+            let key = (path.clone(), layer.width, layer.height, src);
             let pixels: std::sync::Arc<[u8]> = std::sync::Arc::from(frame.rgba.into_boxed_slice());
             if offset == 0 {
                 first = Some(pixels.clone());
             }
             self.insert(key, pixels);
         }
-        first.ok_or_else(|| format!("ffmpeg returned no frame for {}", layer.path))
+        first.ok_or_else(|| format!("ffmpeg returned no frame for {path}"))
     }
 
     fn insert(&mut self, key: (String, u32, u32, i64), pixels: std::sync::Arc<[u8]>) {
@@ -1334,7 +1319,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(script.raster.frames.len(), 1);
-        assert_eq!(script.raster.frames[0].layers.len(), 2);
+        assert_eq!(script.raster.frames[0].layers.len(), 3);
+        assert!(script.raster.frames[0].layers[2].is_title());
         assert!(script.raster.frames[0]
             .captions
             .iter()

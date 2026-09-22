@@ -1,7 +1,7 @@
 use editor_core::{
-    clip_relative, color_grade, set_clip_gain_at, set_grade_at, set_transform_at, toggle_grade_key,
-    toggle_transform_key, toggle_volume_key, transform, ClipId, GradeParam, TrackKind,
-    TransformParam,
+    clip_relative, color_grade, set_clip_gain_at, set_clip_title, set_grade_at, set_transform_at,
+    toggle_grade_key, toggle_transform_key, toggle_volume_key, transform, ClipId, GradeParam,
+    TextAlign, Title, TrackKind, TransformParam,
 };
 use egui::RichText;
 
@@ -56,20 +56,33 @@ fn inspector_body(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId, sna
                 .monospace()
                 .color(THEME.text_dim),
             );
-            ui.label(
-                RichText::new(format!(
-                    "Source {} – {}    head {}    tail {}",
-                    format_tc(snapshot.source_in, snapshot.media_tb),
-                    format_tc(snapshot.source_out, snapshot.media_tb),
-                    snapshot.head_handle,
-                    snapshot.tail_handle
-                ))
-                .size(11.0)
-                .monospace()
-                .color(THEME.text_mute),
-            );
+            if snapshot.is_title {
+                ui.label(
+                    RichText::new("Title generator")
+                        .size(11.0)
+                        .monospace()
+                        .color(THEME.text_mute),
+                );
+            } else {
+                ui.label(
+                    RichText::new(format!(
+                        "Source {} – {}    head {}    tail {}",
+                        format_tc(snapshot.source_in, snapshot.media_tb),
+                        format_tc(snapshot.source_out, snapshot.media_tb),
+                        snapshot.head_handle,
+                        snapshot.tail_handle
+                    ))
+                    .size(11.0)
+                    .monospace()
+                    .color(THEME.text_mute),
+                );
+            }
         });
     });
+
+    if snapshot.is_title {
+        title_controls(ui, app, clip_id);
+    }
 
     let rel = clip_relative(
         editor_core::Frame(app.playhead),
@@ -277,6 +290,7 @@ struct ClipSnap {
     name: String,
     track_name: String,
     kind: TrackKind,
+    is_title: bool,
     timeline_in: i64,
     timeline_out: i64,
     source_in: i64,
@@ -287,6 +301,168 @@ struct ClipSnap {
     media_tb: editor_core::Timebase,
 }
 
+fn title_controls(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId) {
+    let Some(title) = clip_title(app, clip_id) else {
+        return;
+    };
+    ui.add_space(8.0);
+    widgets::section_label(ui, "Title");
+    let mut text = title.text.clone();
+    let response = ui.add(
+        egui::TextEdit::multiline(&mut text)
+            .desired_rows(3)
+            .desired_width(f32::INFINITY),
+    );
+    app.note_text_focus(&response);
+    if response.gained_focus() {
+        app.session.begin_interactive("Title text");
+    }
+    if response.changed() {
+        let mut next = title.clone();
+        next.text = text;
+        write_title(app, clip_id, next, "Title text");
+    }
+    if response.lost_focus() {
+        app.session.end_interactive();
+    }
+
+    let title = clip_title(app, clip_id).unwrap_or(title);
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Align").size(12.0).color(THEME.text));
+        for (align, label) in [
+            (TextAlign::Left, "Left"),
+            (TextAlign::Center, "Center"),
+            (TextAlign::Right, "Right"),
+        ] {
+            if ui.selectable_label(title.align == align, label).clicked() && title.align != align {
+                let mut next = title.clone();
+                next.align = align;
+                write_title(app, clip_id, next, "Title align");
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Colour").size(12.0).color(THEME.text));
+        let mut color = egui::Color32::from_rgba_unmultiplied(
+            (title.color[0] * 255.0).round() as u8,
+            (title.color[1] * 255.0).round() as u8,
+            (title.color[2] * 255.0).round() as u8,
+            (title.color[3] * 255.0).round() as u8,
+        );
+        let response = ui.color_edit_button_srgba(&mut color);
+        if response.drag_started() {
+            app.session.begin_interactive("Title colour");
+        }
+        if response.changed() {
+            let mut next = clip_title(app, clip_id).unwrap_or(title.clone());
+            next.color = [
+                color.r() as f32 / 255.0,
+                color.g() as f32 / 255.0,
+                color.b() as f32 / 255.0,
+                color.a() as f32 / 255.0,
+            ];
+            write_title(app, clip_id, next, "Title colour");
+        }
+        if response.drag_stopped() {
+            app.session.end_interactive();
+        }
+    });
+
+    let title = clip_title(app, clip_id).unwrap_or(title);
+    title_slider(
+        ui,
+        app,
+        clip_id,
+        &title,
+        "Size %",
+        title.font_size * 100.0,
+        2.0..=18.0,
+        |value| value / 100.0,
+        |title, value| title.font_size = value,
+    );
+    title_slider(
+        ui,
+        app,
+        clip_id,
+        &title,
+        "Position X",
+        title.x,
+        0.0..=1.0,
+        |value| value,
+        |title, value| {
+            title.x = value;
+        },
+    );
+    title_slider(
+        ui,
+        app,
+        clip_id,
+        &title,
+        "Position Y",
+        title.y,
+        0.0..=1.0,
+        |value| value,
+        |title, value| {
+            title.y = value;
+        },
+    );
+    title_slider(
+        ui,
+        app,
+        clip_id,
+        &title,
+        "Plate",
+        title.plate,
+        0.0..=1.0,
+        |value| value,
+        |title, value| {
+            title.plate = value;
+        },
+    );
+}
+
+fn title_slider(
+    ui: &mut egui::Ui,
+    app: &mut MeridianApp,
+    clip_id: ClipId,
+    title: &Title,
+    label: &str,
+    shown: f32,
+    range: std::ops::RangeInclusive<f32>,
+    store: impl Fn(f32) -> f32,
+    assign: impl Fn(&mut Title, f32),
+) {
+    let edit = widgets::value_slider(ui, label, shown, range);
+    if edit.started {
+        app.session.begin_interactive(label);
+    }
+    if edit.changed {
+        let mut next = clip_title(app, clip_id).unwrap_or_else(|| title.clone());
+        assign(&mut next, store(edit.value));
+        write_title(app, clip_id, next, label);
+    }
+    if edit.stopped {
+        app.session.end_interactive();
+    }
+}
+
+fn clip_title(app: &MeridianApp, id: ClipId) -> Option<Title> {
+    app.session.project().active()?.clip(id)?.title.clone()
+}
+
+fn write_title(app: &mut MeridianApp, clip_id: ClipId, title: Title, label: &str) {
+    let result = app.session.edit(label, |project| {
+        let sequence = project
+            .active_sequence
+            .ok_or(editor_core::EditError::NoActiveSequence)?;
+        set_clip_title(project, sequence, clip_id, title)
+    });
+    if let Err(err) = result {
+        app.status = err.to_string();
+    }
+}
+
 fn clip_snapshot(app: &MeridianApp, id: ClipId) -> Option<ClipSnap> {
     let sequence = app.session.project().active()?;
     let (ti, _) = sequence.locate_clip(id)?;
@@ -295,6 +471,7 @@ fn clip_snapshot(app: &MeridianApp, id: ClipId) -> Option<ClipSnap> {
         name: clip.name.clone(),
         track_name: sequence.tracks[ti].name.clone(),
         kind: sequence.tracks[ti].kind,
+        is_title: clip.is_title(),
         timeline_in: clip.timeline_in.0,
         timeline_out: clip.timeline_out.0,
         source_in: clip.source_in.0,

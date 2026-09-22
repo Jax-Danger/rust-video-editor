@@ -10,8 +10,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use crate::composite::{
-    active_captions, burn_captions, composite, mask_window, program_stack, transition_motion,
-    BlitLayer, GradeSample, MaskWindow, PictureCache, Place,
+    active_captions, burn_captions, compose_layers, mask_window, program_stack, transition_motion,
+    GradeSample, LayerSource, MaskWindow, PictureCache, Place, ProgramLayer,
 };
 use editor_core::{
     clip_relative, color_grade, transform, ColorGrade, Frame, MediaAsset, TrackKind, Transform,
@@ -20,7 +20,7 @@ use editor_media::{fit_preview_size, PreviewBackend};
 use egui::{Color32, FontId, Painter, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 
 use crate::app::{MeridianApp, ScrubSource};
-use crate::preview::{FrameView, PreviewImage, PreviewQuery};
+use crate::preview::{FrameKey, FrameView, PreviewImage, PreviewQuery};
 use crate::theme::THEME;
 use crate::ui::format_tc;
 use crate::ui::widgets;
@@ -71,8 +71,16 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
             } else {
                 let mut ready = Vec::new();
                 let mut waiting = false;
-                for layer in &plan.layers {
-                    match app.preview.request(layer.query.clone()) {
+                let media: Vec<&PlanLayer> = plan
+                    .layers
+                    .iter()
+                    .filter(|layer| layer.is_media())
+                    .collect();
+                for layer in &media {
+                    let PlanPixels::Media(query) = &layer.pixels else {
+                        continue;
+                    };
+                    match app.preview.request(query.clone()) {
                         FrameView::Exact(image) | FrameView::Nearby(image) => ready.push(image),
                         FrameView::Pending => waiting = true,
                         FrameView::Failed(message) => banner = Some(message),
@@ -81,42 +89,40 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
                         }
                     }
                 }
-                if banner.is_none() && ready.len() == plan.layers.len() {
+                let titles_only = media.is_empty();
+                if banner.is_none() && (titles_only || ready.len() == media.len()) {
                     let signature = plan.signature(playhead);
                     if app
                         .picture_cache
                         .as_ref()
                         .is_none_or(|cache| cache.signature != signature)
                     {
-                        let blits: Vec<BlitLayer<'_>> = ready
-                            .iter()
-                            .zip(plan.layers.iter())
-                            .map(|(image, layer)| BlitLayer {
-                                rgba: &image.rgba,
-                                width: image.width,
-                                height: image.height,
-                                grade: layer.grade.clone(),
-                                place: layer.place,
-                            })
-                            .collect();
-                        let mut rgba = composite(
-                            plan.canvas_w,
-                            plan.canvas_h,
+                        match compose_plan(
+                            &plan,
                             sequence.width as f32,
                             sequence.height as f32,
-                            &blits,
-                        );
-                        burn_captions(&mut rgba, plan.canvas_w, plan.canvas_h, &plan.captions);
-                        app.picture_cache = Some(PictureCache {
-                            signature,
-                            width: plan.canvas_w,
-                            height: plan.canvas_h,
-                            rgba,
-                        });
+                            &ready,
+                        ) {
+                            Ok(mut rgba) => {
+                                burn_captions(
+                                    &mut rgba,
+                                    plan.canvas_w,
+                                    plan.canvas_h,
+                                    &plan.captions,
+                                );
+                                app.picture_cache = Some(PictureCache {
+                                    signature,
+                                    width: plan.canvas_w,
+                                    height: plan.canvas_h,
+                                    rgba,
+                                });
+                            }
+                            Err(message) => banner = Some(message),
+                        }
                     }
                     if let Some(cache) = &app.picture_cache {
                         picture = Some(PreviewImage {
-                            key: crate::preview::FrameKey {
+                            key: FrameKey {
                                 path: format!("composite-{signature}"),
                                 source_frame: playhead,
                                 width: cache.width,
@@ -131,7 +137,7 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
                 } else if banner.is_none() && waiting {
                     if let Some(cache) = &app.picture_cache {
                         picture = Some(PreviewImage {
-                            key: crate::preview::FrameKey {
+                            key: FrameKey {
                                 path: format!("composite-{}", cache.signature),
                                 source_frame: playhead,
                                 width: cache.width,
@@ -241,15 +247,34 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
                 .iter()
                 .find(|c| c.covers(Frame(playhead)) && c.enabled)
             {
-                paint_clip(
-                    &painter,
-                    frame,
-                    sequence.width as f32,
-                    sequence.height as f32,
-                    clip,
-                    1.0,
-                    playhead,
-                );
+                if clip.is_title() {
+                    if let Some(layer) = plan
+                        .layers
+                        .iter()
+                        .find(|layer| layer.clip_id == clip.id.0 && !layer.is_media())
+                    {
+                        paint_title_plate(
+                            &painter,
+                            app,
+                            frame,
+                            layer,
+                            plan.canvas_w,
+                            plan.canvas_h,
+                            sequence.width as f32,
+                            sequence.height as f32,
+                        );
+                    }
+                } else {
+                    paint_clip(
+                        &painter,
+                        frame,
+                        sequence.width as f32,
+                        sequence.height as f32,
+                        clip,
+                        1.0,
+                        playhead,
+                    );
+                }
             }
         }
     } else if let Some((texture, width, height)) = texture {
@@ -492,12 +517,33 @@ fn audio_meters(ui: &mut egui::Ui, peaks: [f32; 2], badge: &str, status: &str) {
 }
 
 struct DecodePlan {
-    layers: Vec<DecodedLayer>,
+    layers: Vec<PlanLayer>,
     problem: Option<String>,
     chip: String,
     canvas_w: u32,
     canvas_h: u32,
     captions: Vec<String>,
+}
+
+enum PlanPixels {
+    Media(PreviewQuery),
+    Title(editor_core::Title),
+}
+
+struct PlanLayer {
+    pixels: PlanPixels,
+    grade: GradeSample,
+    place: Place,
+    label: String,
+    width: u32,
+    height: u32,
+    clip_id: u64,
+}
+
+impl PlanLayer {
+    fn is_media(&self) -> bool {
+        matches!(self.pixels, PlanPixels::Media(_))
+    }
 }
 
 impl DecodePlan {
@@ -507,10 +553,33 @@ impl DecodePlan {
         self.canvas_w.hash(&mut hasher);
         self.canvas_h.hash(&mut hasher);
         for layer in &self.layers {
-            layer.query.path.hash(&mut hasher);
-            layer.query.source_frame.hash(&mut hasher);
-            layer.query.width.hash(&mut hasher);
-            layer.query.height.hash(&mut hasher);
+            layer.clip_id.hash(&mut hasher);
+            layer.width.hash(&mut hasher);
+            layer.height.hash(&mut hasher);
+            match &layer.pixels {
+                PlanPixels::Media(query) => {
+                    0u8.hash(&mut hasher);
+                    query.path.hash(&mut hasher);
+                    query.source_frame.hash(&mut hasher);
+                }
+                PlanPixels::Title(title) => {
+                    1u8.hash(&mut hasher);
+                    title.text.hash(&mut hasher);
+                    bits(title.font_size).hash(&mut hasher);
+                    for channel in title.color {
+                        bits(channel).hash(&mut hasher);
+                    }
+                    match title.align {
+                        editor_core::TextAlign::Left => 0u8,
+                        editor_core::TextAlign::Center => 1u8,
+                        editor_core::TextAlign::Right => 2u8,
+                    }
+                    .hash(&mut hasher);
+                    bits(title.x).hash(&mut hasher);
+                    bits(title.y).hash(&mut hasher);
+                    bits(title.plate).hash(&mut hasher);
+                }
+            }
             bits(layer.grade.exposure).hash(&mut hasher);
             bits(layer.grade.contrast).hash(&mut hasher);
             bits(layer.grade.highlights).hash(&mut hasher);
@@ -563,13 +632,6 @@ impl DecodePlan {
     }
 }
 
-struct DecodedLayer {
-    query: PreviewQuery,
-    grade: GradeSample,
-    place: Place,
-    label: String,
-}
-
 fn bits(value: f32) -> u32 {
     value.to_bits()
 }
@@ -610,21 +672,36 @@ fn decode_plan(
         .layers
         .into_iter()
         .filter(|layer| layer.place.contributes())
-        .map(|layer| DecodedLayer {
-            query: PreviewQuery {
-                path: layer.path,
-                source_frame: layer.source_frame,
+        .map(|layer| {
+            let pixels = match layer.source {
+                LayerSource::Media {
+                    path,
+                    source_frame,
+                    time_secs,
+                    frame_secs,
+                    last_source_frame,
+                } => PlanPixels::Media(PreviewQuery {
+                    path,
+                    source_frame,
+                    width: layer.width,
+                    height: layer.height,
+                    time_secs,
+                    frame_secs,
+                    last_source_frame,
+                    burst,
+                    lead,
+                }),
+                LayerSource::Title(title) => PlanPixels::Title(title),
+            };
+            PlanLayer {
+                pixels,
+                grade: layer.grade,
+                place: layer.place,
+                label: layer.label,
                 width: layer.width,
                 height: layer.height,
-                time_secs: layer.time_secs,
-                frame_secs: layer.frame_secs,
-                last_source_frame: layer.last_source_frame,
-                burst,
-                lead,
-            },
-            grade: layer.grade,
-            place: layer.place,
-            label: layer.label,
+                clip_id: layer.clip_id,
+            }
         })
         .collect();
     DecodePlan {
@@ -635,6 +712,112 @@ fn decode_plan(
         canvas_h,
         captions: active_captions(sequence, playhead),
     }
+}
+
+fn compose_plan(
+    plan: &DecodePlan,
+    seq_w: f32,
+    seq_h: f32,
+    media: &[PreviewImage],
+) -> Result<Vec<u8>, String> {
+    let programs: Vec<ProgramLayer> = plan.layers.iter().map(program_from_plan).collect();
+    let mut cursor = 0;
+    compose_layers(
+        plan.canvas_w,
+        plan.canvas_h,
+        seq_w,
+        seq_h,
+        &programs,
+        |_| {
+            let image = media
+                .get(cursor)
+                .ok_or_else(|| "missing decoded frame".to_string())?;
+            cursor += 1;
+            Ok(image.rgba.to_vec())
+        },
+    )
+}
+
+fn program_from_plan(layer: &PlanLayer) -> ProgramLayer {
+    let source = match &layer.pixels {
+        PlanPixels::Media(query) => LayerSource::Media {
+            path: query.path.clone(),
+            source_frame: query.source_frame,
+            time_secs: query.time_secs,
+            frame_secs: query.frame_secs,
+            last_source_frame: query.last_source_frame,
+        },
+        PlanPixels::Title(title) => LayerSource::Title(title.clone()),
+    };
+    ProgramLayer {
+        source,
+        width: layer.width,
+        height: layer.height,
+        grade: layer.grade.clone(),
+        place: layer.place,
+        label: layer.label.clone(),
+        clip_id: layer.clip_id,
+    }
+}
+
+fn paint_title_plate(
+    painter: &Painter,
+    app: &mut MeridianApp,
+    frame: Rect,
+    layer: &PlanLayer,
+    canvas_w: u32,
+    canvas_h: u32,
+    seq_w: f32,
+    seq_h: f32,
+) {
+    let program = program_from_plan(layer);
+    let Ok(rgba) = compose_layers(canvas_w, canvas_h, seq_w, seq_h, &[program], |_| {
+        Err("title plate has no picture".into())
+    }) else {
+        return;
+    };
+    let image = PreviewImage {
+        key: FrameKey {
+            path: format!("title-{}", title_signature(layer)),
+            source_frame: 0,
+            width: canvas_w,
+            height: canvas_h,
+        },
+        width: canvas_w,
+        height: canvas_h,
+        rgba: std::sync::Arc::from(rgba.into_boxed_slice()),
+    };
+    let texture = app.preview.texture(painter.ctx(), &image);
+    paint_decoded(painter, frame, texture, canvas_w, canvas_h, 1.0);
+}
+
+fn title_signature(layer: &PlanLayer) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    layer.clip_id.hash(&mut hasher);
+    layer.width.hash(&mut hasher);
+    layer.height.hash(&mut hasher);
+    if let PlanPixels::Title(title) = &layer.pixels {
+        title.text.hash(&mut hasher);
+        bits(title.font_size).hash(&mut hasher);
+        for channel in title.color {
+            bits(channel).hash(&mut hasher);
+        }
+        bits(title.x).hash(&mut hasher);
+        bits(title.y).hash(&mut hasher);
+        bits(title.plate).hash(&mut hasher);
+        match title.align {
+            editor_core::TextAlign::Left => 0u8,
+            editor_core::TextAlign::Center => 1u8,
+            editor_core::TextAlign::Right => 2u8,
+        }
+        .hash(&mut hasher);
+    }
+    bits(layer.place.opacity).hash(&mut hasher);
+    bits(layer.place.pos_x).hash(&mut hasher);
+    bits(layer.place.pos_y).hash(&mut hasher);
+    bits(layer.place.scale_x).hash(&mut hasher);
+    bits(layer.place.scale_y).hash(&mut hasher);
+    hasher.finish()
 }
 
 fn paint_decoded(

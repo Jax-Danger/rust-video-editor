@@ -14,7 +14,8 @@ use crate::caption::CaptionDraft;
 use crate::effects::{color_grade_mut, transform_mut, GradeParam, TransformParam};
 use crate::model::{
     CaptionCue, Clip, ClipId, CueId, Marker, MarkerId, MediaAsset, MediaId, Project, Sequence,
-    SequenceId, TrackId, TrackKind, Transition, TransitionAlign, TransitionId, TransitionKind,
+    SequenceId, Title, TrackId, TrackKind, Transition, TransitionAlign, TransitionId,
+    TransitionKind,
 };
 use crate::time::{convert_frames, mul_div_round, Frame, Timebase};
 
@@ -36,6 +37,8 @@ pub enum EditError {
     WrongTrackKind,
     #[error("clip duration must be at least one frame")]
     InvalidDuration,
+    #[error("clip is not a title")]
+    NotATitle,
     #[error("edit is outside the timeline")]
     OutOfRange,
     #[error("playhead is not inside a clip")]
@@ -1240,7 +1243,110 @@ pub fn clip_from_media(
             crate::model::LabelColor::Green
         },
         volume: crate::effects::AnimatedF32::constant(1.0),
+        title: None,
     })
+}
+
+/// Place a five-second title generator at `at` on the highest video track that
+/// has room. If every video track is busy, a new video track is added on top.
+pub fn add_title(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    at: Frame,
+    text: &str,
+) -> Result<ClipId, EditError> {
+    if at.0 < 0 {
+        return Err(EditError::OutOfRange);
+    }
+    let text = {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            "Title"
+        } else {
+            trimmed
+        }
+    };
+    let timebase = project
+        .sequence(sequence_id)
+        .ok_or(EditError::SequenceNotFound)?
+        .timebase;
+    let mut duration = (timebase.fps_f64() * 5.0).round() as i64;
+    if duration < 1 {
+        duration = 1;
+    }
+    let end = at.0.saturating_add(duration);
+    let track_id = ensure_title_track(project, sequence_id, at.0, end)?;
+    let id = ClipId(project.alloc());
+    let clip = Clip::generator(id.0, at.0, end, timebase, Title::new(text));
+    overwrite_clips(project, sequence_id, vec![(track_id, clip)])?;
+    Ok(id)
+}
+
+/// Replace the generator payload on a title clip and keep the timeline name
+/// in sync with the first line.
+pub fn set_clip_title(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    clip_id: ClipId,
+    title: Title,
+) -> Result<(), EditError> {
+    map_sequence(project, sequence_id, |sequence, _alloc| {
+        let (ti, ci) = sequence
+            .locate_clip(clip_id)
+            .ok_or(EditError::ClipNotFound)?;
+        let clip = &mut sequence.tracks[ti].clips[ci];
+        if clip.title.is_none() {
+            return Err(EditError::NotATitle);
+        }
+        let title = title.sanitized();
+        clip.name = title.timeline_name();
+        clip.title = Some(title);
+        Ok(())
+    })
+}
+
+fn ensure_title_track(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    start: i64,
+    end: i64,
+) -> Result<TrackId, EditError> {
+    let sequence = project
+        .sequence(sequence_id)
+        .ok_or(EditError::SequenceNotFound)?;
+    let videos: Vec<(TrackId, bool)> = sequence
+        .tracks
+        .iter()
+        .filter(|track| track.kind == TrackKind::Video && !track.locked)
+        .map(|track| {
+            let busy = track
+                .clips
+                .iter()
+                .any(|clip| clip.timeline_in.0 < end && clip.timeline_out.0 > start);
+            (track.id, busy)
+        })
+        .collect();
+    if let Some((id, _)) = videos.iter().rev().find(|(_, busy)| !*busy) {
+        return Ok(*id);
+    }
+    let count = sequence
+        .tracks
+        .iter()
+        .filter(|track| track.kind == TrackKind::Video)
+        .count();
+    let id = TrackId(project.alloc());
+    let track = crate::model::Track::new(id, TrackKind::Video, format!("V{}", count + 1));
+    let sequence = project
+        .sequence_mut(sequence_id)
+        .ok_or(EditError::SequenceNotFound)?;
+    let insert_at = sequence
+        .tracks
+        .iter()
+        .rposition(|item| item.kind == TrackKind::Video)
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    sequence.tracks.insert(insert_at, track);
+    Ok(id)
 }
 
 pub fn link_clips(a: &mut Clip, b: &mut Clip) {
@@ -2122,5 +2228,64 @@ mod tests {
         assert!(media.has_video && media.has_audio);
         assert!(!media.offline);
         assert_eq!(media.duration, Frame(240));
+    }
+
+    #[test]
+    fn title_round_trips_and_old_clips_stay_untitled() {
+        let clip = Clip::basic(1, 0, 24);
+        let json = serde_json::to_string(&clip).unwrap();
+        assert!(!json.contains("title"));
+        let loaded: Clip = serde_json::from_str(&json).unwrap();
+        assert!(loaded.title.is_none());
+
+        let mut titled = Clip::generator(7, 0, 48, Timebase::fps_24(), Title::new("Hello\nthere"));
+        titled.title.as_mut().unwrap().align = crate::model::TextAlign::Left;
+        let json = serde_json::to_string(&titled).unwrap();
+        let loaded: Clip = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded, titled);
+        assert_eq!(loaded.name, "Hello");
+        assert_eq!(loaded.title.unwrap().text, "Hello\nthere");
+    }
+
+    #[test]
+    fn add_title_uses_a_free_video_track_and_can_be_edited() {
+        let (sequence, track) = video_sequence();
+        let mut project = project_with(sequence);
+        sequence_busy(&mut project, track);
+        let id = add_title(&mut project, SequenceId(1), Frame(0), "  Lower third  ").unwrap();
+        let clip = project.active().unwrap().clip(id).unwrap();
+        assert!(clip.is_title());
+        assert_eq!(clip.name, "Lower third");
+        assert_eq!(clip.timeline_in, Frame(0));
+        assert!(clip.duration() >= 24);
+        assert_ne!(
+            project.active().unwrap().locate_clip(id).unwrap().0,
+            0,
+            "a busy V1 should not be overwritten"
+        );
+        let mut title = clip.title.clone().unwrap();
+        title.text = "Updated".into();
+        title.font_size = 0.09;
+        title.x = 0.25;
+        set_clip_title(&mut project, SequenceId(1), id, title).unwrap();
+        let clip = project.active().unwrap().clip(id).unwrap();
+        assert_eq!(clip.name, "Updated");
+        assert!((clip.title.as_ref().unwrap().font_size - 0.09).abs() < 1.0e-5);
+        let picture = project.active().unwrap().clip(ClipId(1));
+        assert!(picture.is_some(), "the picture clip stays");
+        let json = project.to_json_pretty().unwrap();
+        let loaded = Project::from_json(&json).unwrap();
+        assert_eq!(
+            loaded.active().unwrap().clip(id).unwrap().title,
+            project.active().unwrap().clip(id).unwrap().title
+        );
+        assert!(
+            set_clip_title(&mut project, SequenceId(1), ClipId(1), Title::new("nope")).is_err()
+        );
+    }
+
+    fn sequence_busy(project: &mut Project, track: TrackId) {
+        let clip = Clip::basic(1, 0, 200);
+        overwrite_clips(project, SequenceId(1), vec![(track, clip)]).unwrap();
     }
 }

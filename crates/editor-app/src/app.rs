@@ -1,10 +1,10 @@
 //! Application state, commands, and workspace layout.
 
 use editor_core::{
-    add_transition, builtin_templates, clip_from_media, expand_linked, link_clips, plan_export,
-    replace_captions, Bin, BinId, BusState, CaptionTranscriber, ClipId, CueId, Direction,
-    EditError, ExportRange, Frame, MediaAsset, MediaId, Project, Session, Timebase, Track,
-    TrackFlag, TrackId, TrackKind, TransitionKind, TrimEdge,
+    add_title, add_transition, builtin_templates, clip_from_media, expand_linked, link_clips,
+    plan_export, replace_captions, Bin, BinId, BusState, CaptionTranscriber, ClipId, CueId,
+    Direction, EditError, ExportRange, Frame, MediaAsset, MediaId, Project, Session, Timebase,
+    Track, TrackFlag, TrackId, TrackKind, TransitionKind, TrimEdge,
 };
 use editor_media::{duration_frames, probe, resolve_media_path};
 use egui::{Event, Key, Modifiers, RichText, ViewportCommand};
@@ -652,6 +652,27 @@ impl MeridianApp {
             Ok(()) => self.status = format!("{} {delta:+}", self.tool.label()),
             Err(err) => self.status = err.to_string(),
         }
+    }
+
+    pub fn add_title(&mut self) {
+        let playhead = self.playhead.max(0);
+        let created = std::cell::Cell::new(None);
+        let result = self.session.edit("New Title", |project| {
+            let sequence = project.active_sequence.ok_or(EditError::NoActiveSequence)?;
+            let id = add_title(project, sequence, Frame(playhead), "Title")?;
+            created.set(Some(id));
+            Ok(())
+        });
+        self.status = match result {
+            Ok(()) => {
+                if let Some(id) = created.get() {
+                    self.selected = vec![id];
+                    self.selected_cue = None;
+                }
+                format!("Title at {}.", format_tc(playhead, self.timebase()))
+            }
+            Err(err) => err.to_string(),
+        };
     }
 
     pub fn place_selected_media(&mut self, insert: bool) {
@@ -1572,6 +1593,10 @@ impl MeridianApp {
                         }
                         if ui.button("Import from Path…").clicked() {
                             open_import(self);
+                            ui.close_menu();
+                        }
+                        if ui.button("New Title").clicked() {
+                            self.add_title();
                             ui.close_menu();
                         }
                         ui.separator();

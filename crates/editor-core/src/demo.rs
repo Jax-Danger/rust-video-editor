@@ -3,7 +3,7 @@
 use crate::effects::{AnimatedF32, ColorGrade, Effect, Transform};
 use crate::model::{
     Bin, BinId, CaptionCue, Clip, ClipId, CueId, LabelColor, Marker, MarkerId, MediaAsset, MediaId,
-    Project, Sequence, SequenceId, Track, TrackId, TrackKind, Transition, TransitionAlign,
+    Project, Sequence, SequenceId, Title, Track, TrackId, TrackKind, Transition, TransitionAlign,
     TransitionId, TransitionKind,
 };
 use crate::time::{Frame, Timebase};
@@ -138,7 +138,7 @@ pub fn demo_project() -> Project {
 
     let mut v1 = Track::new(TrackId(201), TrackKind::Video, "V1");
     let mut v2 = Track::new(TrackId(202), TrackKind::Video, "V2");
-    let v3 = Track::new(TrackId(203), TrackKind::Video, "V3");
+    let mut v3 = Track::new(TrackId(203), TrackKind::Video, "V3");
     let mut a1 = Track::new(TrackId(211), TrackKind::Audio, "A1");
     let mut a2 = Track::new(TrackId(212), TrackKind::Audio, "A2");
     let a3 = Track::new(TrackId(213), TrackKind::Audio, "A3");
@@ -172,10 +172,15 @@ pub fn demo_project() -> Project {
     let mut aerial = placed(304, 12, "AERIAL", 36, 108, 0, 72, 192, LabelColor::Violet);
     aerial.effects.push(Effect::Transform(aerial_transform()));
 
+    let mut opening = Title::lower_third("NORTHLINE");
+    opening.color = [0.96, 0.93, 0.86, 1.0];
+    let title = Clip::generator(305, 0, 120, tb, opening);
+
     let score = placed(314, 13, "SCORE", 0, 408, 0, 408, 720, LabelColor::Blue);
 
     v1.clips = vec![intv_a, city, intv_b];
     v2.clips = vec![aerial];
+    v3.clips = vec![title];
     a1.clips = vec![intv_a_audio, city_audio, intv_b_audio];
     a2.clips = vec![score];
 
@@ -272,6 +277,7 @@ fn placed(
         effects: Vec::new(),
         label,
         volume: AnimatedF32::constant(1.0),
+        title: None,
     }
 }
 
@@ -343,6 +349,14 @@ mod tests {
         assert_eq!(dissolve.range(Frame(144)), (Frame(138), Frame(150)));
         assert!(v1.clips[0].tail_handle() > 6);
         assert!(v1.clips[1].head_handle() >= 6);
+        let title = sequence.tracks[2]
+            .clips
+            .iter()
+            .find(|clip| clip.is_title())
+            .expect("opening title");
+        assert_eq!(title.name, "NORTHLINE");
+        assert!(title.covers(Frame(24)));
+        assert!(title.title.as_ref().unwrap().text.contains("NORTHLINE"));
         let json = project.to_json_pretty().unwrap();
         let loaded = Project::from_json(&json).unwrap();
         assert_eq!(loaded, project);
