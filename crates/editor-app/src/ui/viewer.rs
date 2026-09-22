@@ -10,15 +10,16 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use crate::composite::{
-    active_captions, burn_captions, compose_layers, mask_window, transition_motion, FilterSample,
-    GradeSample, LayerSource, MaskWindow, PictureCache, Place, ProgramLayer,
+    active_captions, burn_captions, compose_layers, compose_layers_env, mask_window,
+    media_layers_in_stack, transition_motion, ComposeEnv, FilterSample, GradeSample, LayerSource,
+    MaskWindow, PictureCache, Place, ProgramLayer,
 };
 use editor_core::{
     active_angle, clip_relative, color_grade, multicam_target, source_frame_at, transform,
     ColorGrade, Frame, MediaAsset, MulticamGroup, TrackKind, Transform,
 };
 use editor_media::{fit_preview_size, PreviewBackend};
-use egui::{Color32, FontId, Painter, Pos2, Rect, Sense, Shape, Stroke, Vec2};
+use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 
 use crate::app::{MeridianApp, ScrubSource};
 use crate::preview::{FrameKey, FrameView, PreviewImage, PreviewQuery};
@@ -50,10 +51,12 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
     let audio_status = app.audio.status().to_string();
     let media = app.session.project().media.clone();
     let groups = app.session.project().multicam_groups.clone();
+    let sequences = app.session.project().sequences.clone();
     let prefer_proxies = app.session.project().prefer_proxies;
     let bank = angle_bank(&sequence, &groups, &app.selected, playhead);
     let plan = decode_plan(
         &sequence,
+        &sequences,
         playhead,
         &media,
         &groups,
@@ -84,15 +87,7 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
             } else {
                 let mut ready = Vec::new();
                 let mut waiting = false;
-                let media: Vec<&PlanLayer> = plan
-                    .layers
-                    .iter()
-                    .filter(|layer| layer.is_media())
-                    .collect();
-                for layer in &media {
-                    let PlanPixels::Media(query) = &layer.pixels else {
-                        continue;
-                    };
+                for query in &plan.media_queries {
                     match app.preview.request(query.clone()) {
                         FrameView::Exact(image) | FrameView::Nearby(image) => ready.push(image),
                         FrameView::Pending => waiting = true,
@@ -102,8 +97,10 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
                         }
                     }
                 }
-                let titles_only = media.is_empty();
-                if banner.is_none() && (titles_only || ready.len() == media.len()) {
+                let titles_only = plan.media_queries.is_empty();
+                if banner.is_none()
+                    && (titles_only || ready.len() == plan.media_queries.len())
+                {
                     let signature = plan.signature(playhead);
                     if app
                         .picture_cache
@@ -180,6 +177,15 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
     };
 
     widgets::panel_header(ui, "Program", |ui| {
+        if !app.sequence_nav_stack.is_empty() {
+            if ui
+                .button(egui::RichText::new("← Parent").size(11.0).color(THEME.accent))
+                .clicked()
+            {
+                app.close_nested_sequence();
+            }
+            ui.add_space(6.0);
+        }
         ui.label(
             egui::RichText::new(&sequence.name)
                 .size(12.0)
@@ -273,6 +279,14 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
                 if clip.is_adjustment() {
                     // Adjustment layers grade the decoded composite; proxy cards
                     // skip them because they carry no pixels of their own.
+                } else if clip.is_nested() {
+                    painter.text(
+                        frame.center(),
+                        Align2::CENTER_CENTER,
+                        "Nested",
+                        FontId::new(18.0, egui::FontFamily::Proportional),
+                        THEME.accent,
+                    );
                 } else if clip.is_title() {
                     if let Some(layer) = plan
                         .layers
@@ -640,6 +654,11 @@ fn audio_meters(ui: &mut egui::Ui, peaks: [f32; 2], badge: &str, status: &str) {
 
 struct DecodePlan {
     layers: Vec<PlanLayer>,
+    media_queries: Vec<PreviewQuery>,
+    compose_sequences: Vec<editor_core::Sequence>,
+    compose_media: Vec<MediaAsset>,
+    compose_groups: Vec<MulticamGroup>,
+    compose_source: editor_media::PreviewSource,
     problem: Option<String>,
     chip: String,
     canvas_w: u32,
@@ -653,6 +672,10 @@ enum PlanPixels {
     Title(editor_core::Title),
     Solid([f32; 3]),
     Adjustment,
+    Nested {
+        sequence_id: editor_core::SequenceId,
+        child_frame: i64,
+    },
 }
 
 struct PlanLayer {
@@ -712,6 +735,14 @@ impl DecodePlan {
                     }
                 }
                 PlanPixels::Adjustment => 3u8.hash(&mut hasher),
+                PlanPixels::Nested {
+                    sequence_id,
+                    child_frame,
+                } => {
+                    4u8.hash(&mut hasher);
+                    sequence_id.0.hash(&mut hasher);
+                    child_frame.hash(&mut hasher);
+                }
             }
             bits(layer.grade.exposure).hash(&mut hasher);
             bits(layer.grade.contrast).hash(&mut hasher);
@@ -775,8 +806,32 @@ fn bits(value: f32) -> u32 {
     value.to_bits()
 }
 
+fn media_query_from_layer(layer: &ProgramLayer, burst: u32, lead: u32) -> Option<PreviewQuery> {
+    match &layer.source {
+        LayerSource::Media {
+            path,
+            source_frame,
+            time_secs,
+            frame_secs,
+            last_source_frame,
+        } => Some(PreviewQuery {
+            path: path.clone(),
+            source_frame: *source_frame,
+            width: layer.width,
+            height: layer.height,
+            time_secs: *time_secs,
+            frame_secs: *frame_secs,
+            last_source_frame: *last_source_frame,
+            burst,
+            lead,
+        }),
+        _ => None,
+    }
+}
+
 fn decode_plan(
     sequence: &editor_core::Sequence,
+    sequences: &[editor_core::Sequence],
     playhead: i64,
     media: &[MediaAsset],
     groups: &[MulticamGroup],
@@ -798,8 +853,23 @@ fn decode_plan(
         editor_media::PreviewSource::Full
     };
     let stack = editor_media::program_stack_with(
-        sequence, media, playhead, canvas_w, canvas_h, source, groups,
+        sequence,
+        media,
+        playhead,
+        canvas_w,
+        canvas_h,
+        source,
+        groups,
+        sequences,
     );
+    let compose_env = ComposeEnv {
+        sequences,
+        media,
+        groups,
+        preview_source: source,
+        depth: 0,
+    };
+    let media_programs = media_layers_in_stack(&stack.layers, compose_env);
     let used_proxy = stack.layers.iter().any(|layer| layer.using_proxy);
     let problem = if stack.layers.is_empty() {
         stack.errors.into_iter().next()
@@ -843,6 +913,13 @@ fn decode_plan(
                 LayerSource::Title(title) => PlanPixels::Title(title),
                 LayerSource::Solid { rgb } => PlanPixels::Solid(rgb),
                 LayerSource::Adjustment => PlanPixels::Adjustment,
+                LayerSource::Nested {
+                    sequence_id,
+                    child_frame,
+                } => PlanPixels::Nested {
+                    sequence_id,
+                    child_frame,
+                },
             };
             PlanLayer {
                 pixels,
@@ -856,8 +933,17 @@ fn decode_plan(
             }
         })
         .collect();
+    let media_queries = media_programs
+        .iter()
+        .filter_map(|layer| media_query_from_layer(layer, burst, lead))
+        .collect();
     DecodePlan {
         layers,
+        media_queries,
+        compose_sequences: sequences.to_vec(),
+        compose_media: media.to_vec(),
+        compose_groups: groups.to_vec(),
+        compose_source: source,
         problem,
         chip,
         canvas_w,
@@ -874,13 +960,21 @@ fn compose_plan(
     media: &[PreviewImage],
 ) -> Result<Vec<u8>, String> {
     let programs: Vec<ProgramLayer> = plan.layers.iter().map(program_from_plan).collect();
+    let env = ComposeEnv {
+        sequences: &plan.compose_sequences,
+        media: &plan.compose_media,
+        groups: &plan.compose_groups,
+        preview_source: plan.compose_source,
+        depth: 0,
+    };
     let mut cursor = 0;
-    compose_layers(
+    compose_layers_env(
         plan.canvas_w,
         plan.canvas_h,
         seq_w,
         seq_h,
         &programs,
+        Some(env),
         |_| {
             let image = media
                 .get(cursor)
@@ -903,6 +997,13 @@ fn program_from_plan(layer: &PlanLayer) -> ProgramLayer {
         PlanPixels::Title(title) => LayerSource::Title(title.clone()),
         PlanPixels::Solid(rgb) => LayerSource::Solid { rgb: *rgb },
         PlanPixels::Adjustment => LayerSource::Adjustment,
+        PlanPixels::Nested {
+            sequence_id,
+            child_frame,
+        } => LayerSource::Nested {
+            sequence_id: *sequence_id,
+            child_frame: *child_frame,
+        },
     };
     ProgramLayer {
         source,

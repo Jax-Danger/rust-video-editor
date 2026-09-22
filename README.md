@@ -94,6 +94,18 @@ A multicam group ties two or more video angles to one sync origin. Each angle ha
 
 Groups, offsets, and angle cuts are stored in the project JSON (`multicam_groups` on the project, `multicam` on the clip, cuts in group time). Projects saved before this field still load; an empty group list is omitted.
 
+## Nested sequences (compound clips)
+
+A nested clip is one timeline item that rasterizes a child sequence. The child lives in `project.sequences` like any other sequence. The parent clip's `source_in` / `source_out` are frames inside that child. Preview and Deliver composite the child at that frame and paint the result as one layer on the parent, including grades and transforms on the nest clip itself.
+
+**Create.** Select one or more clips (linked partners expand automatically). **Edit → Nest Selection** moves them into a new child sequence and replaces them with nested clips on the same tracks — video and audio stay linked when both were nested. The child is named `Nested`, `Nested 2`, and so on. Multicam clips cannot be nested directly.
+
+**Open.** Double-click a nested clip on the timeline, choose **Sequence → Open Nested Sequence**, or select a nested clip and open it from the menu. The program monitor shows a **← Parent** control while you are inside a nest. **Sequence → Close Nested Sequence** returns to the parent. Edits inside the child show on the parent immediately because both paths share the same compositor.
+
+**Export.** Nested picture and audio recurse through the shared `compose_layers` path. A nest inside a nest is supported up to eight levels deep; deeper nesting is rejected to avoid cycles and runaway cost.
+
+Nested bindings round-trip in project JSON (`nested: { "sequence": <id> }` on the clip). Older projects load with nested clips off.
+
 ## Keyboard
 
 Shortcuts are global while you are not typing in a text field. The same list is under **Help → Keyboard Shortcuts**. On macOS, Command replaces Ctrl.
@@ -407,7 +419,7 @@ A progress bar follows ffmpeg's `out_time`. **Cancel** sends `SIGTERM`. A failed
 
 ## Tests
 
-`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, deliver presets (apply, custom JSON, last-settings round-trip), the sample project round-trip, imported media paths in JSON, proxy attach and relink, timeline culling on an 800-clip sequence, ruler spacing across an hour, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, proxy argument planning and preview fallback, the disk frame cache, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, pan, fader, burned captions, deliver bitrate hints, audio-only WAV planning, retimed source frames, muted retimed audio), multicam sync offsets, razor angle switches, group-time cuts, JSON round-trip, and raster frames that follow the active angle, the mix bus (pan law, mute, solo, keyframed gain, peak and RMS), clip speed (constant 25–400%, reverse, a linear ramp, JSON round-trip, and duration ripple), adjustment layers (JSON round-trip, track placement, composite stacking), and the shared composite (luma curve, lift/gamma/gain wheels, grade split, dissolve mix, wipe angle, push, dip, slide, blur dissolve, iris, clip filters, anchor, caption burn-in, adjustment grade-below). It does not spawn ffmpeg or whisper.
+`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, deliver presets (apply, custom JSON, last-settings round-trip), the sample project round-trip, imported media paths in JSON, proxy attach and relink, timeline culling on an 800-clip sequence, ruler spacing across an hour, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, proxy argument planning and preview fallback, the disk frame cache, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, pan, fader, burned captions, deliver bitrate hints, audio-only WAV planning, retimed source frames, muted retimed audio), multicam sync offsets, razor angle switches, group-time cuts, JSON round-trip, and raster frames that follow the active angle, nested sequence create/frame mapping/JSON round-trip/export raster, the mix bus (pan law, mute, solo, keyframed gain, peak and RMS), clip speed (constant 25–400%, reverse, a linear ramp, JSON round-trip, and duration ripple), adjustment layers (JSON round-trip, track placement, composite stacking), and the shared composite (luma curve, lift/gamma/gain wheels, grade split, dissolve mix, wipe angle, push, dip, slide, blur dissolve, iris, clip filters, anchor, caption burn-in, adjustment grade-below). It does not spawn ffmpeg or whisper.
 
 `cargo test -p editor-media --features ffmpeg` also encodes a short H.264/AAC mp4 when `ffmpeg` is on `PATH`. `cargo test -p editor-app --features whisper` builds the local speech-to-text path; the binary and model are resolved at runtime, not at compile time.
 

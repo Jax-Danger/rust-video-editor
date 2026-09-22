@@ -12,13 +12,14 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use editor_core::{
-    ffmpeg_pan_filter, ffmpeg_volume_arg, mix_regions, multicam_audio_spans, source_frame_at,
-    ExportRange, Frame, GainCurve, MediaAsset, MulticamGroup, Sequence, Timebase, TrackKind,
+    ffmpeg_pan_filter, ffmpeg_volume_arg, mix_regions, multicam_audio_spans, nested_audio_spans,
+    source_frame_at, ExportRange, Frame, GainCurve, MediaAsset, MulticamGroup, Sequence, Timebase,
+    TrackKind,
 };
 
-use crate::composite::{active_captions, program_stack_with, ProgramLayer};
+use crate::composite::{active_captions, program_stack_with, ComposeEnv, ProgramLayer};
 #[cfg(feature = "ffmpeg")]
-use crate::composite::{compose_layers, LayerSource};
+use crate::composite::{compose_layers_env, LayerSource};
 
 /// Optional encoder overrides from a deliver preset or the panel.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -77,6 +78,10 @@ pub struct RasterPlan {
     pub seq_height: f32,
     pub fps: String,
     pub frames: Vec<RasterFrame>,
+    /// Child sequences referenced by nested clips during raster export.
+    pub compose_sequences: Vec<Sequence>,
+    pub compose_media: Vec<MediaAsset>,
+    pub compose_groups: Vec<MulticamGroup>,
 }
 
 #[derive(Clone, Debug)]
@@ -101,6 +106,7 @@ pub fn plan_encode(
         sequence,
         media,
         &[],
+        &[sequence.clone()],
         range,
         codec,
         container,
@@ -114,6 +120,7 @@ pub fn plan_encode_with(
     sequence: &Sequence,
     media: &[MediaAsset],
     groups: &[MulticamGroup],
+    sequences: &[Sequence],
     range: ExportRange,
     codec: &str,
     container: &str,
@@ -131,7 +138,8 @@ pub fn plan_encode_with(
     let width = even_dim(sequence.width);
     let height = even_dim(sequence.height);
     let fps = fps_token(sequence.timebase);
-    let pieces = audible_pieces(sequence, media, groups, range_in, range_out, &mut warnings);
+    let pieces =
+        audible_pieces(sequence, media, groups, sequences, range_in, range_out, &mut warnings);
     let dur = frames_secs(range_out - range_in, sequence.timebase);
     let mut graph = Graph::default();
     let audio = slice_audio(
@@ -156,6 +164,7 @@ pub fn plan_encode_with(
                 height,
                 crate::PreviewSource::Full,
                 groups,
+                sequences,
             );
             if let Some(error) = stack.errors.first() {
                 return Err(error.clone());
@@ -199,6 +208,9 @@ pub fn plan_encode_with(
             seq_height: sequence.height.max(1) as f32,
             fps,
             frames,
+            compose_sequences: sequences.to_vec(),
+            compose_media: media.to_vec(),
+            compose_groups: groups.to_vec(),
         },
     })
 }
@@ -679,7 +691,7 @@ fn write_raster(
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             return Err("export cancelled".into());
         }
-        let rgba = render_frame(frame, plan, &mut cache)?;
+        let rgba = render_frame(frame, plan, &mut cache, &plan.compose_sequences, &plan.compose_media, &plan.compose_groups)?;
         stdin.write_all(&rgba).map_err(|err| err.to_string())?;
         if let Ok(mut slot) = shared.lock() {
             let fraction = ((index as f32 + 1.0) / total).clamp(0.0, 0.99);
@@ -695,19 +707,31 @@ fn render_frame(
     frame: &RasterFrame,
     plan: &RasterPlan,
     cache: &mut DecodeCache,
+    sequences: &[Sequence],
+    media: &[MediaAsset],
+    groups: &[MulticamGroup],
 ) -> Result<Vec<u8>, String> {
-    let mut rgba = compose_layers(
+    let env = ComposeEnv {
+        sequences,
+        media,
+        groups,
+        preview_source: crate::PreviewSource::Full,
+        depth: 0,
+    };
+    let mut rgba = compose_layers_env(
         plan.width,
         plan.height,
         plan.seq_width,
         plan.seq_height,
         &frame.layers,
+        Some(env),
         |layer| cache.load(layer).map(|pixels| pixels.to_vec()),
     )?;
     crate::composite::burn_captions(&mut rgba, plan.width, plan.height, &frame.captions);
     Ok(rgba)
 }
 
+#[cfg(feature = "ffmpeg")]
 #[cfg(feature = "ffmpeg")]
 #[derive(Default)]
 struct DecodeCache {
@@ -718,6 +742,21 @@ struct DecodeCache {
 #[cfg(feature = "ffmpeg")]
 impl DecodeCache {
     fn load(&mut self, layer: &ProgramLayer) -> Result<std::sync::Arc<[u8]>, String> {
+        match &layer.source {
+            LayerSource::Media {
+                path,
+                source_frame,
+                time_secs,
+                frame_secs: _,
+                last_source_frame: _,
+            } => {}
+            LayerSource::Nested { .. } => {
+                return Err(format!("{} is nested and is not decoded directly", layer.label));
+            }
+            _ => {
+                return Err(format!("{} is not a media layer", layer.label));
+            }
+        }
         let LayerSource::Media {
             path,
             source_frame,
@@ -726,7 +765,7 @@ impl DecodeCache {
             last_source_frame: _,
         } = &layer.source
         else {
-            return Err(format!("{} is a title and is not decoded", layer.label));
+            unreachable!();
         };
         let key = (path.clone(), layer.width, layer.height, *source_frame);
         if let Some(hit) = self.map.get(&key) {
@@ -874,6 +913,7 @@ fn audible_pieces(
     sequence: &Sequence,
     media: &[MediaAsset],
     groups: &[MulticamGroup],
+    sequences: &[Sequence],
     from: i64,
     to: i64,
     warnings: &mut Vec<String>,
@@ -888,6 +928,31 @@ fn audible_pieces(
         else {
             continue;
         };
+        if let Some(binding) = &clip.nested {
+            let Some(child) = sequences.iter().find(|item| item.id == binding.sequence) else {
+                warnings.push(format!("Skipped nested audio on {} — child missing", clip.name));
+                continue;
+            };
+            if let Some(spans) = nested_audio_spans(clip, child, groups, media, sequence.timebase)
+            {
+                for span in spans {
+                    push_wav(
+                        &mut pieces,
+                        warnings,
+                        media,
+                        span.media_id,
+                        span.timeline_in,
+                        span.timeline_out,
+                        span.source_at_in,
+                        span.seconds_per_frame,
+                        region.gain,
+                        region.pan,
+                        &region.gain_keys,
+                    );
+                }
+            }
+            continue;
+        }
         if let Some(spans) = multicam_audio_spans(clip, groups, media, sequence.timebase) {
             for span in spans {
                 push_wav(
@@ -1364,7 +1429,8 @@ mod tests {
             crate::composite::LayerSource::Media { source_frame, .. } => *source_frame,
             crate::composite::LayerSource::Title(_)
             | crate::composite::LayerSource::Solid { .. }
-            | crate::composite::LayerSource::Adjustment => {
+            | crate::composite::LayerSource::Adjustment
+            | crate::composite::LayerSource::Nested { .. } => {
                 panic!("expected a media layer")
             }
         }
@@ -1723,7 +1789,15 @@ mod tests {
             .iter()
             .any(|line| line.contains("ridge")));
         let mut cache = DecodeCache::default();
-        let rgba = render_frame(&script.raster.frames[0], &script.raster, &mut cache).unwrap();
+        let rgba = render_frame(
+            &script.raster.frames[0],
+            &script.raster,
+            &mut cache,
+            &script.raster.compose_sequences,
+            &script.raster.compose_media,
+            &script.raster.compose_groups,
+        )
+        .unwrap();
         let dir = std::env::temp_dir().join(format!("meridian-match-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1799,8 +1873,15 @@ mod tests {
                 )
                 .unwrap();
                 let mut cache = DecodeCache::default();
-                let rgba =
-                    render_frame(&script.raster.frames[0], &script.raster, &mut cache).unwrap();
+                let rgba = render_frame(
+                    &script.raster.frames[0],
+                    &script.raster,
+                    &mut cache,
+                    &script.raster.compose_sequences,
+                    &script.raster.compose_media,
+                    &script.raster.compose_groups,
+                )
+                .unwrap();
                 let raw = dir.join(format!("{name}.rgba"));
                 std::fs::write(&raw, &rgba).unwrap();
                 let png = dir.join(format!("{name}.png"));
@@ -1906,7 +1987,7 @@ mod tests {
         sequence.tracks[1].clips = vec![audio];
         let path = clip_path.to_string_lossy().into_owned();
         let media = vec![asset(1, &path, true, true)];
-        let pieces = audible_pieces(&sequence, &media, 0, 96, &mut Vec::new());
+        let pieces = audible_pieces(&sequence, &media, &[], &[sequence.clone()], 0, 96, &mut Vec::new());
         assert_eq!(pieces.len(), 1);
         let extracted = dir.join("caption.wav");
         write_timeline_wav(&pieces, 0, 96, sequence.timebase, &extracted).unwrap();
@@ -2096,6 +2177,7 @@ mod tests {
             &sequence,
             &media,
             &[group],
+            &[sequence.clone()],
             ExportRange::WholeSequence,
             "H.264",
             "mp4",
@@ -2124,6 +2206,55 @@ mod tests {
         }
         assert!(script.inputs.iter().any(|path| path.ends_with("wide.mp4")));
         assert!(script.inputs.iter().any(|path| path.ends_with("tight.mp4")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nested_raster_uses_child_sequence_frames() {
+        use editor_core::{
+            create_nested_sequence, nested_frame_at, Clip, ClipId, MediaId, Sequence, SequenceId,
+            TrackId, TrackKind,
+        };
+        let dir = std::env::temp_dir().join(format!("meridian-nest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = touch(&dir, "plate.mp4");
+        let mut project = editor_core::Project::new("nest");
+        let seq = SequenceId(project.alloc());
+        let mut sequence = Sequence::new(seq, "Main", 64, 36, Timebase::fps_24());
+        sequence.add_track(TrackId(2), TrackKind::Video, "V1");
+        let clip_id = ClipId(project.alloc());
+        let mut clip = Clip::basic(clip_id.0, 0, 8);
+        clip.media_id = Some(MediaId(1));
+        sequence.tracks[0].clips = vec![clip];
+        project.sequences.push(sequence);
+        project.active_sequence = Some(seq);
+        project.media.push(asset(1, &path, true, false));
+        let nested_id = create_nested_sequence(&mut project, seq, &[clip_id]).unwrap();
+        let parent = project.sequence(seq).unwrap();
+        let nested = parent.clip(nested_id).unwrap();
+        assert_eq!(nested_frame_at(nested, Frame(2), parent.timebase), Frame(2));
+        let script = plan_encode_with(
+            parent,
+            &project.media,
+            &[],
+            &project.sequences,
+            ExportRange::WholeSequence,
+            "H.264",
+            "mp4",
+            false,
+            EncodeHints::default(),
+        )
+        .unwrap();
+        match &script.raster.frames[2].layers[0].source {
+            crate::LayerSource::Nested {
+                sequence_id,
+                child_frame,
+            } => {
+                assert_eq!(*sequence_id, nested.nested.as_ref().unwrap().sequence);
+                assert_eq!(*child_frame, 2);
+            }
+            other => panic!("expected nested layer, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

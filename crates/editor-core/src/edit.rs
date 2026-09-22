@@ -64,6 +64,14 @@ pub enum EditError {
     AngleOutOfRange,
     #[error("multicam group not found")]
     GroupNotFound,
+    #[error("nothing selected")]
+    NothingSelected,
+    #[error("clip is already nested")]
+    AlreadyNested,
+    #[error("clip cannot be nested")]
+    NotNestable,
+    #[error("nested sequence would create a cycle")]
+    NestedCycle,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1523,6 +1531,7 @@ pub fn clip_from_media(
         adjustment: false,
         speed: ClipSpeed::normal(),
         multicam: None,
+        nested: None,
     })
 }
 
