@@ -9,6 +9,7 @@ pub mod deliver_preset;
 pub mod demo;
 pub mod edit;
 pub mod effects;
+pub mod eq;
 pub mod mix;
 pub mod model;
 pub mod multicam;
@@ -39,10 +40,11 @@ pub use edit::{
     ripple_delete, ripple_trim, ripple_trim_next_to_playhead, ripple_trim_prev_to_playhead,
     roll_cut, set_clip_gain_at, set_clip_speed, set_clip_title,
     set_clip_volume, set_filter_at, set_grade_at, set_in_point, set_luma_curve_point,
-    set_master_fader, set_out_point, set_track_fader, set_track_flag, set_track_pan,
+    set_master_fader, set_out_point, set_track_eq, set_track_eq_low_cut, set_track_fader,
+    set_track_flag, set_track_pan,
     set_transform_at, set_wheel_offsets_at, slide, slip, snap_span, snap_to_targets,
     source_frame_at, toggle_filter_key, toggle_grade_key, toggle_transform_key, toggle_volume_key,
-    trim, update_cue_text, EditError, SnapHit, SnapKind, SnapPoint, TrackFlag, TrimEdge,
+    trim, update_cue_text, EditError, EqBand, SnapHit, SnapKind, SnapPoint, TrackFlag, TrimEdge,
 };
 pub use effects::{
     blur, blur_mut, clip_relative, color_grade, color_grade_mut, crop, crop_mut, has_filter,
@@ -50,6 +52,10 @@ pub use effects::{
     BlurFilter, ColorGrade, CropFilter, Effect, FilterKind, FilterParam, GradeParam, Interpolation,
     KeyframeF32, RgbWheel, SharpenFilter, ToneCurve, Transform, TransformParam, VignetteFilter,
     WheelChannel, WheelKind,
+};
+pub use eq::{
+    clamp_eq_db, ffmpeg_eq_filters, format_eq_db, process_interleaved, EqProcessor, TrackEq3,
+    EQ_DB_MAX, EQ_DB_MIN, EQ_HIGH_HZ, EQ_LOW_CUT_HZ, EQ_LOW_HZ, EQ_MID_HZ,
 };
 pub use mix::{
     accumulate_stereo, audio_solo_active, audio_topology, channel_clips, clamp_gain, clamp_pan,

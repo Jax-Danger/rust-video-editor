@@ -12,9 +12,9 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use editor_core::{
-    ffmpeg_pan_filter, ffmpeg_volume_arg, mix_regions, multicam_audio_spans, nested_audio_spans,
-    source_frame_at, ExportRange, Frame, GainCurve, MediaAsset, MulticamGroup, Sequence, Timebase,
-    TrackKind,
+    ffmpeg_eq_filters, ffmpeg_pan_filter, ffmpeg_volume_arg, mix_regions, multicam_audio_spans,
+    nested_audio_spans, source_frame_at, ExportRange, Frame, GainCurve, MediaAsset, MulticamGroup,
+    Sequence, Timebase, TrackEq3, TrackKind,
 };
 
 use crate::composite::{active_captions, program_stack_with, ComposeEnv, ProgramLayer};
@@ -42,6 +42,8 @@ pub struct WavPiece {
     pub gain: f32,
     /// Track pan, −1 left … +1 right. Center omits the pan filter.
     pub pan: f32,
+    /// Pre-fader EQ on the parent track.
+    pub eq: TrackEq3,
     /// Keyed clip gain × track fader, in sequence frames.
     pub gain_keys: Vec<editor_core::GainKey>,
 }
@@ -865,6 +867,10 @@ fn slice_audio(
             filter.push(',');
             filter.push_str(&pan);
         }
+        for eq in ffmpeg_eq_filters(&piece.eq) {
+            filter.push(',');
+            filter.push_str(&eq);
+        }
         filter.push_str(&format!(
             ",adelay={}|{},aformat=sample_rates=48000:channel_layouts=stereo[{label}]",
             delay_ms.round() as i64,
@@ -920,6 +926,12 @@ fn audible_pieces(
 ) -> Vec<WavPiece> {
     let mut pieces = Vec::new();
     for region in mix_regions(sequence, from, to, false) {
+        let track_eq = sequence
+            .tracks
+            .iter()
+            .find(|track| track.id.0 == region.track_id)
+            .map(|track| track.eq)
+            .unwrap_or_default();
         let Some(clip) = sequence
             .tracks
             .iter()
@@ -947,6 +959,7 @@ fn audible_pieces(
                         span.seconds_per_frame,
                         region.gain,
                         region.pan,
+                        track_eq,
                         &region.gain_keys,
                     );
                 }
@@ -966,6 +979,7 @@ fn audible_pieces(
                     span.seconds_per_frame,
                     region.gain,
                     region.pan,
+                    track_eq,
                     &region.gain_keys,
                 );
             }
@@ -1004,6 +1018,7 @@ fn audible_pieces(
             seconds_per_frame,
             gain: region.gain,
             pan: region.pan,
+            eq: track_eq,
             gain_keys: region.gain_keys,
         });
     }
@@ -1021,6 +1036,7 @@ fn push_wav(
     seconds_per_frame: f64,
     gain: f32,
     pan: f32,
+    eq: TrackEq3,
     gain_keys: &[editor_core::GainKey],
 ) {
     let Some(asset) = media.iter().find(|item| item.id == media_id) else {
@@ -1042,6 +1058,7 @@ fn push_wav(
         seconds_per_frame,
         gain,
         pan,
+        eq,
         gain_keys: gain_keys.to_vec(),
     });
 }
@@ -1222,8 +1239,8 @@ fn container_name(container: &str) -> &'static str {
 mod tests {
     use super::*;
     use editor_core::{
-        Clip, ClipId, ColorGrade, CueId, Effect, MediaId, SequenceId, TrackId, Transform,
-        Transition, TransitionAlign, TransitionId, TransitionKind,
+        Clip, ClipId, ColorGrade, CueId, Effect, MediaId, SequenceId, TrackEq3, TrackId,
+        TrackKind, Transform, Transition, TransitionAlign, TransitionId, TransitionKind,
     };
 
     fn touch(dir: &std::path::Path, name: &str) -> String {
@@ -1591,6 +1608,60 @@ mod tests {
         assert!(
             script.filter.contains("volume=0.5000"),
             "master fader missing: {}",
+            script.filter
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn track_eq_filters_share_the_playback_eq() {
+        let dir = std::env::temp_dir().join(format!("meridian-plan-eq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let voice = touch(&dir, "voice.wav");
+        let mut sequence = Sequence::new(SequenceId(1), "EQ", 320, 180, Timebase::fps_24());
+        sequence.add_track(TrackId(2), TrackKind::Video, "V1");
+        sequence.add_track(TrackId(3), TrackKind::Audio, "A1");
+        let mut picture = Clip::basic(10, 0, 24);
+        picture.media_id = Some(MediaId(1));
+        sequence.tracks[0].clips = vec![picture];
+        let mut audio = Clip::basic(11, 0, 24);
+        audio.media_id = Some(MediaId(2));
+        sequence.tracks[1].clips = vec![audio];
+        sequence.tracks[1].eq = TrackEq3 {
+            low: 3.0,
+            mid: -2.0,
+            high: 4.0,
+            low_cut: true,
+        };
+        let media = vec![asset(1, &voice, true, false), asset(2, &voice, false, true)];
+        let script = plan_encode(
+            &sequence,
+            &media,
+            ExportRange::WholeSequence,
+            "H.264",
+            "mp4",
+            false,
+            EncodeHints::default(),
+        )
+        .unwrap();
+        assert!(
+            script.filter.contains("highpass=f=80"),
+            "low cut missing: {}",
+            script.filter
+        );
+        assert!(
+            script.filter.contains("equalizer=f=200"),
+            "low shelf missing: {}",
+            script.filter
+        );
+        assert!(
+            script.filter.contains("equalizer=f=1000"),
+            "mid band missing: {}",
+            script.filter
+        );
+        assert!(
+            script.filter.contains("equalizer=f=8000"),
+            "high shelf missing: {}",
             script.filter
         );
         let _ = std::fs::remove_dir_all(&dir);
