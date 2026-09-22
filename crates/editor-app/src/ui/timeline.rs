@@ -660,11 +660,11 @@ fn lane(
             } else if clip.is_adjustment() {
                 format!("A  {}", clip.name)
             } else if let Some(angle) = opening_angle_name(clip, &groups) {
-                match clip.speed.badge() {
+                match clip_badge(clip) {
                     Some(badge) => format!("{}  ·  {angle}  {badge}", clip.name),
                     None => format!("{}  ·  {angle}", clip.name),
                 }
-            } else if let Some(badge) = clip.speed.badge() {
+            } else if let Some(badge) = clip_badge(clip) {
                 format!("{}  {badge}", clip.name)
             } else {
                 clip.name.clone()
@@ -1194,5 +1194,13 @@ fn paint_transitions(
             Color32::from_white_alpha(50),
             Stroke::new(1.0_f32, Color32::from_white_alpha(140)),
         ));
+    }
+}
+
+fn clip_badge(clip: &editor_core::Clip) -> Option<String> {
+    if clip.is_hold() {
+        Some("Hold".into())
+    } else {
+        clip.speed.badge()
     }
 }

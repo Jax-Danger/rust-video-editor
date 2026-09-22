@@ -344,6 +344,7 @@ fn nested_parent_clip(
         multicam: None,
         nested: Some(binding),
         track_matte: None,
+        hold_frame: None,
     }
 }
 

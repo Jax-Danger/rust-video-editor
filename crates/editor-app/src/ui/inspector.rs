@@ -1,10 +1,11 @@
 use editor_core::{
-    blur, chroma_key, clip_relative, color_grade, crop, set_clip_gain_at, set_clip_speed,
-    set_clip_title, set_filter_at, set_grade_at, set_shape_mask_invert, set_shape_mask_shape,
-    set_track_matte, set_transform_at, shape_mask, sharpen, stabilize, source_frame_at,
-    toggle_filter_key, toggle_grade_key, toggle_transform_key, toggle_volume_key, transform,
-    lut, vignette, ClipId, ClipSpeed, FilterParam, GradeParam, LabelColor, MarkerId, ShapeMaskKind,
-    TextAlign, Title, TrackKind, TrackMatteBinding, TrackMatteMode, TransformParam,
+    blur, chroma_key, clip_relative, color_grade, crop, default_freeze_duration, set_clip_gain_at,
+    set_clip_speed, set_clip_title, set_filter_at, set_grade_at,
+    set_shape_mask_invert, set_shape_mask_shape, set_track_matte, set_transform_at, shape_mask,
+    sharpen, stabilize, source_frame_at, toggle_filter_key, toggle_grade_key, toggle_transform_key,
+    toggle_volume_key, transform, lut, vignette, ClipId, ClipSpeed, FilterParam, GradeParam,
+    LabelColor, MarkerId, ShapeMaskKind, TextAlign, Title, TrackKind, TrackMatteBinding,
+    TrackMatteMode, TransformParam,
 };
 use egui::{pos2, Align2, Rect, RichText, Sense, TextEdit, Vec2};
 
@@ -96,6 +97,7 @@ fn inspector_body(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId, sna
         title_controls(ui, app, clip_id);
     } else if !snapshot.is_adjustment {
         speed_controls(ui, app, clip_id);
+        hold_controls(ui, app, clip_id);
     }
 
     let rel = clip_relative(
@@ -445,6 +447,131 @@ fn speed_controls(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId) {
             .color(THEME.text_mute),
         );
     });
+}
+
+fn hold_controls(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId) {
+    let snapshot = {
+        let Some(sequence) = app.session.project().active() else {
+            return;
+        };
+        let Some(clip) = sequence.clip(clip_id) else {
+            return;
+        };
+        if clip.is_title() {
+            return;
+        }
+        HoldSnapshot {
+            is_hold: clip.is_hold(),
+            hold_frame: clip.hold_frame,
+            media_timebase: clip.media_timebase,
+            covers_playhead: clip.covers(editor_core::Frame(app.playhead)),
+            hold_from_playhead: if clip.covers(editor_core::Frame(app.playhead)) {
+                Some(source_frame_at(clip, editor_core::Frame(app.playhead), sequence.timebase))
+            } else {
+                None
+            },
+            hold_from_in: source_frame_at(clip, clip.timeline_in, sequence.timebase),
+            default_duration: default_freeze_duration(sequence.timebase),
+        }
+    };
+
+    ui.add_space(8.0);
+    widgets::section_label(ui, "Hold");
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        let mut hold = snapshot.is_hold;
+        if ui.checkbox(&mut hold, "Hold one source frame").changed() {
+            if hold {
+                let frame = snapshot.hold_from_playhead.unwrap_or(snapshot.hold_from_in);
+                if let Err(err) = app.session.set_clip_hold(clip_id, frame) {
+                    app.status = err.to_string();
+                }
+            } else if let Err(err) = app.session.clear_clip_hold(clip_id) {
+                app.status = err.to_string();
+            }
+        }
+    });
+    if let Some(frame) = snapshot.hold_frame {
+        ui.horizontal(|ui| {
+            ui.add_space(12.0);
+            ui.label(
+                RichText::new(format!(
+                    "Source {}",
+                    format_tc(frame.0, snapshot.media_timebase)
+                ))
+                .size(11.0)
+                .monospace()
+                .color(THEME.text_dim),
+            );
+        });
+        let mut set_from_playhead = false;
+        let mut freeze_at_playhead = false;
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            if ui.button("Set from playhead").clicked() {
+                set_from_playhead = true;
+            }
+            if ui.button("Freeze at playhead").clicked() {
+                freeze_at_playhead = true;
+            }
+        });
+        if set_from_playhead {
+            if snapshot.covers_playhead {
+                if let Some(frame) = snapshot.hold_from_playhead {
+                    if let Err(err) = app.session.set_clip_hold(clip_id, frame) {
+                        app.status = err.to_string();
+                    }
+                }
+            } else {
+                app.status = "Move the playhead inside the clip.".into();
+            }
+        }
+        if freeze_at_playhead {
+            app.freeze_at_playhead();
+        }
+        ui.horizontal(|ui| {
+            ui.add_space(12.0);
+            ui.label(
+                RichText::new(
+                    "Preview and Deliver sample this frame for the whole clip. Audio is muted.",
+                )
+                .size(11.0)
+                .color(THEME.text_mute),
+            );
+        });
+    } else {
+        let mut freeze_at_playhead = false;
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            if ui.button("Freeze at playhead").clicked() {
+                freeze_at_playhead = true;
+            }
+        });
+        if freeze_at_playhead {
+            app.freeze_at_playhead();
+        }
+        ui.horizontal(|ui| {
+            ui.add_space(12.0);
+            ui.label(
+                RichText::new(format!(
+                    "Freeze turns the playhead frame into a {}-frame hold (two seconds).",
+                    snapshot.default_duration
+                ))
+                .size(11.0)
+                .color(THEME.text_mute),
+            );
+        });
+    }
+}
+
+struct HoldSnapshot {
+    is_hold: bool,
+    hold_frame: Option<editor_core::Frame>,
+    media_timebase: editor_core::Timebase,
+    covers_playhead: bool,
+    hold_from_playhead: Option<editor_core::Frame>,
+    hold_from_in: editor_core::Frame,
+    default_duration: i64,
 }
 
 fn clip_speed(app: &MeridianApp, id: ClipId) -> Option<ClipSpeed> {

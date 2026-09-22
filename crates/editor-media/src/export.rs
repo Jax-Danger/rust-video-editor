@@ -1011,7 +1011,7 @@ fn audible_pieces(
             warnings.push(format!("Skipped offline audio {}", asset.name));
             continue;
         }
-        if clip.speed.mutes_audio() {
+        if clip.mutes_audio() {
             warnings.push(format!(
                 "Muted audio on {} — retimed clips stay silent so they do not drift from the picture",
                 clip.name

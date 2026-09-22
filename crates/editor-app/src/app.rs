@@ -969,6 +969,8 @@ impl MeridianApp {
             self.ripple_trim_prev_to_playhead();
         } else if tap(Key::W) && !mods.command {
             self.ripple_trim_next_to_playhead();
+        } else if pressed_shift(Key::F) {
+            self.freeze_at_playhead();
         } else if tap(Key::F) {
             self.zoom_to_fit();
             self.reveal_playhead = true;
@@ -1370,6 +1372,25 @@ impl MeridianApp {
     pub fn split_at_playhead(&mut self) {
         match self.session.razor_at(Frame(self.playhead)) {
             Ok(()) => self.status = "Split clips under the playhead.".into(),
+            Err(err) => self.status = err.to_string(),
+        }
+    }
+
+    pub fn freeze_at_playhead(&mut self) {
+        let duration = editor_core::default_freeze_duration(self.timebase());
+        let at = Frame(self.playhead);
+        let selected = self.selected_with_links();
+        let result = if selected.is_empty() {
+            let tracks = self.targeted_track_ids();
+            self.session.freeze_at_playhead(at, duration, &tracks)
+        } else {
+            self.session.freeze_clips_at(&selected, at, duration)
+        };
+        match result {
+            Ok(ids) => {
+                self.selected = ids;
+                self.status = format!("Freeze frame for {duration} frames.");
+            }
             Err(err) => self.status = err.to_string(),
         }
     }
@@ -3156,6 +3177,10 @@ impl MeridianApp {
                             self.split_at_playhead();
                             ui.close_menu();
                         }
+                        if ui.button("Freeze Frame at Playhead").clicked() {
+                            self.freeze_at_playhead();
+                            ui.close_menu();
+                        }
                         if ui.button("Create Multicam from Pool").clicked() {
                             self.create_multicam_from_pool();
                             ui.close_menu();
@@ -3756,6 +3781,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("C  /  Ctrl+K", "Razor at the playhead (also selects the razor tool)"),
     ("/", "Razor at the playhead (keeps the active tool)"),
     ("Q / W", "Ripple trim previous / next edit to the playhead (targeted tracks)"),
+    ("Shift+F", "Freeze frame at the playhead (targeted tracks or selection)"),
     (", / .", "Overwrite / insert source in–out at the program playhead"),
     ("1–9", "Toggle video track target (V1–V9)"),
     ("Shift+1–9", "Toggle audio track target (A1–A9)"),

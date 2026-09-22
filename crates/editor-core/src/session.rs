@@ -470,6 +470,46 @@ impl Session {
             edit::delete_cue(project, seq, cue)
         })
     }
+
+    pub fn set_clip_hold(&mut self, clip: ClipId, hold: Frame) -> Result<(), EditError> {
+        let seq = self.active_id()?;
+        self.edit("Hold frame", |project| edit::set_clip_hold(project, seq, clip, hold))
+    }
+
+    pub fn clear_clip_hold(&mut self, clip: ClipId) -> Result<(), EditError> {
+        let seq = self.active_id()?;
+        self.edit("Clear hold", |project| edit::clear_clip_hold(project, seq, clip))
+    }
+
+    pub fn freeze_at_playhead(
+        &mut self,
+        at: Frame,
+        duration: i64,
+        tracks: &[TrackId],
+    ) -> Result<Vec<ClipId>, EditError> {
+        let seq = self.active_id()?;
+        let mut frozen = Vec::new();
+        self.edit("Freeze frame", |project| {
+            frozen = edit::freeze_at_playhead(project, seq, at, duration, tracks)?;
+            Ok(())
+        })?;
+        Ok(frozen)
+    }
+
+    pub fn freeze_clips_at(
+        &mut self,
+        clips: &[ClipId],
+        at: Frame,
+        duration: i64,
+    ) -> Result<Vec<ClipId>, EditError> {
+        let seq = self.active_id()?;
+        let mut frozen = Vec::new();
+        self.edit("Freeze frame", |project| {
+            frozen = edit::freeze_clips_at(project, seq, clips, at, duration)?;
+            Ok(())
+        })?;
+        Ok(frozen)
+    }
 }
 
 #[cfg(test)]
