@@ -10,6 +10,7 @@ pub mod edit;
 pub mod effects;
 pub mod mix;
 pub mod model;
+pub mod scale;
 pub mod session;
 pub mod template;
 pub mod time;
@@ -19,16 +20,17 @@ pub use caption::{
     StubTranscriber, TimedWord, TranscribeRequest,
 };
 pub use deliver::{plan_export, ExportPlan, ExportRange};
-pub use demo::demo_project;
+pub use demo::{demo_project, dense_project};
 pub use edit::{
-    active_sequence_id, add_marker, add_title, add_transition, clip_from_media,
+    active_sequence_id, add_marker, add_title, add_transition, attach_proxies, clip_from_media,
     collect_snap_points, delete_cue, expand_linked, import_media, insert_clips, lift_delete,
-    link_clips, move_clips, overwrite_clips, razor_at, razor_clip, replace_captions, ripple_delete,
-    ripple_trim, roll_cut, set_clip_gain_at, set_clip_title, set_clip_volume, set_grade_at,
-    set_in_point, set_luma_curve_point, set_master_fader, set_out_point, set_track_fader,
-    set_track_flag, set_track_pan, set_transform_at, set_wheel_offsets_at, slide, slip, snap_span,
-    snap_to_targets, source_frame_at, toggle_grade_key, toggle_transform_key, toggle_volume_key,
-    trim, update_cue_text, EditError, SnapHit, SnapKind, SnapPoint, TrackFlag, TrimEdge,
+    link_clips, move_clips, overwrite_clips, razor_at, razor_clip, relink_media, replace_captions,
+    ripple_delete, ripple_trim, roll_cut, set_clip_gain_at, set_clip_title, set_clip_volume,
+    set_grade_at, set_in_point, set_luma_curve_point, set_master_fader, set_out_point,
+    set_track_fader, set_track_flag, set_track_pan, set_transform_at, set_wheel_offsets_at, slide,
+    slip, snap_span, snap_to_targets, source_frame_at, toggle_grade_key, toggle_transform_key,
+    toggle_volume_key, trim, update_cue_text, EditError, SnapHit, SnapKind, SnapPoint, TrackFlag,
+    TrimEdge,
 };
 pub use effects::{
     clip_relative, color_grade, color_grade_mut, transform, transform_mut, AnimatedF32, ColorGrade,
@@ -44,6 +46,11 @@ pub use mix::{
     FADER_DB_MIN, GAIN_MAX,
 };
 pub use model::*;
+pub use scale::{
+    align_frame, clamp_timeline_zoom, clip_index_at, frame_at_x, ruler_mark_count, ruler_step,
+    stacked_clip_indices, stacked_hits, timeline_scale_label, timeline_x, visible_clip_span,
+    visible_span, zoom_origin, RulerStep, MAX_PIXELS_PER_FRAME, MIN_PIXELS_PER_FRAME,
+};
 pub use session::Session;
 pub use template::{builtin_templates, project_from_template, ProjectTemplate};
 pub use time::{convert_frames, Frame, MediaTime, Timebase};

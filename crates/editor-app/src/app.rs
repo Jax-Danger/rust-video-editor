@@ -172,11 +172,16 @@ pub struct MeridianApp {
     pub text_editing: bool,
     pub dragging_media: Option<MediaId>,
     pub timeline_view: Option<egui::Rect>,
+    /// Frame at the left edge of the timeline viewport. Scrolling changes this,
+    /// not a pixel strip as wide as the sequence.
+    pub timeline_origin: f64,
     pub ruler_rect: Option<egui::Rect>,
     pub viewer_bar: Option<egui::Rect>,
     pub viewer_bar_end: i64,
     pub audio: AudioEngine,
     pub picture_cache: Option<crate::composite::PictureCache>,
+    pub proxy_job: Option<crate::proxy_job::ProxyJob>,
+    pub proxy_note: String,
     #[cfg(feature = "ffmpeg")]
     pub export_job: Option<editor_media::ExportJob>,
     #[cfg(all(feature = "ffmpeg", feature = "whisper"))]
@@ -216,11 +221,14 @@ impl MeridianApp {
             text_editing: false,
             dragging_media: None,
             timeline_view: None,
+            timeline_origin: 0.0,
             ruler_rect: None,
             viewer_bar: None,
             viewer_bar_end: 0,
             audio: AudioEngine::new(),
             picture_cache: None,
+            proxy_job: None,
+            proxy_note: String::new(),
             #[cfg(feature = "ffmpeg")]
             export_job: None,
             #[cfg(all(feature = "ffmpeg", feature = "whisper"))]
@@ -329,7 +337,59 @@ impl MeridianApp {
     }
 
     pub fn zoom_by(&mut self, factor: f32) {
-        self.pixels_per_frame = (self.pixels_per_frame * factor).clamp(0.2, 64.0);
+        let old = self.pixels_per_frame;
+        let new = editor_core::clamp_timeline_zoom(old * factor);
+        self.rebase_timeline_zoom(old, new, self.zoom_anchor_px());
+    }
+
+    /// Pixel in the timeline view that should stay on the same frame while zooming.
+    /// The playhead wins when it is on screen. Otherwise the anchor is the center
+    /// of the clips actually visible, not the empty area past the last clip.
+    pub fn zoom_anchor_px(&self) -> f32 {
+        let width = self
+            .timeline_view
+            .map(|rect| rect.width())
+            .unwrap_or(900.0)
+            .max(1.0);
+        let ppf = f64::from(self.pixels_per_frame.max(editor_core::MIN_PIXELS_PER_FRAME));
+        let playhead_x = (self.playhead as f64 - self.timeline_origin) * ppf;
+        if playhead_x >= 0.0 && playhead_x <= f64::from(width) {
+            return playhead_x as f32;
+        }
+        let end = self.sequence_end().max(0) as f64;
+        let content_right = ((end - self.timeline_origin).max(0.0) * ppf) as f32;
+        (width * 0.5).min(content_right.max(0.0))
+    }
+
+    /// Keep `anchor_px` (distance from the left of the timeline view) on the same frame.
+    pub fn rebase_timeline_zoom(&mut self, old: f32, new: f32, anchor_px: f32) {
+        let width = self.timeline_view.map(|rect| rect.width()).unwrap_or(900.0);
+        self.pixels_per_frame = new;
+        self.timeline_origin = editor_core::zoom_origin(
+            self.timeline_origin,
+            old,
+            new,
+            anchor_px,
+            self.sequence_end(),
+            width,
+        );
+    }
+
+    pub fn clamp_timeline_origin(&mut self, end: i64) {
+        let width = self
+            .timeline_view
+            .map(|rect| rect.width())
+            .unwrap_or(900.0)
+            .max(80.0) as f64;
+        let ppf = f64::from(self.pixels_per_frame.max(editor_core::MIN_PIXELS_PER_FRAME));
+        let view_frames = width / ppf;
+        let max_origin = (end as f64 - view_frames).max(0.0);
+        if !self.timeline_origin.is_finite() || self.timeline_origin < 0.0 {
+            self.timeline_origin = 0.0;
+        }
+        if self.timeline_origin > max_origin {
+            self.timeline_origin = max_origin;
+        }
     }
 
     pub fn note_text_focus(&mut self, response: &egui::Response) {
@@ -905,6 +965,30 @@ impl MeridianApp {
                 }
             }
         }
+        let snap = self.proxy_job.as_ref().map(|job| job.snapshot());
+        if let Some(snap) = snap {
+            self.proxy_note = snap.message.clone();
+            if snap.finished {
+                self.proxy_job = None;
+                if !snap.attached.is_empty() {
+                    let links = snap
+                        .attached
+                        .iter()
+                        .map(|(id, path)| (MediaId(*id), path.clone()))
+                        .collect();
+                    match self.session.attach_proxies(links) {
+                        Ok(()) => self.status = snap.message,
+                        Err(err) => self.status = err.to_string(),
+                    }
+                } else {
+                    self.status = snap.message;
+                }
+                self.proxy_note.clear();
+            } else {
+                self.status = snap.message;
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+        }
     }
 
     pub fn add_transition_at_selection(&mut self, kind: TransitionKind) {
@@ -959,9 +1043,132 @@ impl MeridianApp {
     }
 
     pub fn zoom_to_fit(&mut self) {
-        let frames = (self.sequence_end() + 24).max(48) as f32;
-        let width = self.timeline_width.max(200.0);
-        self.pixels_per_frame = (width / frames).clamp(0.2, 64.0);
+        let frames = self.sequence_end().max(1) as f32;
+        let width = self
+            .timeline_view
+            .map(|rect| rect.width())
+            .unwrap_or(900.0)
+            .max(80.0);
+        self.pixels_per_frame = editor_core::clamp_timeline_zoom(width / frames);
+        self.timeline_origin = 0.0;
+    }
+
+    pub fn toggle_proxies(&mut self) {
+        let next = !self.session.project().prefer_proxies;
+        self.session.set_prefer_proxies(next);
+        self.status = if next {
+            "Prefer proxies. Preview uses a proxy when that file is on disk, and the original otherwise.".into()
+        } else {
+            "Full resolution preview. Export always uses the original.".into()
+        };
+    }
+
+    pub fn cancel_proxies(&mut self) {
+        if let Some(job) = &self.proxy_job {
+            job.cancel();
+            self.proxy_note = "Cancelling proxy generation…".into();
+            self.status = self.proxy_note.clone();
+        }
+    }
+
+    pub fn generate_proxies(&mut self, whole_project: bool) {
+        if self.proxy_job.is_some() {
+            self.status = "A proxy job is already running.".into();
+            return;
+        }
+        let project_path = self.path.clone();
+        let dir = match project_path.as_deref() {
+            Some(path) => editor_media::project_proxy_dir(std::path::Path::new(path)),
+            None => editor_media::unsaved_proxy_dir(),
+        };
+        let selected = self.selected_media;
+        let items: Vec<crate::proxy_job::ProxyItem> = self
+            .session
+            .project()
+            .media
+            .iter()
+            .filter(|media| media.has_video)
+            .filter(|media| whole_project || selected == Some(media.id))
+            .filter(|media| !ui::media_missing(&media.path))
+            .map(|media| {
+                let source = resolve_media_path(&media.path);
+                let output = editor_media::proxy_output_path(&dir, &source);
+                crate::proxy_job::ProxyItem {
+                    media_id: media.id.0,
+                    name: media.name.clone(),
+                    source,
+                    output,
+                }
+            })
+            .collect();
+        if items.is_empty() {
+            self.status = if whole_project {
+                "No online video in the project to proxy.".into()
+            } else {
+                "Select an online video clip in the pool.".into()
+            };
+            return;
+        }
+        let total = items.len();
+        self.proxy_note = format!("Proxy 0/{total}");
+        self.status = self.proxy_note.clone();
+        self.proxy_job = Some(crate::proxy_job::spawn_proxies(items));
+    }
+
+    pub fn relink_selected(&mut self) {
+        let Some(id) = self.selected_media else {
+            self.status = "Select a pool item to relink.".into();
+            return;
+        };
+        self.relink_media(id);
+    }
+
+    pub fn relink_media(&mut self, id: MediaId) {
+        let Some(path) = dialogs::relink_media_file() else {
+            self.status = "Relink cancelled.".into();
+            return;
+        };
+        let canonical = canonical_media_path(&path);
+        let probed = match probe(std::path::Path::new(&canonical)) {
+            Ok(result) => result,
+            Err(err) => {
+                self.status = err.to_string();
+                return;
+            }
+        };
+        let mut asset = asset_from_probe(&probed);
+        asset.path = canonical.clone();
+        asset.offline = ui::media_missing(&canonical);
+        let name = self
+            .session
+            .project()
+            .media(id)
+            .map(|media| media.name.clone())
+            .unwrap_or_else(|| "media".into());
+        match self.session.relink_media(id, asset) {
+            Ok(()) => {
+                let state = if ui::media_missing(&canonical) {
+                    "offline"
+                } else {
+                    "online"
+                };
+                self.status = format!("Relinked {name} ({state}) — {canonical}");
+            }
+            Err(err) => self.status = err.to_string(),
+        }
+    }
+
+    pub fn open_dense(&mut self) {
+        self.session.replace_project(editor_core::dense_project());
+        self.path = None;
+        self.playhead = 0;
+        self.selected.clear();
+        self.selected_media = Some(MediaId(10));
+        self.pixels_per_frame = editor_core::clamp_timeline_zoom(0.05);
+        self.timeline_origin = 0.0;
+        self.halt_transport();
+        self.workspace = Workspace::Edit;
+        self.status = "Opened a 400-clip sequence. Fit shows minutes; zoom in to frames.".into();
     }
 
     pub fn import_dialog(&mut self) {
@@ -1387,6 +1594,7 @@ fn asset_from_probe(result: &editor_media::ProbeResult) -> MediaAsset {
         has_video: result.has_video,
         has_audio: result.has_audio,
         offline: result.offline,
+        proxy_path: None,
     }
 }
 
@@ -1595,8 +1803,30 @@ impl MeridianApp {
                             open_import(self);
                             ui.close_menu();
                         }
+                        if ui.button("Relink Media…").clicked() {
+                            self.relink_selected();
+                            ui.close_menu();
+                        }
                         if ui.button("New Title").clicked() {
                             self.add_title();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Generate Proxies for Selection").clicked() {
+                            self.generate_proxies(false);
+                            ui.close_menu();
+                        }
+                        if ui.button("Generate Proxies for Project").clicked() {
+                            self.generate_proxies(true);
+                            ui.close_menu();
+                        }
+                        let proxy_label = if self.session.project().prefer_proxies {
+                            "Use Full Resolution"
+                        } else {
+                            "Prefer Proxies"
+                        };
+                        if ui.button(proxy_label).clicked() {
+                            self.toggle_proxies();
                             ui.close_menu();
                         }
                         ui.separator();
@@ -1649,6 +1879,11 @@ impl MeridianApp {
                         }
                     });
                     ui.menu_button("Sequence", |ui| {
+                        if ui.button("Dense Sequence (400 clips)").clicked() {
+                            self.open_dense();
+                            ui.close_menu();
+                        }
+                        ui.separator();
                         if ui.button("Mark In").clicked() {
                             self.mark_in();
                             ui.close_menu();
@@ -1883,10 +2118,13 @@ impl MeridianApp {
                                 .color(theme::THEME.text_dim),
                         );
                         ui.label(
-                            RichText::new(format!("{:.1} px/f", self.pixels_per_frame))
-                                .size(11.0)
-                                .monospace()
-                                .color(theme::THEME.text_mute),
+                            RichText::new(editor_core::timeline_scale_label(
+                                self.pixels_per_frame,
+                                self.timebase().fps_f64(),
+                            ))
+                            .size(11.0)
+                            .monospace()
+                            .color(theme::THEME.text_mute),
                         );
                     });
                 });

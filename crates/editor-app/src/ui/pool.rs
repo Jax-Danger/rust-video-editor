@@ -8,6 +8,9 @@ use crate::ui::widgets;
 
 pub fn media_pool(ui: &mut egui::Ui, app: &mut MeridianApp) {
     widgets::panel_header(ui, "Media Pool", |ui| {
+        if widgets::ghost_button(ui, "Relink") {
+            app.relink_selected();
+        }
         if widgets::ghost_button(ui, "Import") {
             app.import_dialog();
         }
@@ -15,6 +18,7 @@ pub fn media_pool(ui: &mut egui::Ui, app: &mut MeridianApp) {
             app.add_title();
         }
     });
+    proxy_bar(ui, app);
 
     let bins: Vec<_> = app
         .session
@@ -41,6 +45,9 @@ pub fn media_pool(ui: &mut egui::Ui, app: &mut MeridianApp) {
                 m.kind_label(),
                 m.has_video,
                 m.has_audio,
+                m.proxy_path
+                    .as_deref()
+                    .is_some_and(|path| !super::media_missing(path)),
             )
         })
         .collect();
@@ -94,10 +101,11 @@ pub fn media_pool(ui: &mut egui::Ui, app: &mut MeridianApp) {
                 if !open {
                     continue;
                 }
-                for (mid, bin, mname, dur, tb, w, h, offline, kind, video, audio) in &media {
+                for (mid, bin, mname, dur, tb, w, h, offline, kind, video, audio, proxy) in &media {
                     if *bin == id {
                         media_row(
-                            ui, app, *mid, mname, *dur, *tb, *w, *h, *offline, kind, *video, *audio,
+                            ui, app, *mid, mname, *dur, *tb, *w, *h, *offline, kind, *video,
+                            *audio, *proxy,
                         );
                     }
                 }
@@ -109,12 +117,13 @@ pub fn media_pool(ui: &mut egui::Ui, app: &mut MeridianApp) {
                                 .size(11.0)
                                 .color(THEME.text_mute),
                         );
-                        for (mid, bin, mname, dur, tb, w, h, offline, kind, video, audio) in &media
+                        for (mid, bin, mname, dur, tb, w, h, offline, kind, video, audio, proxy) in
+                            &media
                         {
                             if *bin == *cid {
                                 media_row(
                                     ui, app, *mid, mname, *dur, *tb, *w, *h, *offline, kind,
-                                    *video, *audio,
+                                    *video, *audio, *proxy,
                                 );
                             }
                         }
@@ -150,6 +159,30 @@ fn bin_header(ui: &mut egui::Ui, name: &str, open: bool) -> bool {
     response.clicked()
 }
 
+fn proxy_bar(ui: &mut egui::Ui, app: &mut MeridianApp) {
+    let prefer = app.session.project().prefer_proxies;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        let label = if prefer { "Proxies" } else { "Full" };
+        if widgets::chip(ui, label, prefer) {
+            app.toggle_proxies();
+        }
+        if widgets::ghost_button(ui, "Selected") {
+            app.generate_proxies(false);
+        }
+        if widgets::ghost_button(ui, "Project") {
+            app.generate_proxies(true);
+        }
+        if app.proxy_job.is_some() && widgets::ghost_button(ui, "Cancel") {
+            app.cancel_proxies();
+        }
+    });
+    if !app.proxy_note.is_empty() {
+        ui.label(RichText::new(&app.proxy_note).size(11.0).color(THEME.amber));
+    }
+    ui.add_space(2.0);
+}
+
 fn media_row(
     ui: &mut egui::Ui,
     app: &mut MeridianApp,
@@ -163,6 +196,7 @@ fn media_row(
     kind: &str,
     has_video: bool,
     has_audio: bool,
+    has_proxy: bool,
 ) {
     let selected = app.selected_media == Some(id);
     let (rect, response) = ui.allocate_exact_size(
@@ -232,14 +266,25 @@ fn media_row(
         .map(|media| media.path.clone())
         .unwrap_or_default();
     let missing = offline || super::media_missing(&path);
+    let online = Color32::from_rgb(110, 196, 150);
+    let status_color = if missing { THEME.amber } else { online };
+    painter.circle_filled(
+        pos2(thumb.right() - 3.0, thumb.bottom() - 3.0),
+        3.5,
+        status_color,
+    );
     let meta = if missing {
-        "Offline — file is not on disk".to_string()
+        "Offline — click the pill to relink".to_string()
     } else {
+        let proxy = if has_proxy { "   Proxy" } else { "" };
         match (width, height) {
             (Some(w), Some(h)) if w > 0 => {
-                format!("{kind}   {w}×{h}   {}", format_tc(duration, timebase))
+                format!(
+                    "Online   {kind}   {w}×{h}   {}{proxy}",
+                    format_tc(duration, timebase)
+                )
             }
-            _ => format!("{kind}   {}", format_tc(duration, timebase)),
+            _ => format!("Online   {kind}   {}{proxy}", format_tc(duration, timebase)),
         }
     };
     painter.text(
@@ -247,7 +292,11 @@ fn media_row(
         Align2::LEFT_TOP,
         meta,
         THEME.font(10.0),
-        THEME.text_mute,
+        if missing {
+            THEME.amber
+        } else {
+            THEME.text_mute
+        },
     );
     if missing {
         let pill = Rect::from_min_size(
@@ -275,6 +324,17 @@ fn media_row(
         app.status = "Drop on the timeline. Shift inserts instead of overwriting.".into();
     } else if response.clicked() {
         app.selected_media = Some(id);
+        if missing {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let pill = Rect::from_min_size(
+                    pos2(rect.right() - 58.0, rect.top() + 12.0),
+                    Vec2::new(48.0, 16.0),
+                );
+                if pill.contains(pos) {
+                    app.relink_media(id);
+                }
+            }
+        }
     }
     if response.double_clicked() {
         app.selected_media = Some(id);

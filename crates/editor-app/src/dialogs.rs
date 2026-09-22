@@ -8,6 +8,14 @@ const MEDIA_EXT: &[&str] = &[
     "ogg",
 ];
 
+pub fn relink_media_file() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Relink Media")
+        .add_filter("Media", MEDIA_EXT)
+        .add_filter("All files", &["*"])
+        .pick_file()
+}
+
 pub fn import_media_files() -> Option<Vec<PathBuf>> {
     rfd::FileDialog::new()
         .set_title("Import Media")

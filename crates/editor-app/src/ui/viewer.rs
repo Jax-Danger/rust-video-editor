@@ -10,8 +10,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use crate::composite::{
-    active_captions, burn_captions, compose_layers, mask_window, program_stack, transition_motion,
-    GradeSample, LayerSource, MaskWindow, PictureCache, Place, ProgramLayer,
+    active_captions, burn_captions, compose_layers, mask_window, transition_motion, GradeSample,
+    LayerSource, MaskWindow, PictureCache, Place, ProgramLayer,
 };
 use editor_core::{
     clip_relative, color_grade, transform, ColorGrade, Frame, MediaAsset, TrackKind, Transform,
@@ -48,7 +48,16 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
     let audio_badge = app.audio.badge();
     let audio_status = app.audio.status().to_string();
     let media = app.session.project().media.clone();
-    let plan = decode_plan(&sequence, playhead, &media, playing, scrubbing, reverse);
+    let prefer_proxies = app.session.project().prefer_proxies;
+    let plan = decode_plan(
+        &sequence,
+        playhead,
+        &media,
+        playing,
+        scrubbing,
+        reverse,
+        prefer_proxies,
+    );
     let backend = app.preview.backend().clone();
 
     let mut banner: Option<String> = None;
@@ -181,6 +190,15 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
         );
         ui.add_space(6.0);
         widgets::readout(ui, mode, 78.0, mode == "Preview");
+        ui.add_space(4.0);
+        let resolution = if plan.used_proxy {
+            "Proxy"
+        } else if prefer_proxies {
+            "Full*"
+        } else {
+            "Full"
+        };
+        widgets::readout(ui, resolution, 58.0, plan.used_proxy);
         ui.add_space(6.0);
         widgets::readout(ui, &format_tc(playhead, sequence.timebase), 118.0, true);
         ui.add_space(8.0);
@@ -523,6 +541,7 @@ struct DecodePlan {
     canvas_w: u32,
     canvas_h: u32,
     captions: Vec<String>,
+    used_proxy: bool,
 }
 
 enum PlanPixels {
@@ -643,6 +662,7 @@ fn decode_plan(
     playing: bool,
     scrubbing: bool,
     reverse: bool,
+    prefer_proxies: bool,
 ) -> DecodePlan {
     let (canvas_w, canvas_h) = fit_preview_size(
         sequence.width.max(2),
@@ -651,7 +671,14 @@ fn decode_plan(
         PREVIEW_MAX_H,
     )
     .unwrap_or((PREVIEW_MAX_W, PREVIEW_MAX_H));
-    let stack = program_stack(sequence, media, playhead, canvas_w, canvas_h);
+    let source = if prefer_proxies {
+        editor_media::PreviewSource::Proxy
+    } else {
+        editor_media::PreviewSource::Full
+    };
+    let stack =
+        editor_media::program_stack_with(sequence, media, playhead, canvas_w, canvas_h, source);
+    let used_proxy = stack.layers.iter().any(|layer| layer.using_proxy);
     let problem = if stack.layers.is_empty() {
         stack.errors.into_iter().next()
     } else {
@@ -711,6 +738,7 @@ fn decode_plan(
         canvas_w,
         canvas_h,
         captions: active_captions(sequence, playhead),
+        used_proxy,
     }
 }
 
@@ -756,6 +784,7 @@ fn program_from_plan(layer: &PlanLayer) -> ProgramLayer {
         grade: layer.grade.clone(),
         place: layer.place,
         label: layer.label.clone(),
+        using_proxy: false,
         clip_id: layer.clip_id,
     }
 }

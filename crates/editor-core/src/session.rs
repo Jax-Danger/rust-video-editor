@@ -89,6 +89,7 @@ impl Session {
         if self.interactive.is_some() {
             let result = f(&mut self.project);
             if result.is_ok() {
+                self.project.normalize();
                 self.dirty = true;
                 self.generation = self.generation.saturating_add(1);
             }
@@ -97,6 +98,7 @@ impl Session {
         let before = self.project.clone();
         match f(&mut self.project) {
             Ok(()) => {
+                self.project.normalize();
                 self.push_undo(label, before);
                 Ok(())
             }
@@ -292,6 +294,30 @@ impl Session {
         self.edit("Track", |project| {
             edit::set_track_flag(project, seq, track, flag, value)
         })
+    }
+
+    pub fn relink_media(&mut self, id: MediaId, source: MediaAsset) -> Result<(), EditError> {
+        self.edit("Relink media", |project| {
+            edit::relink_media(project, id, &source)
+        })
+    }
+
+    pub fn attach_proxies(&mut self, links: Vec<(MediaId, String)>) -> Result<(), EditError> {
+        self.edit("Attach proxies", |project| {
+            edit::attach_proxies(project, &links)?;
+            project.prefer_proxies = true;
+            Ok(())
+        })
+    }
+
+    /// Preview preference. Not an undo step; it is saved with the project.
+    pub fn set_prefer_proxies(&mut self, enabled: bool) {
+        if self.project.prefer_proxies == enabled {
+            return;
+        }
+        self.project.prefer_proxies = enabled;
+        self.dirty = true;
+        self.generation = self.generation.saturating_add(1);
     }
 
     pub fn import_media(&mut self, asset: MediaAsset) -> Result<MediaId, EditError> {

@@ -979,6 +979,7 @@ mod tests {
             has_video: false,
             has_audio: true,
             offline: true,
+            proxy_path: None,
         }];
         assert!(collect_pieces(&sequence, &media, 0, 48).is_empty());
         sequence.tracks[0].muted = false;
@@ -1045,6 +1046,7 @@ mod tests {
             has_video: false,
             has_audio: true,
             offline: false,
+            proxy_path: None,
         }
     }
 }

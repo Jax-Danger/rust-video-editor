@@ -929,6 +929,7 @@ mod tests {
             has_video: video,
             has_audio: audio,
             offline: false,
+            proxy_path: None,
         }
     }
 

@@ -2,8 +2,8 @@
 //! program monitor and Deliver share one grade, transform, and transition path.
 
 pub use editor_media::{
-    active_captions, burn_captions, compose_layers, mask_window, program_stack, transition_motion,
-    CanvasMask, GradeSample, LayerSource, MaskWindow, Place, ProgramLayer,
+    active_captions, burn_captions, compose_layers, mask_window, transition_motion, CanvasMask,
+    GradeSample, LayerSource, MaskWindow, Place, ProgramLayer,
 };
 
 pub struct PictureCache {

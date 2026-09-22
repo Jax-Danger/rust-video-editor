@@ -8,10 +8,16 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-use editor_media::{decode_frames, preview_backend, FrameRequest, PreviewBackend, MAX_BURST};
+use editor_media::{
+    decode_frames, frame_cache_dir, preview_backend, FrameCache, FrameRequest, PreviewBackend,
+    DEFAULT_FRAME_CACHE_BYTES, MAX_BURST,
+};
 use egui::{ColorImage, Context, TextureHandle, TextureOptions};
 
-const CACHE_LIMIT: usize = 96;
+/// In-memory decoded frames. 256 MiB is about 128 frames of 960×540 RGBA.
+pub const PREVIEW_MEMORY_BYTES: usize = 256 * 1024 * 1024;
+/// Cap on tiny frames so the map cannot grow without a byte limit binding.
+pub const PREVIEW_MEMORY_FRAMES: usize = 192;
 const LOOKAHEAD: i64 = 8;
 
 /// Where a decode burst should start so scrubbing reuses one ffmpeg invocation.
@@ -160,6 +166,7 @@ pub struct PreviewEngine {
     slots: HashMap<FrameKey, Slot>,
     lru: VecDeque<FrameKey>,
     textures: HashMap<FrameKey, TextureHandle>,
+    memory_bytes: usize,
 }
 
 impl PreviewEngine {
@@ -183,6 +190,7 @@ impl PreviewEngine {
             slots: HashMap::new(),
             lru: VecDeque::new(),
             textures: HashMap::new(),
+            memory_bytes: 0,
         }
     }
 
@@ -406,14 +414,14 @@ impl PreviewEngine {
                             rgba: Arc::from(frame.rgba.into_boxed_slice()),
                             key: key.clone(),
                         };
-                        self.slots.insert(key.clone(), Slot::Ready(image));
-                        self.touch(&key);
+                        self.insert_ready(key, image);
                     }
                     self.evict();
                 }
                 Err(message) => {
                     for offset in 0..done.count {
                         let key = done.key.at(done.start_frame + i64::from(offset));
+                        self.drop_ready_bytes(&key);
                         self.slots.insert(key, Slot::Failed(message.clone()));
                     }
                 }
@@ -429,12 +437,29 @@ impl PreviewEngine {
         self.lru.push_back(key.clone());
     }
 
+    fn insert_ready(&mut self, key: FrameKey, image: PreviewImage) {
+        self.drop_ready_bytes(&key);
+        self.memory_bytes = self.memory_bytes.saturating_add(image.rgba.len());
+        self.slots.insert(key.clone(), Slot::Ready(image));
+        self.touch(&key);
+    }
+
+    fn drop_ready_bytes(&mut self, key: &FrameKey) {
+        if let Some(Slot::Ready(image)) = self.slots.get(key) {
+            self.memory_bytes = self.memory_bytes.saturating_sub(image.rgba.len());
+        }
+    }
+
     fn evict(&mut self) {
-        while self.lru.len() > CACHE_LIMIT {
-            if let Some(old) = self.lru.pop_front() {
-                self.slots.remove(&old);
-                self.textures.remove(&old);
-            }
+        while self.lru.len() > 1
+            && (self.memory_bytes > PREVIEW_MEMORY_BYTES || self.lru.len() > PREVIEW_MEMORY_FRAMES)
+        {
+            let Some(old) = self.lru.pop_front() else {
+                break;
+            };
+            self.drop_ready_bytes(&old);
+            self.slots.remove(&old);
+            self.textures.remove(&old);
         }
     }
 
@@ -479,12 +504,9 @@ mod tests {
 }
 
 fn worker_loop(rx: Receiver<Job>, tx: Sender<JobDone>) {
+    let mut cache = FrameCache::open(frame_cache_dir(), DEFAULT_FRAME_CACHE_BYTES);
     while let Ok(job) = rx.recv() {
-        let result =
-            match FrameRequest::new(&job.path, job.time_secs, job.width, job.height, job.count) {
-                Ok(request) => decode_frames(&request).map_err(|err| err.to_string()),
-                Err(err) => Err(err.to_string()),
-            };
+        let result = decode_job(&mut cache, &job);
         let done = JobDone {
             id: job.id,
             key: job.key(),
@@ -496,4 +518,22 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<JobDone>) {
             break;
         }
     }
+}
+
+fn decode_job(
+    cache: &mut FrameCache,
+    job: &Job,
+) -> Result<Vec<editor_media::DecodedFrame>, String> {
+    if let Some(frames) =
+        cache.get_burst(&job.path, job.start_frame, job.count, job.width, job.height)
+    {
+        return Ok(frames);
+    }
+    let frames = match FrameRequest::new(&job.path, job.time_secs, job.width, job.height, job.count)
+    {
+        Ok(request) => decode_frames(&request).map_err(|err| err.to_string())?,
+        Err(err) => return Err(err.to_string()),
+    };
+    cache.put_burst(&job.path, job.start_frame, job.width, job.height, &frames);
+    Ok(frames)
 }

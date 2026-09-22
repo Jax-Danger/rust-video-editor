@@ -462,6 +462,8 @@ pub struct ProgramLayer {
     pub grade: GradeSample,
     pub place: Place,
     pub label: String,
+    /// True when the decoded file is the proxy rather than the camera original.
+    pub using_proxy: bool,
     pub clip_id: u64,
 }
 
@@ -486,6 +488,26 @@ pub fn program_stack(
     canvas_w: u32,
     canvas_h: u32,
 ) -> ProgramStack {
+    program_stack_with(
+        sequence,
+        media,
+        playhead,
+        canvas_w,
+        canvas_h,
+        crate::PreviewSource::Full,
+    )
+}
+
+/// Like [`program_stack`], but preview may substitute a proxy file.
+/// Export keeps calling [`program_stack`], which is always full resolution.
+pub fn program_stack_with(
+    sequence: &Sequence,
+    media: &[MediaAsset],
+    playhead: i64,
+    canvas_w: u32,
+    canvas_h: u32,
+    source: crate::PreviewSource,
+) -> ProgramStack {
     let mut layers = Vec::new();
     let mut errors = Vec::new();
     if canvas_w < 2 || canvas_h < 2 {
@@ -498,7 +520,9 @@ pub fn program_stack(
     }) {
         if let Some(hit) = transition_hit(track, playhead) {
             for (clip, outgoing) in [(hit.left, true), (hit.right, false)] {
-                match layer_from_clip(sequence, track, clip, media, playhead, canvas_w, canvas_h) {
+                match layer_from_clip(
+                    sequence, track, clip, media, playhead, canvas_w, canvas_h, source,
+                ) {
                     Ok(Some(mut layer)) => {
                         layer.place = apply_transition(
                             layer.place,
@@ -524,7 +548,9 @@ pub fn program_stack(
             .iter()
             .find(|clip| clip.enabled && clip.covers(Frame(playhead)))
         {
-            match layer_from_clip(sequence, track, clip, media, playhead, canvas_w, canvas_h) {
+            match layer_from_clip(
+                sequence, track, clip, media, playhead, canvas_w, canvas_h, source,
+            ) {
                 Ok(Some(layer)) => layers.push(layer),
                 Ok(None) => {}
                 Err(message) => errors.push(message),
@@ -592,6 +618,7 @@ fn layer_from_clip(
     playhead: i64,
     canvas_w: u32,
     canvas_h: u32,
+    source: crate::PreviewSource,
 ) -> Result<Option<ProgramLayer>, String> {
     if !clip.enabled {
         return Ok(None);
@@ -613,6 +640,7 @@ fn layer_from_clip(
             grade: GradeSample::from_effects(&clip.effects, rel),
             place,
             label: format!("{}  {}", track.name, clip.name),
+            using_proxy: false,
             clip_id: clip.id.0,
         }));
     }
@@ -626,7 +654,7 @@ fn layer_from_clip(
     if !asset.has_video {
         return Err(format!("{} has no picture", asset.name));
     }
-    let resolved = crate::resolve_media_path(&asset.path);
+    let (resolved, using_proxy) = crate::preview_file(asset, source);
     if !resolved.is_file() {
         return Err(format!("Offline — {} is not on disk", asset.name));
     }
@@ -654,6 +682,7 @@ fn layer_from_clip(
         grade: GradeSample::from_effects(&clip.effects, rel),
         place,
         label: format!("{}  {}", track.name, clip.name),
+        using_proxy,
         clip_id: clip.id.0,
     }))
 }
@@ -1626,6 +1655,7 @@ mod tests {
             has_video: true,
             has_audio: false,
             offline: false,
+            proxy_path: None,
         };
         let stack = program_stack(&sequence, &[asset.clone()], 2, 64, 36);
         assert_eq!(stack.layers.len(), 2);
@@ -1636,6 +1666,52 @@ mod tests {
         let stack = program_stack(&sequence, &[asset], 2, 64, 36);
         assert_eq!(stack.layers.len(), 1);
         assert!(stack.layers[0].label.contains("TOP"));
+        assert!(!stack.layers[0].using_proxy);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proxy_preview_is_opt_in_and_full_stack_stays_on_the_original() {
+        use editor_core::{Clip, MediaAsset, MediaId, Sequence, Timebase, TrackKind};
+
+        let dir = std::env::temp_dir().join(format!("meridian-proxy-stack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = dir.join("original.mp4");
+        let proxy = dir.join("proxy.mp4");
+        std::fs::write(&original, b"full").unwrap();
+        std::fs::write(&proxy, b"proxy").unwrap();
+        let mut sequence = Sequence::new(SequenceId(1), "Cut", 64, 36, Timebase::fps_24());
+        sequence.add_track(TrackId(2), TrackKind::Video, "V1");
+        let mut clip = Clip::basic(10, 0, 12);
+        clip.media_id = Some(MediaId(1));
+        sequence.tracks[0].clips = vec![clip];
+        let asset = MediaAsset {
+            id: MediaId(1),
+            bin_id: editor_core::BinId(1),
+            name: "clip".into(),
+            path: original.to_string_lossy().into_owned(),
+            duration: editor_core::Frame(24),
+            timebase: Timebase::fps_24(),
+            width: Some(64),
+            height: Some(36),
+            video_codec: Some("h264".into()),
+            audio_codec: None,
+            audio_channels: None,
+            sample_rate: None,
+            has_video: true,
+            has_audio: false,
+            offline: false,
+            proxy_path: Some(proxy.to_string_lossy().into_owned()),
+        };
+        let full = program_stack(&sequence, &[asset.clone()], 2, 64, 36);
+        assert_eq!(full.layers.len(), 1);
+        assert!(!full.layers[0].using_proxy);
+        assert!(media_path(&full.layers[0]).ends_with("original.mp4"));
+        let preview =
+            program_stack_with(&sequence, &[asset], 2, 64, 36, crate::PreviewSource::Proxy);
+        assert!(preview.layers[0].using_proxy);
+        assert!(media_path(&preview.layers[0]).ends_with("proxy.mp4"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1713,6 +1789,7 @@ mod tests {
             has_video: true,
             has_audio: false,
             offline: false,
+            proxy_path: None,
         };
         let stack = program_stack(&sequence, &[asset], 2, 160, 48);
         assert!(stack.errors.is_empty(), "{:?}", stack.errors);
@@ -1738,6 +1815,13 @@ mod tests {
             "picture should remain outside the title plate"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn media_path(layer: &ProgramLayer) -> &str {
+        match &layer.source {
+            LayerSource::Media { path, .. } => path,
+            LayerSource::Title(_) => "",
+        }
     }
 
     fn ink_centroid(rgba: &[u8], w: u32, h: u32) -> (f32, f32) {

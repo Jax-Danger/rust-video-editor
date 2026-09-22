@@ -5,6 +5,7 @@ mod caption_job;
 mod composite;
 mod dialogs;
 mod preview;
+mod proxy_job;
 mod theme;
 mod ui;
 
