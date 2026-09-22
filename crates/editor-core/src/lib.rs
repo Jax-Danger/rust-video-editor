@@ -33,8 +33,9 @@ pub use deliver_preset::{
 };
 pub use demo::{demo_project, dense_project};
 pub use edit::{
-    active_sequence_id, add_adjustment_layer, add_marker, add_title, add_transition, attach_proxies,
-    clip_from_media, resolve_source_marks,
+    active_sequence_id, add_adjustment_layer, add_marker, add_marker_with_color, add_title,
+    add_transition, attach_proxies, create_bin, delete_bin, delete_marker,
+    clip_from_media, move_media_to_bin, rename_bin, resolve_source_marks,
     collect_snap_points, delete_cue, expand_linked, import_media, insert_clips, lift_delete,
     link_clips, move_clips, overwrite_clips, razor_at, razor_clip, relink_media, replace_captions,
     ripple_delete, ripple_trim, ripple_trim_next_to_playhead, ripple_trim_prev_to_playhead,
@@ -42,7 +43,7 @@ pub use edit::{
     set_clip_volume, set_filter_at, set_grade_at, set_in_point, set_luma_curve_point,
     set_master_fader, set_out_point, set_track_eq, set_track_eq_low_cut, set_track_fader,
     set_track_flag, set_track_pan,
-    set_transform_at, set_wheel_offsets_at, slide, slip, snap_span, snap_to_targets,
+    set_transform_at, set_wheel_offsets_at, slide, slip, snap_span, snap_to_targets, update_marker,
     source_frame_at, toggle_filter_key, toggle_grade_key, toggle_transform_key, toggle_volume_key,
     trim, update_cue_text, EditError, EqBand, SnapHit, SnapKind, SnapPoint, TrackFlag, TrimEdge,
 };

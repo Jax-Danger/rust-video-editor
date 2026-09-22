@@ -7,8 +7,9 @@ use editor_core::{
     create_multicam, create_nested_sequence, expand_linked, link_clips, multicam_target,
     nested_sequence_id, plan_export, replace_captions, resolve_source_marks, set_angle_sync,
     switch_angle, Bin, BinId, BusState, CaptionTranscriber, ClipId, CueId, Direction, EditError,
-    ExportRange, Frame, MediaAsset, MediaId, MulticamId, Project, SequenceId, Session, Timebase,
-    Track, TrackFlag, TrackId, TrackKind, TransitionKind, TrimEdge,
+    ExportRange, Frame, LabelColor, MarkerId, MediaAsset, MediaId, MulticamId, Project,
+    SequenceId, Session, Timebase, Track, TrackFlag, TrackId, TrackKind, TransitionKind,
+    TrimEdge,
 };
 use editor_media::{duration_frames, probe, resolve_media_path};
 use egui::{Event, Key, Modifiers, RichText, ViewportCommand};
@@ -260,6 +261,10 @@ pub struct MeridianApp {
     pub targeted_tracks: HashSet<TrackId>,
     /// Parent sequences when editing inside a nested compound clip.
     pub sequence_nav_stack: Vec<SequenceId>,
+    pub selected_bin: Option<BinId>,
+    pub selected_marker: Option<MarkerId>,
+    /// Inline rename buffer for a media-pool bin.
+    pub renaming_bin: Option<(BinId, String)>,
 }
 
 impl MeridianApp {
@@ -317,6 +322,9 @@ impl MeridianApp {
             caption_job: None,
             targeted_tracks: HashSet::new(),
             sequence_nav_stack: Vec::new(),
+            selected_bin: None,
+            selected_marker: None,
+            renaming_bin: None,
         };
         app.reset_track_targets();
         app.sync_title(&cc.egui_ctx);
@@ -1004,6 +1012,14 @@ impl MeridianApp {
             self.mark_out();
         } else if tap(Key::M) {
             self.add_marker();
+        } else if pressed(Key::OpenBracket) {
+            if self.focused_monitor == MonitorFocus::Program {
+                self.jump_marker(-1);
+            }
+        } else if pressed(Key::CloseBracket) {
+            if self.focused_monitor == MonitorFocus::Program {
+                self.jump_marker(1);
+            }
         } else if tap(Key::S) && !mods.command {
             self.snap_enabled = !self.snap_enabled;
             self.status = if self.snap_enabled {
@@ -1024,7 +1040,11 @@ impl MeridianApp {
         } else if pressed_shift(Key::Delete) || pressed_shift(Key::Backspace) {
             self.delete_selection(true);
         } else if pressed(Key::Delete) || pressed(Key::Backspace) {
-            self.delete_selection(false);
+            if self.selected.is_empty() && self.selected_marker.is_some() {
+                self.delete_selected_marker();
+            } else {
+                self.delete_selection(false);
+            }
         } else if pressed(Key::Equals) || pressed(Key::Plus) {
             self.zoom_by(1.25);
         } else if pressed(Key::Minus) {
@@ -1035,6 +1055,8 @@ impl MeridianApp {
         } else if tap(Key::Escape) {
             self.selected.clear();
             self.selected_cue = None;
+            self.selected_marker = None;
+            self.renaming_bin = None;
             self.dragging_media = None;
             self.status = "Selection cleared.".into();
         }
@@ -1163,6 +1185,148 @@ impl MeridianApp {
         let name = format!("Marker {}", format_tc(self.playhead, self.timebase()));
         match self.session.add_marker(Frame(self.playhead), &name) {
             Ok(()) => self.status = format!("Added {name}."),
+            Err(err) => self.status = err.to_string(),
+        }
+    }
+
+    pub fn delete_selected_marker(&mut self) {
+        let Some(marker_id) = self.selected_marker else {
+            self.status = "No marker selected.".into();
+            return;
+        };
+        match self.session.delete_marker(marker_id) {
+            Ok(()) => {
+                self.selected_marker = None;
+                self.status = "Deleted marker.".into();
+            }
+            Err(err) => self.status = err.to_string(),
+        }
+    }
+
+    pub fn jump_to_marker(&mut self, marker_id: MarkerId) {
+        let marker_name = self
+            .session
+            .project()
+            .active()
+            .and_then(|sequence| {
+                sequence
+                    .markers
+                    .iter()
+                    .find(|marker| marker.id == marker_id)
+                    .map(|marker| (marker.frame.0, marker.name.clone()))
+            });
+        if let Some((frame, name)) = marker_name {
+            self.playhead = frame;
+            self.selected_marker = Some(marker_id);
+            self.halt_transport();
+            self.reveal_playhead = true;
+            self.status = format!("Marker — {name}.");
+        }
+    }
+
+    pub fn jump_marker(&mut self, direction: i64) {
+        let Some(sequence) = self.session.project().active() else {
+            return;
+        };
+        let markers = &sequence.markers;
+        if markers.is_empty() {
+            self.status = "No markers in this sequence.".into();
+            return;
+        }
+        let target = if direction > 0 {
+            markers
+                .iter()
+                .find(|marker| marker.frame.0 > self.playhead)
+                .or_else(|| markers.first())
+        } else {
+            markers
+                .iter()
+                .rev()
+                .find(|marker| marker.frame.0 < self.playhead)
+                .or_else(|| markers.last())
+        };
+        if let Some(marker) = target {
+            self.jump_to_marker(marker.id);
+        }
+    }
+
+    pub fn update_marker_name(&mut self, marker_id: MarkerId, name: String) {
+        match self.session.update_marker(marker_id, Some(name), None, None, None) {
+            Ok(()) => {}
+            Err(err) => self.status = err.to_string(),
+        }
+    }
+
+    pub fn update_marker_color(&mut self, marker_id: MarkerId, color: LabelColor) {
+        match self.session.update_marker(marker_id, None, Some(color), None, None) {
+            Ok(()) => {}
+            Err(err) => self.status = err.to_string(),
+        }
+    }
+
+    pub fn update_marker_comment(&mut self, marker_id: MarkerId, comment: String) {
+        match self.session.update_marker(marker_id, None, None, Some(comment), None) {
+            Ok(()) => {}
+            Err(err) => self.status = err.to_string(),
+        }
+    }
+
+    pub fn create_pool_bin(&mut self, parent: Option<BinId>) {
+        let count = self.session.project().bins.len() + 1;
+        let name = if count == 1 {
+            "Master".to_string()
+        } else {
+            format!("Bin {count}")
+        };
+        match self.session.create_bin(parent, &name) {
+            Ok(bin_id) => {
+                self.selected_bin = Some(bin_id);
+                self.renaming_bin = Some((bin_id, name.clone()));
+                self.status = format!("Created {name}.");
+            }
+            Err(err) => self.status = err.to_string(),
+        }
+    }
+
+    pub fn rename_pool_bin(&mut self, bin_id: BinId, name: String) {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            self.status = "Bin name cannot be empty.".into();
+            return;
+        }
+        match self.session.rename_bin(bin_id, trimmed) {
+            Ok(()) => {
+                self.renaming_bin = None;
+                self.status = format!("Renamed bin to {trimmed}.");
+            }
+            Err(err) => self.status = err.to_string(),
+        }
+    }
+
+    pub fn delete_pool_bin(&mut self, bin_id: BinId) {
+        match self.session.delete_bin(bin_id) {
+            Ok(()) => {
+                if self.selected_bin == Some(bin_id) {
+                    self.selected_bin = self.session.project().bins.first().map(|bin| bin.id);
+                }
+                self.renaming_bin = None;
+                self.status = "Deleted bin.".into();
+            }
+            Err(err) => self.status = err.to_string(),
+        }
+    }
+
+    pub fn move_pool_selection_to_bin(&mut self, bin_id: BinId) {
+        if self.pool_selection.is_empty() {
+            self.status = "Select media to move.".into();
+            return;
+        }
+        let ids = self.pool_selection.clone();
+        match self.session.move_media_to_bin(&ids, bin_id) {
+            Ok(()) => {
+                self.selected_bin = Some(bin_id);
+                self.status = format!("Moved {} item(s) to bin.", ids.len());
+            }
             Err(err) => self.status = err.to_string(),
         }
     }
@@ -1960,9 +2124,13 @@ impl MeridianApp {
             return;
         }
         let count = assets.len();
+        let target_bin = self.selected_bin;
         let result = self.session.edit("Import media", move |project| {
             ensure_master_bin(project);
-            for asset in assets {
+            for mut asset in assets {
+                if let Some(bin_id) = target_bin {
+                    asset.bin_id = bin_id;
+                }
                 editor_core::import_media(project, asset);
             }
             Ok(())
@@ -3259,6 +3427,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("I / O", "Mark in / out on the focused monitor (source or program)"),
     ("\\", "Toggle focus between source and program monitors"),
     ("M", "Add marker"),
+    ("[ / ]", "Previous / next marker"),
     ("V", "Select tool"),
     ("C  /  Ctrl+K", "Razor at the playhead (also selects the razor tool)"),
     ("/", "Razor at the playhead (keeps the active tool)"),

@@ -1,5 +1,7 @@
-use editor_core::MediaId;
-use egui::{pos2, Align2, Color32, FontId, Id, Rect, RichText, Sense, Stroke, Vec2};
+use editor_core::{BinId, MediaId};
+use egui::{
+    pos2, Align2, Color32, FontId, Id, Rect, RichText, Sense, Stroke, TextEdit, Ui, Vec2,
+};
 
 use crate::app::MeridianApp;
 use crate::theme::THEME;
@@ -8,6 +10,9 @@ use crate::ui::widgets;
 
 pub fn media_pool(ui: &mut egui::Ui, app: &mut MeridianApp) {
     widgets::panel_header(ui, "Media Pool", |ui| {
+        if widgets::ghost_button(ui, "New Bin") {
+            app.create_pool_bin(app.selected_bin);
+        }
         if widgets::ghost_button(ui, "Relink") {
             app.relink_selected();
         }
@@ -71,7 +76,7 @@ pub fn media_pool(ui: &mut egui::Ui, app: &mut MeridianApp) {
                 m.width,
                 m.height,
                 m.offline,
-                m.kind_label(),
+                m.kind_label().to_string(),
                 m.has_video,
                 m.has_audio,
                 m.proxy_path
@@ -95,7 +100,7 @@ pub fn media_pool(ui: &mut egui::Ui, app: &mut MeridianApp) {
         );
     }
 
-    if media.is_empty() {
+    if bins.is_empty() && media.is_empty() {
         ui.add_space(12.0);
         ui.label(
             RichText::new("The pool is empty.")
@@ -104,14 +109,18 @@ pub fn media_pool(ui: &mut egui::Ui, app: &mut MeridianApp) {
         );
         widgets::empty_note(
             ui,
-            "File → Import, Ctrl+I, or drop video, audio, or stills here. Then double-click to open in source, or use Overwrite / Insert.",
+            "Create a bin, import with File → Import or Ctrl+I, or drop files here. Double-click to open in source.",
         );
         return;
     }
 
-    let roots: Vec<_> = bins.iter().filter(|b| b.2.is_none()).cloned().collect();
-    let list = if roots.is_empty() {
-        bins.clone()
+    let roots: Vec<BinId> = bins
+        .iter()
+        .filter(|(_, _, parent)| parent.is_none())
+        .map(|(id, _, _)| *id)
+        .collect();
+    let roots = if roots.is_empty() {
+        bins.iter().map(|(id, _, _)| *id).collect()
     } else {
         roots
     };
@@ -121,71 +130,170 @@ pub fn media_pool(ui: &mut egui::Ui, app: &mut MeridianApp) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.add_space(4.0);
-            for (id, name, _) in list {
-                let open_id = Id::new(("bin-open", id.0));
-                let open = ui.ctx().data(|data| data.get_temp(open_id)).unwrap_or(true);
-                if bin_header(ui, &name, open) {
-                    ui.ctx().data_mut(|data| data.insert_temp(open_id, !open));
-                }
-                if !open {
-                    continue;
-                }
-                for (mid, bin, mname, dur, tb, w, h, offline, kind, video, audio, proxy) in &media {
-                    if *bin == id {
-                        media_row(
-                            ui, app, *mid, mname, *dur, *tb, *w, *h, *offline, kind, *video,
-                            *audio, *proxy,
-                        );
-                    }
-                }
-                for (cid, cname, parent) in &bins {
-                    if *parent == Some(id) {
-                        ui.add_space(2.0);
-                        ui.label(
-                            RichText::new(format!("  {cname}"))
-                                .size(11.0)
-                                .color(THEME.text_mute),
-                        );
-                        for (mid, bin, mname, dur, tb, w, h, offline, kind, video, audio, proxy) in
-                            &media
-                        {
-                            if *bin == *cid {
-                                media_row(
-                                    ui, app, *mid, mname, *dur, *tb, *w, *h, *offline, kind,
-                                    *video, *audio, *proxy,
-                                );
-                            }
-                        }
-                    }
-                }
+            for bin_id in roots {
+                paint_bin(ui, app, bin_id, 0, &bins, &media);
             }
             ui.add_space(6.0);
         });
 }
 
-fn bin_header(ui: &mut egui::Ui, name: &str, open: bool) -> bool {
+fn paint_bin(
+    ui: &mut Ui,
+    app: &mut MeridianApp,
+    bin_id: BinId,
+    depth: usize,
+    bins: &[(BinId, String, Option<BinId>)],
+    media: &[(
+        MediaId,
+        BinId,
+        String,
+        i64,
+        editor_core::Timebase,
+        Option<u32>,
+        Option<u32>,
+        bool,
+        String,
+        bool,
+        bool,
+        bool,
+    )],
+) {
+    let Some((_, name, _)) = bins.iter().find(|(id, _, _)| *id == bin_id) else {
+        return;
+    };
+    let indent = 8.0 + depth as f32 * 14.0;
+    let open_id = Id::new(("bin-open", bin_id.0));
+    let open = ui.ctx().data(|data| data.get_temp(open_id)).unwrap_or(true);
+    let selected = app.selected_bin == Some(bin_id);
+    let renaming = app.renaming_bin.as_ref().map(|(id, _)| *id) == Some(bin_id);
+    let drop_target = app.dragging_media.is_some();
+
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::click());
     let painter = ui.painter();
-    if response.hovered() {
+    if selected {
+        painter.rect_filled(rect, 0.0, THEME.accent_dim);
+    } else if response.hovered() || (drop_target && response.hovered()) {
         painter.rect_filled(rect, 0.0, THEME.header);
     }
+    if drop_target && response.hovered() {
+        painter.rect_stroke(
+            rect,
+            0.0,
+            Stroke::new(1.0_f32, THEME.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+
     let mark = if open { "▾" } else { "▸" };
     painter.text(
-        pos2(rect.left() + 8.0, rect.center().y),
+        pos2(rect.left() + indent, rect.center().y),
         Align2::LEFT_CENTER,
         mark,
         FontId::new(11.0, egui::FontFamily::Proportional),
         THEME.text_dim,
     );
-    painter.text(
-        pos2(rect.left() + 22.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        name,
-        FontId::new(12.0, egui::FontFamily::Proportional),
-        THEME.text,
-    );
-    response.clicked()
+
+    if renaming {
+        if let Some((id, buffer)) = app.renaming_bin.as_mut() {
+            if *id == bin_id {
+                let edit = ui.put(
+                    Rect::from_min_size(
+                        pos2(rect.left() + indent + 14.0, rect.top() + 2.0),
+                        Vec2::new(rect.width() - indent - 18.0, 18.0),
+                    ),
+                    TextEdit::singleline(buffer).font(FontId::new(
+                        12.0,
+                        egui::FontFamily::Proportional,
+                    )),
+                );
+                if edit.lost_focus()
+                    || ui.input(|input| input.key_pressed(egui::Key::Enter))
+                {
+                    let next = buffer.clone();
+                    app.rename_pool_bin(bin_id, next);
+                }
+            }
+        }
+    } else {
+        painter.text(
+            pos2(rect.left() + indent + 14.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            name,
+            FontId::new(12.0, egui::FontFamily::Proportional),
+            THEME.text,
+        );
+    }
+
+    if response.clicked() {
+        app.selected_bin = Some(bin_id);
+        ui.ctx().data_mut(|data| data.insert_temp(open_id, !open));
+    }
+    if response.double_clicked() && !renaming {
+        app.selected_bin = Some(bin_id);
+        app.renaming_bin = Some((bin_id, name.clone()));
+    }
+    if app.dragging_media.is_some()
+        && response.hovered()
+        && ui.input(|input| input.pointer.any_released())
+    {
+        app.move_pool_selection_to_bin(bin_id);
+        app.dragging_media = None;
+    }
+
+    response.context_menu(|ui| {
+        if ui.button("New Sub-bin").clicked() {
+            app.create_pool_bin(Some(bin_id));
+            ui.close_menu();
+        }
+        if ui.button("Rename").clicked() {
+            app.selected_bin = Some(bin_id);
+            app.renaming_bin = Some((bin_id, name.clone()));
+            ui.close_menu();
+        }
+        if ui.button("Delete Bin").clicked() {
+            app.delete_pool_bin(bin_id);
+            ui.close_menu();
+        }
+        if !app.pool_selection.is_empty() {
+            ui.separator();
+            if ui.button("Move Selection Here").clicked() {
+                app.move_pool_selection_to_bin(bin_id);
+                ui.close_menu();
+            }
+        }
+    });
+
+    if !open {
+        return;
+    }
+
+    for (mid, bin, mname, dur, tb, w, h, offline, kind, video, audio, proxy) in media {
+        if *bin == bin_id {
+            media_row(
+                ui,
+                app,
+                *mid,
+                mname,
+                *dur,
+                *tb,
+                *w,
+                *h,
+                *offline,
+                kind,
+                *video,
+                *audio,
+                *proxy,
+                indent + 14.0,
+            );
+        }
+    }
+
+    for (child_id, _, parent) in bins {
+        if *parent == Some(bin_id) {
+            paint_bin(ui, app, *child_id, depth + 1, bins, media);
+        }
+    }
 }
 
 fn proxy_bar(ui: &mut egui::Ui, app: &mut MeridianApp) {
@@ -226,6 +334,7 @@ fn media_row(
     has_video: bool,
     has_audio: bool,
     has_proxy: bool,
+    indent: f32,
 ) {
     let selected = app.pool_selection.contains(&id);
     let (rect, response) = ui.allocate_exact_size(
@@ -245,7 +354,7 @@ fn media_row(
     }
 
     let thumb = Rect::from_min_size(
-        pos2(rect.left() + 8.0, rect.top() + 6.0),
+        pos2(rect.left() + indent, rect.top() + 6.0),
         Vec2::new(32.0, 24.0),
     );
     let thumb_color = if has_video {
@@ -353,7 +462,7 @@ fn media_row(
         if !app.pool_selection.contains(&id) {
             app.pool_selection = vec![id];
         }
-        app.status = "Drop on the timeline. Shift inserts instead of overwriting.".into();
+        app.status = "Drop on a bin to move, or on the timeline to edit.".into();
     } else if response.clicked() {
         let mods = ui.input(|input| input.modifiers);
         if mods.command {
@@ -372,6 +481,9 @@ fn media_row(
         } else {
             app.pool_selection = vec![id];
             app.selected_media = Some(id);
+        }
+        if let Some(media) = app.session.project().media(id) {
+            app.selected_bin = Some(media.bin_id);
         }
         if missing {
             if let Some(pos) = response.interact_pointer_pos() {
@@ -396,7 +508,25 @@ fn media_row(
             .media(id)
             .map(|media| media.path.clone())
         {
-            response.on_hover_text(format!("Offline — {path}"));
+            response.clone().on_hover_text(format!("Offline — {path}"));
         }
     }
+
+    response.context_menu(|ui| {
+        let bins: Vec<(BinId, String)> = app
+            .session
+            .project()
+            .bins
+            .iter()
+            .map(|bin| (bin.id, bin.name.clone()))
+            .collect();
+        ui.menu_button("Move to Bin", |ui| {
+            for (bin_id, bin_name) in bins {
+                if ui.button(bin_name).clicked() {
+                    app.move_pool_selection_to_bin(bin_id);
+                    ui.close_menu();
+                }
+            }
+        });
+    });
 }
