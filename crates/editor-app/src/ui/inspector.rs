@@ -1,9 +1,10 @@
 use editor_core::{
     blur, chroma_key, clip_relative, color_grade, crop, set_clip_gain_at, set_clip_speed,
-    set_clip_title, set_filter_at, set_grade_at, set_transform_at, sharpen, stabilize,
-    source_frame_at, toggle_filter_key, toggle_grade_key, toggle_transform_key, toggle_volume_key,
-    transform, vignette, ClipId, ClipSpeed, FilterParam, GradeParam, LabelColor, MarkerId,
-    TextAlign, Title, TrackKind, TransformParam,
+    set_clip_title, set_filter_at, set_grade_at, set_shape_mask_invert, set_shape_mask_shape,
+    set_track_matte, set_transform_at, shape_mask, sharpen, stabilize, source_frame_at,
+    toggle_filter_key, toggle_grade_key, toggle_transform_key, toggle_volume_key, transform,
+    vignette, ClipId, ClipSpeed, FilterParam, GradeParam, LabelColor, MarkerId, ShapeMaskKind,
+    TextAlign, Title, TrackKind, TrackMatteBinding, TrackMatteMode, TransformParam,
 };
 use egui::{pos2, Align2, Rect, RichText, Sense, TextEdit, Vec2};
 
@@ -287,6 +288,8 @@ fn inspector_body(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId, sna
 
     if snapshot.kind == TrackKind::Video {
         effects_controls(ui, app, clip_id, rel);
+        mask_controls(ui, app, clip_id, rel);
+        track_matte_controls(ui, app, clip_id);
     }
 
     ui.add_space(8.0);
@@ -1276,12 +1279,259 @@ fn effects_controls(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId, r
     );
 }
 
+fn mask_controls(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId, rel: i64) {
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add_space(2.0);
+        ui.vertical(|ui| {
+            widgets::section_label(ui, "Mask");
+        });
+    });
+    let shape = clip_shape_mask_kind(app, clip_id);
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        ui.label("Shape");
+        let rect_selected = shape == ShapeMaskKind::Rectangle;
+        let ellipse_selected = shape == ShapeMaskKind::Ellipse;
+        if ui.selectable_label(rect_selected, "Rect").clicked() && !rect_selected {
+            write_shape_mask_shape(app, clip_id, ShapeMaskKind::Rectangle);
+        }
+        if ui
+            .selectable_label(ellipse_selected, "Ellipse")
+            .clicked()
+            && !ellipse_selected
+        {
+            write_shape_mask_shape(app, clip_id, ShapeMaskKind::Ellipse);
+        }
+    });
+    filter_slider(
+        ui,
+        app,
+        clip_id,
+        rel,
+        FilterParam::ShapeMaskCenterX,
+        "Center X",
+        0.0..=1.0,
+    );
+    filter_slider(
+        ui,
+        app,
+        clip_id,
+        rel,
+        FilterParam::ShapeMaskCenterY,
+        "Center Y",
+        0.0..=1.0,
+    );
+    filter_slider(
+        ui,
+        app,
+        clip_id,
+        rel,
+        FilterParam::ShapeMaskWidth,
+        "Width",
+        0.05..=1.0,
+    );
+    filter_slider(
+        ui,
+        app,
+        clip_id,
+        rel,
+        FilterParam::ShapeMaskHeight,
+        "Height",
+        0.05..=1.0,
+    );
+    filter_slider(
+        ui,
+        app,
+        clip_id,
+        rel,
+        FilterParam::ShapeMaskFeather,
+        "Feather",
+        0.0..=0.5,
+    );
+    let invert = clip_shape_mask_invert(app, clip_id);
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        let mut inverted = invert;
+        if ui.checkbox(&mut inverted, "Invert mask").changed() {
+            write_shape_mask_invert(app, clip_id, inverted);
+        }
+    });
+}
+
+fn track_matte_controls(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId) {
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add_space(2.0);
+        ui.vertical(|ui| {
+            widgets::section_label(ui, "Track Matte");
+        });
+    });
+    let Some(sequence) = app.session.project().active() else {
+        return;
+    };
+    let tracks: Vec<(u32, String)> = editor_media::visible_video_tracks(sequence)
+        .enumerate()
+        .map(|(index, track)| (index as u32, track.name.clone()))
+        .collect();
+    let current = clip_track_matte(app, clip_id);
+    let selected = current.as_ref().map(|m| m.source_track);
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        ui.label("Source track");
+        egui::ComboBox::from_id_salt(format!("track_matte_{clip_id:?}"))
+            .selected_text(match selected {
+                Some(index) => tracks
+                    .iter()
+                    .find(|(i, _)| *i == index)
+                    .map(|(_, name)| name.as_str())
+                    .unwrap_or("Unknown"),
+                None => "None",
+            })
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(selected.is_none(), "None").clicked() {
+                    write_track_matte(app, clip_id, None);
+                }
+                for (index, name) in &tracks {
+                    if ui
+                        .selectable_label(selected == Some(*index), name)
+                        .clicked()
+                    {
+                        let mode = current
+                            .as_ref()
+                            .map(|m| m.mode)
+                            .unwrap_or(TrackMatteMode::Alpha);
+                        let invert = current.as_ref().map(|m| m.invert).unwrap_or(false);
+                        write_track_matte(
+                            app,
+                            clip_id,
+                            Some(TrackMatteBinding {
+                                source_track: *index,
+                                mode,
+                                invert,
+                            }),
+                        );
+                    }
+                }
+            });
+    });
+    if let Some(matte) = current {
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label("Mode");
+            let alpha = matte.mode == TrackMatteMode::Alpha;
+            let luma = matte.mode == TrackMatteMode::Luma;
+            if ui.selectable_label(alpha, "Alpha").clicked() && !alpha {
+                write_track_matte(
+                    app,
+                    clip_id,
+                    Some(TrackMatteBinding {
+                        source_track: matte.source_track,
+                        mode: TrackMatteMode::Alpha,
+                        invert: matte.invert,
+                    }),
+                );
+            }
+            if ui.selectable_label(luma, "Luma").clicked() && !luma {
+                write_track_matte(
+                    app,
+                    clip_id,
+                    Some(TrackMatteBinding {
+                        source_track: matte.source_track,
+                        mode: TrackMatteMode::Luma,
+                        invert: matte.invert,
+                    }),
+                );
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            let mut inverted = matte.invert;
+            if ui.checkbox(&mut inverted, "Invert matte").changed() {
+                write_track_matte(
+                    app,
+                    clip_id,
+                    Some(TrackMatteBinding {
+                        source_track: matte.source_track,
+                        mode: matte.mode,
+                        invert: inverted,
+                    }),
+                );
+            }
+        });
+    }
+}
+
+fn clip_shape_mask_kind(app: &MeridianApp, clip_id: ClipId) -> ShapeMaskKind {
+    clip_effects(app, clip_id)
+        .and_then(|effects| shape_mask(effects))
+        .map(|mask| mask.shape)
+        .unwrap_or(ShapeMaskKind::Rectangle)
+}
+
+fn clip_shape_mask_invert(app: &MeridianApp, clip_id: ClipId) -> bool {
+    clip_effects(app, clip_id)
+        .and_then(|effects| shape_mask(effects))
+        .map(|mask| mask.invert)
+        .unwrap_or(false)
+}
+
+fn clip_track_matte(app: &MeridianApp, clip_id: ClipId) -> Option<TrackMatteBinding> {
+    let sequence = app.session.project().active()?;
+    let clip = sequence.clip(clip_id)?;
+    clip.track_matte.clone()
+}
+
+fn clip_effects<'a>(
+    app: &'a MeridianApp,
+    clip_id: ClipId,
+) -> Option<&'a [editor_core::Effect]> {
+    let sequence = app.session.project().active()?;
+    let clip = sequence.clip(clip_id)?;
+    Some(&clip.effects)
+}
+
+fn write_shape_mask_shape(app: &mut MeridianApp, clip_id: ClipId, shape: ShapeMaskKind) {
+    let Ok(seq) = app.session.active_id() else {
+        return;
+    };
+    if let Err(err) = app.session.edit("Mask shape", |project| {
+        set_shape_mask_shape(project, seq, clip_id, shape)
+    }) {
+        app.status = err.to_string();
+    }
+}
+
+fn write_shape_mask_invert(app: &mut MeridianApp, clip_id: ClipId, invert: bool) {
+    let Ok(seq) = app.session.active_id() else {
+        return;
+    };
+    if let Err(err) = app.session.edit("Mask invert", |project| {
+        set_shape_mask_invert(project, seq, clip_id, invert)
+    }) {
+        app.status = err.to_string();
+    }
+}
+
+fn write_track_matte(app: &mut MeridianApp, clip_id: ClipId, matte: Option<TrackMatteBinding>) {
+    let Ok(seq) = app.session.active_id() else {
+        return;
+    };
+    if let Err(err) = app.session.edit("Track matte", |project| {
+        set_track_matte(project, seq, clip_id, matte)
+    }) {
+        app.status = err.to_string();
+    }
+}
+
 fn filter_value(app: &MeridianApp, clip: ClipId, rel: i64, param: FilterParam) -> (f32, bool) {
     let neutral = match param {
         FilterParam::VignetteSoftness | FilterParam::StabilizeSmoothing => 0.5,
         FilterParam::ChromaKeyGreen => 1.0,
         FilterParam::ChromaKeySoftness => 0.15,
         FilterParam::ChromaKeySpillSuppression => 0.5,
+        FilterParam::ShapeMaskCenterX | FilterParam::ShapeMaskCenterY => 0.5,
+        FilterParam::ShapeMaskWidth | FilterParam::ShapeMaskHeight => 1.0,
         _ => 0.0,
     };
     let Some(sequence) = app.session.project().active() else {
@@ -1309,6 +1559,11 @@ fn filter_value(app: &MeridianApp, clip: ClipId, rel: i64, param: FilterParam) -
         }
         FilterParam::StabilizeStrength => stabilize(&clip.effects).map(|f| &f.strength),
         FilterParam::StabilizeSmoothing => stabilize(&clip.effects).map(|f| &f.smoothing),
+        FilterParam::ShapeMaskCenterX => shape_mask(&clip.effects).map(|f| &f.center_x),
+        FilterParam::ShapeMaskCenterY => shape_mask(&clip.effects).map(|f| &f.center_y),
+        FilterParam::ShapeMaskWidth => shape_mask(&clip.effects).map(|f| &f.width),
+        FilterParam::ShapeMaskHeight => shape_mask(&clip.effects).map(|f| &f.height),
+        FilterParam::ShapeMaskFeather => shape_mask(&clip.effects).map(|f| &f.feather),
     };
     if let Some(anim) = anim {
         (anim.value_at(rel), anim.has_key(rel))

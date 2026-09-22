@@ -341,6 +341,7 @@ fn placed(
         speed: crate::model::ClipSpeed::normal(),
         multicam: None,
         nested: None,
+        track_matte: None,
     }
 }
 

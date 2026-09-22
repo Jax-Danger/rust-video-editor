@@ -15,10 +15,10 @@
 //! decodes, so a ramp or a constant rate is the same picture in both.
 
 use editor_core::{
-    blur, chroma_key, clip_relative, color_grade, crop, picture_at, sharpen, stabilize,
-    source_frame_at, transform, vignette, Clip, ColorGrade, Direction, Frame, MediaAsset,
-    MulticamGroup, Sequence,
-    SequenceId, Title, ToneCurve, Track, TrackKind, Transform, TransitionKind, MAX_NEST_DEPTH,
+    blur, chroma_key, clip_relative, color_grade, crop, picture_at, shape_mask, sharpen,
+    stabilize, source_frame_at, transform, vignette, Clip, ColorGrade, Direction, Frame,
+    MediaAsset, MulticamGroup, Sequence, SequenceId, ShapeMaskKind, Title, ToneCurve, Track,
+    TrackKind, TrackMatteBinding, TrackMatteMode, Transform, TransitionKind, MAX_NEST_DEPTH,
 };
 
 use crate::stabilize::{baked_correction, load_sidecar, stabilize_runtime, MotionSample};
@@ -161,6 +161,17 @@ impl GradeSample {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShapeMaskSample {
+    pub shape: ShapeMaskKind,
+    pub center_x: f32,
+    pub center_y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub feather: f32,
+    pub invert: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct FilterSample {
     pub blur_radius: f32,
@@ -172,6 +183,7 @@ pub struct FilterSample {
     pub chroma_key_tolerance: f32,
     pub chroma_key_softness: f32,
     pub chroma_key_spill: f32,
+    pub shape_mask: Option<ShapeMaskSample>,
 }
 
 impl FilterSample {
@@ -186,6 +198,7 @@ impl FilterSample {
             chroma_key_tolerance: 0.0,
             chroma_key_softness: 0.15,
             chroma_key_spill: 0.0,
+            shape_mask: None,
         }
     }
 
@@ -250,6 +263,20 @@ impl FilterSample {
                 .map(|f| f.spill_suppression.value_at(rel))
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0),
+            shape_mask: shape_mask(effects).and_then(|mask| {
+                if !mask.is_active(rel) {
+                    return None;
+                }
+                Some(ShapeMaskSample {
+                    shape: mask.shape,
+                    center_x: mask.center_x.value_at(rel).clamp(0.0, 1.0),
+                    center_y: mask.center_y.value_at(rel).clamp(0.0, 1.0),
+                    width: mask.width.value_at(rel).clamp(0.01, 1.0),
+                    height: mask.height.value_at(rel).clamp(0.01, 1.0),
+                    feather: mask.feather.value_at(rel).clamp(0.0, 0.5),
+                    invert: mask.invert,
+                })
+            }),
         }
     }
 
@@ -259,6 +286,7 @@ impl FilterSample {
             && self.crop.iter().all(|v| *v < 1.0e-4)
             && self.sharpen < 1.0e-4
             && self.chroma_key_tolerance < 1.0e-4
+            && self.shape_mask.is_none()
     }
 }
 
@@ -767,6 +795,16 @@ pub struct BlitLayer<'a> {
     pub height: u32,
     pub grade: GradeSample,
     pub place: Place,
+    pub track_matte: Option<TrackMatteRef<'a>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TrackMatteRef<'a> {
+    pub rgba: &'a [u8],
+    pub dst_w: u32,
+    pub dst_h: u32,
+    pub mode: TrackMatteMode,
+    pub invert: bool,
 }
 
 /// Where a program layer's pixels come from. Titles are rasterized at composite
@@ -802,6 +840,8 @@ pub struct ComposeEnv<'a> {
     pub groups: &'a [MulticamGroup],
     pub preview_source: crate::PreviewSource,
     pub depth: u32,
+    pub sequence: Option<&'a Sequence>,
+    pub playhead: i64,
 }
 
 /// One layer, bottom to top. Higher timeline tracks are later.
@@ -820,6 +860,7 @@ pub struct ProgramLayer {
     /// True when the decoded file is the proxy rather than the camera original.
     pub using_proxy: bool,
     pub clip_id: u64,
+    pub track_matte: Option<TrackMatteBinding>,
 }
 
 impl ProgramLayer {
@@ -876,96 +917,20 @@ pub fn program_stack_with(
     if canvas_w < 2 || canvas_h < 2 {
         return ProgramStack { layers, errors };
     }
-    let seq_w = sequence.width.max(1) as f32;
-    let seq_h = sequence.height.max(1) as f32;
-    for track in sequence.tracks.iter().filter(|track| {
-        track.kind == TrackKind::Video && video_track_visible(track, &sequence.tracks)
-    }) {
-        if let Some(hit) = transition_hit(track, playhead) {
-            let mut transition_layers = Vec::new();
-            let mut dip_plate: Option<([f32; 3], f32)> = None;
-            for (clip, outgoing) in [(hit.left, true), (hit.right, false)] {
-                match layer_from_clip(
-                    sequence,
-                    track,
-                    clip,
-                    media,
-                    groups,
-                    sequences,
-                    playhead,
-                    canvas_w,
-                    canvas_h,
-                    source,
-                ) {
-                    Ok(Some(mut layer)) => {
-                        let (place, motion) = apply_transition(
-                            layer.place,
-                            &hit.kind,
-                            hit.progress,
-                            outgoing,
-                            seq_w,
-                            seq_h,
-                        );
-                        layer.place = place;
-                        if let Some(plate) = motion.dip_plate {
-                            dip_plate = Some(plate);
-                        }
-                        // The transition can change scale-1 geometry into a slide,
-                        // so the decode size has to follow the final place.
-                        let (width, height) = layer_pixel_size(canvas_w, canvas_h, &layer.place);
-                        layer.width = width;
-                        layer.height = height;
-                        transition_layers.push(layer);
-                    }
-                    Ok(None) => {}
-                    Err(message) => errors.push(message),
-                }
-            }
-            if let Some((rgb, opacity)) = dip_plate {
-                if opacity > 0.001 && !transition_layers.is_empty() {
-                    let plate = ProgramLayer {
-                        source: LayerSource::Solid { rgb },
-                        width: canvas_w,
-                        height: canvas_h,
-                        grade: GradeSample::neutral(),
-                        filters: FilterSample::neutral(),
-                        stabilize: StabilizeSample::off(),
-                        stabilize_keyframes: Vec::new(),
-                        place: Place {
-                            opacity,
-                            ..Place::identity()
-                        },
-                        label: "Dip plate".into(),
-                        clip_id: 0,
-                        using_proxy: false,
-                    };
-                    let insert_at = transition_layers.len().min(1);
-                    transition_layers.insert(insert_at, plate);
-                }
-            }
-            layers.extend(transition_layers);
-        } else if let Some(clip) = track
-            .clips
-            .iter()
-            .find(|clip| clip.enabled && clip.covers(Frame(playhead)))
-        {
-            match layer_from_clip(
-                sequence,
-                track,
-                clip,
-                media,
-                groups,
-                sequences,
-                playhead,
-                canvas_w,
-                canvas_h,
-                source,
-            ) {
-                Ok(Some(layer)) => layers.push(layer),
-                Ok(None) => {}
-                Err(message) => errors.push(message),
-            }
-        }
+    for track in visible_video_tracks(sequence) {
+        push_track_layers(
+            sequence,
+            track,
+            playhead,
+            canvas_w,
+            canvas_h,
+            media,
+            groups,
+            sequences,
+            source,
+            &mut layers,
+            &mut errors,
+        );
     }
     ProgramStack { layers, errors }
 }
@@ -982,6 +947,198 @@ pub fn video_track_visible(track: &Track, tracks: &[Track]) -> bool {
     } else {
         true
     }
+}
+
+pub fn visible_video_tracks<'a>(sequence: &'a Sequence) -> impl Iterator<Item = &'a Track> + 'a {
+    sequence.tracks.iter().filter(move |track| {
+        track.kind == TrackKind::Video && video_track_visible(track, &sequence.tracks)
+    })
+}
+
+pub fn visible_video_track_at(sequence: &Sequence, index: u32) -> Option<&Track> {
+    visible_video_tracks(sequence).nth(index as usize)
+}
+
+fn push_track_layers(
+    sequence: &Sequence,
+    track: &Track,
+    playhead: i64,
+    canvas_w: u32,
+    canvas_h: u32,
+    media: &[MediaAsset],
+    groups: &[MulticamGroup],
+    sequences: &[Sequence],
+    source: crate::PreviewSource,
+    layers: &mut Vec<ProgramLayer>,
+    errors: &mut Vec<String>,
+) {
+    let seq_w = sequence.width.max(1) as f32;
+    let seq_h = sequence.height.max(1) as f32;
+    if let Some(hit) = transition_hit(track, playhead) {
+        let mut transition_layers = Vec::new();
+        let mut dip_plate: Option<([f32; 3], f32)> = None;
+        for (clip, outgoing) in [(hit.left, true), (hit.right, false)] {
+            match layer_from_clip(
+                sequence,
+                track,
+                clip,
+                media,
+                groups,
+                sequences,
+                playhead,
+                canvas_w,
+                canvas_h,
+                source,
+            ) {
+                Ok(Some(mut layer)) => {
+                    let (place, motion) = apply_transition(
+                        layer.place,
+                        &hit.kind,
+                        hit.progress,
+                        outgoing,
+                        seq_w,
+                        seq_h,
+                    );
+                    layer.place = place;
+                    if let Some(plate) = motion.dip_plate {
+                        dip_plate = Some(plate);
+                    }
+                    let (width, height) = layer_pixel_size(canvas_w, canvas_h, &layer.place);
+                    layer.width = width;
+                    layer.height = height;
+                    transition_layers.push(layer);
+                }
+                Ok(None) => {}
+                Err(message) => errors.push(message),
+            }
+        }
+        if let Some((rgb, opacity)) = dip_plate {
+            if opacity > 0.001 && !transition_layers.is_empty() {
+                let plate = ProgramLayer {
+                    source: LayerSource::Solid { rgb },
+                    width: canvas_w,
+                    height: canvas_h,
+                    grade: GradeSample::neutral(),
+                    filters: FilterSample::neutral(),
+                    stabilize: StabilizeSample::off(),
+                    stabilize_keyframes: Vec::new(),
+                    place: Place {
+                        opacity,
+                        ..Place::identity()
+                    },
+                    label: "Dip plate".into(),
+                    clip_id: 0,
+                    using_proxy: false,
+                    track_matte: None,
+                };
+                let insert_at = transition_layers.len().min(1);
+                transition_layers.insert(insert_at, plate);
+            }
+        }
+        layers.extend(transition_layers);
+    } else if let Some(clip) = track
+        .clips
+        .iter()
+        .find(|clip| clip.enabled && clip.covers(Frame(playhead)))
+    {
+        match layer_from_clip(
+            sequence,
+            track,
+            clip,
+            media,
+            groups,
+            sequences,
+            playhead,
+            canvas_w,
+            canvas_h,
+            source,
+        ) {
+            Ok(Some(layer)) => layers.push(layer),
+            Ok(None) => {}
+            Err(message) => errors.push(message),
+        }
+    }
+}
+
+fn layers_for_visible_video_track(
+    sequence: &Sequence,
+    video_track_index: u32,
+    playhead: i64,
+    canvas_w: u32,
+    canvas_h: u32,
+    media: &[MediaAsset],
+    groups: &[MulticamGroup],
+    sequences: &[Sequence],
+    source: crate::PreviewSource,
+) -> Result<Vec<ProgramLayer>, String> {
+    let track = visible_video_track_at(sequence, video_track_index)
+        .ok_or_else(|| format!("video track {video_track_index} is not available"))?;
+    let mut layers = Vec::new();
+    let mut errors = Vec::new();
+    push_track_layers(
+        sequence,
+        track,
+        playhead,
+        canvas_w,
+        canvas_h,
+        media,
+        groups,
+        sequences,
+        source,
+        &mut layers,
+        &mut errors,
+    );
+    if layers.is_empty() {
+        if let Some(error) = errors.first() {
+            return Err(error.clone());
+        }
+    }
+    for layer in &mut layers {
+        layer.track_matte = None;
+    }
+    Ok(layers)
+}
+
+fn matte_plate_for_track(
+    env: ComposeEnv<'_>,
+    video_track_index: u32,
+    dst_w: u32,
+    dst_h: u32,
+    media_rgba: &mut dyn FnMut(&ProgramLayer) -> Result<Vec<u8>, String>,
+) -> Result<Vec<u8>, String> {
+    let Some(sequence) = env.sequence else {
+        return Err("track matte needs a compose sequence".into());
+    };
+    let layers = layers_for_visible_video_track(
+        sequence,
+        video_track_index,
+        env.playhead,
+        dst_w,
+        dst_h,
+        env.media,
+        env.groups,
+        env.sequences,
+        env.preview_source,
+    )?;
+    if layers.is_empty() {
+        return Ok(vec![0u8; dst_w as usize * dst_h as usize * 4]);
+    }
+    let seq_w = sequence.width.max(1) as f32;
+    let seq_h = sequence.height.max(1) as f32;
+    compose_layers_env(
+        dst_w,
+        dst_h,
+        seq_w,
+        seq_h,
+        &layers,
+        Some(ComposeEnv {
+            sequence: env.sequence,
+            playhead: env.playhead,
+            depth: env.depth,
+            ..env
+        }),
+        media_rgba,
+    )
 }
 
 struct TransHit<'a> {
@@ -1058,6 +1215,7 @@ fn layer_from_clip(
             label: layer_label(track, clip),
             using_proxy: false,
             clip_id: clip.id.0,
+            track_matte: clip.track_matte.clone(),
         }));
     }
     if let Some(title) = clip.title.clone() {
@@ -1076,6 +1234,7 @@ fn layer_from_clip(
             label: layer_label(track, clip),
             using_proxy: false,
             clip_id: clip.id.0,
+            track_matte: clip.track_matte.clone(),
         }));
     }
     if let Some(binding) = &clip.nested {
@@ -1100,6 +1259,7 @@ fn layer_from_clip(
             label: layer_label(track, clip),
             using_proxy: false,
             clip_id: clip.id.0,
+            track_matte: clip.track_matte.clone(),
         }));
     }
     let resolved_angle = picture_at(clip, groups, media, Frame(playhead), sequence.timebase);
@@ -1165,6 +1325,7 @@ fn layer_from_clip(
         },
         using_proxy,
         clip_id: clip.id.0,
+        track_matte: clip.track_matte.clone(),
     }))
 }
 
@@ -1330,6 +1491,63 @@ fn apply_chroma_key(
     }
 }
 
+fn apply_shape_mask(rgba: &mut [u8], width: u32, height: u32, mask: &ShapeMaskSample) {
+    let w = width as f32;
+    let h = height as f32;
+    let cx = mask.center_x;
+    let cy = mask.center_y;
+    let hw = (mask.width * 0.5).max(1.0e-4);
+    let hh = (mask.height * 0.5).max(1.0e-4);
+    let feather = mask.feather.max(0.0);
+    for y in 0..height {
+        for x in 0..width {
+            let u = (x as f32 + 0.5) / w;
+            let v = (y as f32 + 0.5) / h;
+            let dist = match mask.shape {
+                ShapeMaskKind::Rectangle => {
+                    let dx = (u - cx).abs() - hw;
+                    let dy = (v - cy).abs() - hh;
+                    dx.max(dy)
+                }
+                ShapeMaskKind::Ellipse => {
+                    let dx = (u - cx) / hw;
+                    let dy = (v - cy) / hh;
+                    (dx * dx + dy * dy).sqrt() - 1.0
+                }
+            };
+            let mut matte = 1.0 - smoothstep(-feather, 0.0, dist);
+            if mask.invert {
+                matte = 1.0 - matte;
+            }
+            let idx = (y as usize * width as usize + x as usize) * 4;
+            let existing = rgba[idx + 3] as f32 / 255.0;
+            rgba[idx + 3] = (existing * matte.clamp(0.0, 1.0) * 255.0).round() as u8;
+        }
+    }
+}
+
+fn track_matte_factor(matte: TrackMatteRef<'_>, x: u32, y: u32) -> f32 {
+    if x >= matte.dst_w || y >= matte.dst_h {
+        return 0.0;
+    }
+    let idx = (y as usize * matte.dst_w as usize + x as usize) * 4;
+    if idx + 3 >= matte.rgba.len() {
+        return 0.0;
+    }
+    let r = matte.rgba[idx] as f32 / 255.0;
+    let g = matte.rgba[idx + 1] as f32 / 255.0;
+    let b = matte.rgba[idx + 2] as f32 / 255.0;
+    let a = matte.rgba[idx + 3] as f32 / 255.0;
+    let mut factor = match matte.mode {
+        TrackMatteMode::Alpha => a,
+        TrackMatteMode::Luma => rec709_luma([r, g, b]),
+    };
+    if matte.invert {
+        factor = 1.0 - factor;
+    }
+    factor.clamp(0.0, 1.0)
+}
+
 fn apply_filters(
     rgba: &mut [u8],
     width: u32,
@@ -1364,6 +1582,9 @@ fn apply_filters(
             filters.vignette_amount,
             filters.vignette_softness,
         );
+    }
+    if let Some(mask) = &filters.shape_mask {
+        apply_shape_mask(rgba, width, height, mask);
     }
 }
 
@@ -1507,6 +1728,8 @@ pub fn media_layers_in_stack(layers: &[ProgramLayer], env: ComposeEnv<'_>) -> Ve
                 );
                 let child_env = ComposeEnv {
                     depth: env.depth + 1,
+                    sequence: env.sequence,
+                    playhead: env.playhead,
                     ..env
                 };
                 out.extend(media_layers_in_stack(&stack.layers, child_env));
@@ -1552,6 +1775,8 @@ fn rasterize_nested(
         groups: env.groups,
         preview_source: env.preview_source,
         depth: env.depth + 1,
+        sequence: env.sequence,
+        playhead: env.playhead,
     };
     compose_layers_env(
         width,
@@ -1603,6 +1828,23 @@ pub fn compose_layers_env(
     let mut dst = vec![0u8; len];
     if dst_w == 0 || dst_h == 0 || seq_w <= 1.0 || seq_h <= 1.0 {
         return Ok(dst);
+    }
+    let mut matte_cache: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
+    if let Some(ref env) = env {
+        if env.sequence.is_some() {
+            let mut matte_tracks = Vec::new();
+            for layer in layers {
+                if let Some(binding) = &layer.track_matte {
+                    if !matte_tracks.contains(&binding.source_track) {
+                        matte_tracks.push(binding.source_track);
+                    }
+                }
+            }
+            for track_index in matte_tracks {
+                let plate = matte_plate_for_track(*env, track_index, dst_w, dst_h, &mut media_rgba)?;
+                matte_cache.insert(track_index, plate);
+            }
+        }
     }
     for layer in layers {
         if !layer.place.contributes() || layer.width == 0 || layer.height == 0 {
@@ -1663,12 +1905,22 @@ pub fn compose_layers_env(
                 layer.height,
             );
         }
+        let track_matte = layer.track_matte.as_ref().and_then(|binding| {
+            matte_cache.get(&binding.source_track).map(|plate| TrackMatteRef {
+                rgba: plate.as_slice(),
+                dst_w,
+                dst_h,
+                mode: binding.mode,
+                invert: binding.invert,
+            })
+        });
         let blit = BlitLayer {
             rgba: &rgba,
             width: layer.width,
             height: layer.height,
             grade: layer.grade.clone(),
             place,
+            track_matte,
         };
         composite_layer_over(&mut dst, dst_w, dst_h, seq_w, seq_h, &blit);
     }
@@ -1783,7 +2035,12 @@ fn grade_over(
                     src[2] as f32 / 255.0,
                 ])
             };
-            let alpha = src[3] as f32 / 255.0 * layer.place.opacity;
+            let alpha = src[3] as f32 / 255.0 * layer.place.opacity
+                * layer
+                    .track_matte
+                    .as_ref()
+                    .map(|matte| track_matte_factor(*matte, x, y))
+                    .unwrap_or(1.0);
             over(&mut dst[index..index + 4], rgb, alpha);
         }
     }
@@ -1808,7 +2065,12 @@ fn grade_over_masked(dst: &mut [u8], dst_w: u32, dst_h: u32, layer: &BlitLayer<'
                 src[1] as f32 / 255.0,
                 src[2] as f32 / 255.0,
             ]);
-            let alpha = src[3] as f32 / 255.0 * layer.place.opacity;
+            let alpha = src[3] as f32 / 255.0 * layer.place.opacity
+                * layer
+                    .track_matte
+                    .as_ref()
+                    .map(|matte| track_matte_factor(*matte, x, y))
+                    .unwrap_or(1.0);
             over(&mut dst[index..index + 4], rgb, alpha);
         }
     }
@@ -1889,7 +2151,12 @@ fn blit(dst: &mut [u8], dst_w: u32, dst_h: u32, seq_w: f32, seq_h: f32, layer: &
                 v * src_h as f32 - 0.5,
             );
             let rgb = layer.grade.apply([sample[0], sample[1], sample[2]]);
-            let alpha = sample[3] * place.opacity;
+            let alpha = sample[3] * place.opacity
+                * layer
+                    .track_matte
+                    .as_ref()
+                    .map(|matte| track_matte_factor(*matte, x as u32, y as u32))
+                    .unwrap_or(1.0);
             let index = (y as usize * dst_w as usize + x as usize) * 4;
             if index + 3 < dst.len() {
                 over(&mut dst[index..index + 4], rgb, alpha);
@@ -2252,6 +2519,7 @@ mod tests {
             height: h,
             grade,
             place,
+            track_matte: None,
         }
     }
 
@@ -2627,6 +2895,98 @@ mod tests {
     }
 
     #[test]
+    fn shape_mask_ellipse_softens_outside() {
+        let mut src = solid(32, 32, [255, 255, 255, 255]);
+        apply_filters(
+            &mut src,
+            32,
+            32,
+            &FilterSample {
+                shape_mask: Some(ShapeMaskSample {
+                    shape: ShapeMaskKind::Ellipse,
+                    center_x: 0.5,
+                    center_y: 0.5,
+                    width: 0.5,
+                    height: 0.5,
+                    feather: 0.05,
+                    invert: false,
+                }),
+                ..FilterSample::neutral()
+            },
+            0.0,
+        );
+        let centre = (16 * 32 + 16) * 4 + 3;
+        let corner = (2 * 32 + 2) * 4 + 3;
+        assert_eq!(src[centre], 255, "centre stays opaque");
+        assert!(src[corner] < 128, "corner is feathered out");
+    }
+
+    #[test]
+    fn shape_mask_invert_keeps_outside() {
+        let mut src = solid(32, 32, [255, 255, 255, 255]);
+        apply_filters(
+            &mut src,
+            32,
+            32,
+            &FilterSample {
+                shape_mask: Some(ShapeMaskSample {
+                    shape: ShapeMaskKind::Rectangle,
+                    center_x: 0.5,
+                    center_y: 0.5,
+                    width: 0.5,
+                    height: 0.5,
+                    feather: 0.02,
+                    invert: true,
+                }),
+                ..FilterSample::neutral()
+            },
+            0.0,
+        );
+        let centre = (16 * 32 + 16) * 4 + 3;
+        let corner = (2 * 32 + 2) * 4 + 3;
+        assert!(src[centre] < 128, "inverted centre is keyed out");
+        assert_eq!(src[corner], 255, "inverted outside stays opaque");
+    }
+
+    #[test]
+    fn track_matte_alpha_masks_during_composite() {
+        let src = solid(16, 16, [255, 0, 0, 255]);
+        let mut matte = vec![0u8; 16 * 16 * 4];
+        for y in 0..16 {
+            for x in 0..8 {
+                let idx = (y * 16 + x) * 4;
+                matte[idx..idx + 4].copy_from_slice(&[255, 255, 255, 255]);
+            }
+        }
+        let matte_ref = TrackMatteRef {
+            rgba: &matte,
+            dst_w: 16,
+            dst_h: 16,
+            mode: TrackMatteMode::Alpha,
+            invert: false,
+        };
+        let out = composite(
+            16,
+            16,
+            16.0,
+            16.0,
+            &[BlitLayer {
+                rgba: &src,
+                width: 16,
+                height: 16,
+                grade: GradeSample::neutral(),
+                place: Place::identity(),
+                track_matte: Some(matte_ref),
+            }],
+        );
+        let left = (8 * 16 + 4) * 4;
+        let right = (8 * 16 + 12) * 4;
+        assert_eq!(out[left], 255, "matte keeps left side");
+        assert_eq!(out[left + 3], 255);
+        assert_eq!(out[right + 3], 0, "transparent matte clears right side");
+    }
+
+    #[test]
     fn anchor_moves_the_opaque_centroid() {
         let src = solid(4, 4, [255, 255, 255, 255]);
         let centered = composite(
@@ -2978,6 +3338,7 @@ mod tests {
             label: "red".into(),
             using_proxy: false,
             clip_id: 1,
+            track_matte: None,
         };
         let adjustment = ProgramLayer {
             source: LayerSource::Adjustment,
@@ -2994,6 +3355,7 @@ mod tests {
             label: "adj".into(),
             using_proxy: false,
             clip_id: 2,
+            track_matte: None,
         };
         let top = ProgramLayer {
             source: LayerSource::Solid {
@@ -3012,6 +3374,7 @@ mod tests {
             label: "blue".into(),
             using_proxy: false,
             clip_id: 3,
+            track_matte: None,
         };
         let red_only = compose_layers(4, 4, 4.0, 4.0, &[bottom.clone()], |_| {
             Err("no media".into())
@@ -3110,6 +3473,7 @@ mod tests {
             label: "shake".into(),
             using_proxy: false,
             clip_id: 99,
+            track_matte: None,
         };
         let off = compose_layers(
             width,

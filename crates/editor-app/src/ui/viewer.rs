@@ -1136,6 +1136,7 @@ struct DecodePlan {
     compose_media: Vec<MediaAsset>,
     compose_groups: Vec<MulticamGroup>,
     compose_source: editor_media::PreviewSource,
+    playhead: i64,
     problem: Option<String>,
     chip: String,
     canvas_w: u32,
@@ -1166,6 +1167,7 @@ struct PlanLayer {
     width: u32,
     height: u32,
     clip_id: u64,
+    track_matte: Option<editor_core::TrackMatteBinding>,
 }
 
 impl PlanLayer {
@@ -1285,6 +1287,26 @@ impl DecodePlan {
             bits(layer.filters.chroma_key_tolerance).hash(&mut hasher);
             bits(layer.filters.chroma_key_softness).hash(&mut hasher);
             bits(layer.filters.chroma_key_spill).hash(&mut hasher);
+            if let Some(mask) = &layer.filters.shape_mask {
+                match mask.shape {
+                    editor_core::ShapeMaskKind::Rectangle => 0u8.hash(&mut hasher),
+                    editor_core::ShapeMaskKind::Ellipse => 1u8.hash(&mut hasher),
+                }
+                bits(mask.center_x).hash(&mut hasher);
+                bits(mask.center_y).hash(&mut hasher);
+                bits(mask.width).hash(&mut hasher);
+                bits(mask.height).hash(&mut hasher);
+                bits(mask.feather).hash(&mut hasher);
+                mask.invert.hash(&mut hasher);
+            }
+            if let Some(matte) = &layer.track_matte {
+                matte.source_track.hash(&mut hasher);
+                match matte.mode {
+                    editor_core::TrackMatteMode::Alpha => 0u8.hash(&mut hasher),
+                    editor_core::TrackMatteMode::Luma => 1u8.hash(&mut hasher),
+                }
+                matte.invert.hash(&mut hasher);
+            }
             layer.label.hash(&mut hasher);
         }
         for line in &self.captions {
@@ -1360,6 +1382,8 @@ fn decode_plan(
         groups,
         preview_source: source,
         depth: 0,
+        sequence: Some(sequence),
+        playhead,
     };
     let media_programs = media_layers_in_stack(&stack.layers, compose_env);
     let used_proxy = stack.layers.iter().any(|layer| layer.using_proxy);
@@ -1424,6 +1448,7 @@ fn decode_plan(
                 width: layer.width,
                 height: layer.height,
                 clip_id: layer.clip_id,
+                track_matte: layer.track_matte.clone(),
             }
         })
         .collect();
@@ -1438,6 +1463,7 @@ fn decode_plan(
         compose_media: media.to_vec(),
         compose_groups: groups.to_vec(),
         compose_source: source,
+        playhead,
         problem,
         chip,
         canvas_w,
@@ -1460,6 +1486,8 @@ fn compose_plan(
         groups: &plan.compose_groups,
         preview_source: plan.compose_source,
         depth: 0,
+        sequence: plan.compose_sequences.first(),
+        playhead: plan.playhead,
     };
     let mut cursor = 0;
     compose_layers_env(
@@ -1511,6 +1539,7 @@ fn program_from_plan(layer: &PlanLayer) -> ProgramLayer {
         label: layer.label.clone(),
         using_proxy: false,
         clip_id: layer.clip_id,
+        track_matte: layer.track_matte.clone(),
     }
 }
 

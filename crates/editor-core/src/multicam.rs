@@ -443,6 +443,7 @@ fn multicam_clip(
         speed: crate::model::ClipSpeed::normal(),
         multicam: Some(binding),
         nested: None,
+        track_matte: None,
     }
 }
 
