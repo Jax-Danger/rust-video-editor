@@ -688,6 +688,9 @@ fn write_raster(
     shared: &std::sync::Arc<std::sync::Mutex<ExportSnapshot>>,
 ) -> Result<(), String> {
     let mut cache = DecodeCache::default();
+    if let Ok(mut runtime) = crate::stabilize::stabilize_runtime().lock() {
+        runtime.reset();
+    }
     let total = plan.frames.len().max(1) as f32;
     for (index, frame) in plan.frames.iter().enumerate() {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {

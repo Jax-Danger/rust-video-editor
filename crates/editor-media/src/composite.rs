@@ -15,10 +15,13 @@
 //! decodes, so a ramp or a constant rate is the same picture in both.
 
 use editor_core::{
-    blur, chroma_key, clip_relative, color_grade, crop, picture_at, sharpen, source_frame_at,
-    transform, vignette, Clip, ColorGrade, Direction, Frame, MediaAsset, MulticamGroup, Sequence,
+    blur, chroma_key, clip_relative, color_grade, crop, picture_at, sharpen, stabilize,
+    source_frame_at, transform, vignette, Clip, ColorGrade, Direction, Frame, MediaAsset,
+    MulticamGroup, Sequence,
     SequenceId, Title, ToneCurve, Track, TrackKind, Transform, TransitionKind, MAX_NEST_DEPTH,
 };
+
+use crate::stabilize::{baked_correction, load_sidecar, stabilize_runtime, MotionSample};
 use font8x8::UnicodeFonts;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -257,6 +260,106 @@ impl FilterSample {
             && self.sharpen < 1.0e-4
             && self.chroma_key_tolerance < 1.0e-4
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StabilizeSample {
+    pub strength: f32,
+    pub smoothing: f32,
+    pub baked_keyframes: bool,
+}
+
+impl StabilizeSample {
+    pub fn off() -> Self {
+        Self {
+            strength: 0.0,
+            smoothing: 0.5,
+            baked_keyframes: false,
+        }
+    }
+
+    pub fn active(&self) -> bool {
+        self.strength > 1.0e-4
+    }
+
+    pub fn from_effects(effects: &[editor_core::Effect], rel: i64) -> Self {
+        stabilize(effects)
+            .map(|filter| Self {
+                strength: filter.strength.value_at(rel).clamp(0.0, 1.0),
+                smoothing: filter.smoothing.value_at(rel).clamp(0.05, 1.0),
+                baked_keyframes: !filter.keyframes.is_empty(),
+            })
+            .unwrap_or_else(Self::off)
+    }
+}
+
+fn keyframes_from_effect_or_sidecar(
+    filter: &editor_core::StabilizeFilter,
+    media_path: Option<&str>,
+) -> Vec<MotionSample> {
+    if !filter.keyframes.is_empty() {
+        return filter
+            .keyframes
+            .iter()
+            .map(|key| MotionSample {
+                frame: key.frame,
+                dx: key.dx,
+                dy: key.dy,
+                rotation_deg: key.rotation_deg,
+            })
+            .collect();
+    }
+    if let Some(path) = media_path {
+        if let Some(sidecar) = load_sidecar(path) {
+            return sidecar.samples;
+        }
+    }
+    Vec::new()
+}
+
+fn stabilize_fields(
+    effects: &[editor_core::Effect],
+    rel: i64,
+    media_path: Option<&str>,
+) -> (StabilizeSample, Vec<MotionSample>) {
+    let sample = StabilizeSample::from_effects(effects, rel);
+    let keyframes = stabilize(effects)
+        .map(|filter| keyframes_from_effect_or_sidecar(filter, media_path))
+        .unwrap_or_default();
+    (sample, keyframes)
+}
+
+fn apply_stabilize_place(
+    place: &mut Place,
+    sample: &StabilizeSample,
+    keyframes: &[MotionSample],
+    source_frame: i64,
+    clip_id: u64,
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+) {
+    if !sample.active() {
+        return;
+    }
+    let (dx, dy, rot) = if !keyframes.is_empty() {
+        baked_correction(keyframes, source_frame, sample.strength, sample.smoothing)
+    } else if let Ok(mut runtime) = stabilize_runtime().lock() {
+        runtime.correction_for_frame(
+            clip_id,
+            source_frame,
+            rgba,
+            width,
+            height,
+            sample.strength,
+            sample.smoothing,
+        )
+    } else {
+        (0.0, 0.0, 0.0)
+    };
+    place.shift_x += dx;
+    place.shift_y += dy;
+    place.rotation -= rot;
 }
 
 fn rec709_luma(rgb: [f32; 3]) -> f32 {
@@ -709,6 +812,9 @@ pub struct ProgramLayer {
     pub height: u32,
     pub grade: GradeSample,
     pub filters: FilterSample,
+    pub stabilize: StabilizeSample,
+    /// Motion path from baked keyframes or a sidecar. Empty when using runtime analysis.
+    pub stabilize_keyframes: Vec<MotionSample>,
     pub place: Place,
     pub label: String,
     /// True when the decoded file is the proxy rather than the camera original.
@@ -823,6 +929,8 @@ pub fn program_stack_with(
                         height: canvas_h,
                         grade: GradeSample::neutral(),
                         filters: FilterSample::neutral(),
+                        stabilize: StabilizeSample::off(),
+                        stabilize_keyframes: Vec::new(),
                         place: Place {
                             opacity,
                             ..Place::identity()
@@ -936,12 +1044,16 @@ fn layer_from_clip(
         return Ok(None);
     }
     if clip.is_adjustment() {
+        let (stabilize_sample, stabilize_keyframes) =
+            stabilize_fields(&clip.effects, rel, None);
         return Ok(Some(ProgramLayer {
             source: LayerSource::Adjustment,
             width: canvas_w,
             height: canvas_h,
             grade: GradeSample::from_effects(&clip.effects, rel),
             filters: FilterSample::from_effects(&clip.effects, rel),
+            stabilize: stabilize_sample,
+            stabilize_keyframes,
             place,
             label: layer_label(track, clip),
             using_proxy: false,
@@ -949,6 +1061,8 @@ fn layer_from_clip(
         }));
     }
     if let Some(title) = clip.title.clone() {
+        let (stabilize_sample, stabilize_keyframes) =
+            stabilize_fields(&clip.effects, rel, None);
         let (width, height) = layer_pixel_size(canvas_w, canvas_h, &place);
         return Ok(Some(ProgramLayer {
             source: LayerSource::Title(title),
@@ -956,6 +1070,8 @@ fn layer_from_clip(
             height,
             grade: GradeSample::from_effects(&clip.effects, rel),
             filters: FilterSample::from_effects(&clip.effects, rel),
+            stabilize: stabilize_sample,
+            stabilize_keyframes,
             place,
             label: layer_label(track, clip),
             using_proxy: false,
@@ -966,6 +1082,8 @@ fn layer_from_clip(
         if !sequences.iter().any(|item| item.id == binding.sequence) {
             return Err(format!("Nested sequence missing for {}", clip.name));
         }
+        let (stabilize_sample, stabilize_keyframes) =
+            stabilize_fields(&clip.effects, rel, None);
         let child_frame = source_frame_at(clip, Frame(playhead), sequence.timebase).0;
         return Ok(Some(ProgramLayer {
             source: LayerSource::Nested {
@@ -976,6 +1094,8 @@ fn layer_from_clip(
             height: canvas_h,
             grade: GradeSample::from_effects(&clip.effects, rel),
             filters: FilterSample::from_effects(&clip.effects, rel),
+            stabilize: stabilize_sample,
+            stabilize_keyframes,
             place,
             label: layer_label(track, clip),
             using_proxy: false,
@@ -1020,9 +1140,12 @@ fn layer_from_clip(
         .as_ref()
         .map(|hit| format!("  ·  {}", hit.name))
         .unwrap_or_default();
+    let media_path = resolved.to_string_lossy();
+    let (stabilize_sample, stabilize_keyframes) =
+        stabilize_fields(&clip.effects, rel, Some(media_path.as_ref()));
     Ok(Some(ProgramLayer {
         source: LayerSource::Media {
-            path: resolved.to_string_lossy().into_owned(),
+            path: media_path.into_owned(),
             source_frame,
             time_secs,
             frame_secs: sample_tb.frame_duration_secs().max(1.0e-4),
@@ -1032,6 +1155,8 @@ fn layer_from_clip(
         height,
         grade: GradeSample::from_effects(&clip.effects, rel),
         filters: FilterSample::from_effects(&clip.effects, rel),
+        stabilize: stabilize_sample,
+        stabilize_keyframes,
         place,
         label: {
             let mut label = layer_label(track, clip);
@@ -1521,12 +1646,29 @@ pub fn compose_layers_env(
                 layer.place.blur_radius,
             );
         }
+        let mut place = layer.place;
+        if layer.stabilize.active() {
+            let source_frame = match &layer.source {
+                LayerSource::Media { source_frame, .. } => *source_frame,
+                _ => 0,
+            };
+            apply_stabilize_place(
+                &mut place,
+                &layer.stabilize,
+                &layer.stabilize_keyframes,
+                source_frame,
+                layer.clip_id,
+                &rgba,
+                layer.width,
+                layer.height,
+            );
+        }
         let blit = BlitLayer {
             rgba: &rgba,
             width: layer.width,
             height: layer.height,
             grade: layer.grade.clone(),
-            place: layer.place,
+            place,
         };
         composite_layer_over(&mut dst, dst_w, dst_h, seq_w, seq_h, &blit);
     }
@@ -2830,6 +2972,8 @@ mod tests {
             height: 4,
             grade: GradeSample::neutral(),
             filters: FilterSample::neutral(),
+            stabilize: StabilizeSample::off(),
+            stabilize_keyframes: Vec::new(),
             place: Place::identity(),
             label: "red".into(),
             using_proxy: false,
@@ -2844,6 +2988,8 @@ mod tests {
                 ..GradeSample::neutral()
             },
             filters: FilterSample::neutral(),
+            stabilize: StabilizeSample::off(),
+            stabilize_keyframes: Vec::new(),
             place: Place::identity(),
             label: "adj".into(),
             using_proxy: false,
@@ -2857,6 +3003,8 @@ mod tests {
             height: 4,
             grade: GradeSample::neutral(),
             filters: FilterSample::neutral(),
+            stabilize: StabilizeSample::off(),
+            stabilize_keyframes: Vec::new(),
             place: Place {
                 opacity: 0.5,
                 ..Place::identity()
@@ -2917,20 +3065,106 @@ mod tests {
     }
 
     fn ink_centroid(rgba: &[u8], w: u32, h: u32) -> (f32, f32) {
-        let mut sx = 0.0;
-        let mut sy = 0.0;
-        let mut n = 0.0;
-        for y in 0..h {
-            for x in 0..w {
-                let index = (y * w + x) as usize * 4;
-                if rgba[index] > 200 && rgba[index + 3] > 200 {
-                    sx += x as f32;
-                    sy += y as f32;
-                    n += 1.0;
-                }
+        crate::stabilize::feature_centroid(rgba, w, h)
+    }
+
+    #[test]
+    fn stabilize_shifts_shaky_frame_toward_rest() {
+        let width = 48u32;
+        let height = 36u32;
+        let mut base = solid(width, height, [20, 20, 20, 255]);
+        for y in 14..22 {
+            for x in 20..28 {
+                let idx = ((y * width + x) * 4) as usize;
+                base[idx] = 255;
+                base[idx + 1] = 40;
+                base[idx + 2] = 40;
             }
         }
-        assert!(n > 0.0, "no ink");
-        (sx / n, sy / n)
+        let rest = crate::stabilize::feature_centroid(&base, width, height);
+        let mut frames = Vec::new();
+        for index in 0..16 {
+            let dx = (index as f32 * 0.8).sin() * 6.0;
+            let dy = (index as f32 * 0.6).cos() * 5.0;
+            frames.push(shift_rgba_test(&base, width, height, dx.round() as i32, dy.round() as i32));
+        }
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+        let motion = crate::stabilize::analyze_motion_path(&refs, width, height, 10);
+        let shaky_index = 8usize;
+        let frame = &frames[shaky_index];
+        let layer_off = ProgramLayer {
+            source: LayerSource::Media {
+                path: "shake.mp4".into(),
+                source_frame: shaky_index as i64,
+                time_secs: shaky_index as f64 / 24.0,
+                frame_secs: 1.0 / 24.0,
+                last_source_frame: 15,
+            },
+            width,
+            height,
+            grade: GradeSample::neutral(),
+            filters: FilterSample::neutral(),
+            stabilize: StabilizeSample::off(),
+            stabilize_keyframes: Vec::new(),
+            place: Place::identity(),
+            label: "shake".into(),
+            using_proxy: false,
+            clip_id: 99,
+        };
+        let off = compose_layers(
+            width,
+            height,
+            width as f32,
+            height as f32,
+            &[layer_off.clone()],
+            |_| Ok(frame.clone()),
+        )
+        .unwrap();
+        let layer_on = ProgramLayer {
+            stabilize: StabilizeSample {
+                strength: 1.0,
+                smoothing: 0.7,
+                baked_keyframes: true,
+            },
+            stabilize_keyframes: motion,
+            ..layer_off
+        };
+        let on = compose_layers(
+            width,
+            height,
+            width as f32,
+            height as f32,
+            &[layer_on],
+            |_| Ok(frame.clone()),
+        )
+        .unwrap();
+        let dist = |rgba: &[u8]| {
+            let (x, y) = ink_centroid(rgba, width, height);
+            (x - rest.0).powi(2) + (y - rest.1).powi(2)
+        };
+        assert!(
+            dist(&on) < dist(&off),
+            "stabilized {:?} should sit closer to rest {:?} than raw {:?}",
+            ink_centroid(&on, width, height),
+            rest,
+            ink_centroid(&off, width, height)
+        );
+    }
+
+    fn shift_rgba_test(src: &[u8], width: u32, height: u32, dx: i32, dy: i32) -> Vec<u8> {
+        let mut out = vec![0u8; src.len()];
+        for y in 0..height {
+            for x in 0..width {
+                let sx = x as i32 - dx;
+                let sy = y as i32 - dy;
+                let dst = ((y * width + x) * 4) as usize;
+                if sx < 0 || sy < 0 || sx >= width as i32 || sy >= height as i32 {
+                    continue;
+                }
+                let src_idx = ((sy as u32 * width + sx as u32) * 4) as usize;
+                out[dst..dst + 4].copy_from_slice(&src[src_idx..src_idx + 4]);
+            }
+        }
+        out
     }
 }

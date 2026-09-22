@@ -532,6 +532,37 @@ impl ChromaKeyFilter {
     }
 }
 
+/// Baked motion sample for stabilization (cumulative offset from clip start).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StabilizeKeyframe {
+    pub frame: i64,
+    pub dx: f32,
+    pub dy: f32,
+    #[serde(default)]
+    pub rotation_deg: f32,
+}
+
+/// Warp-stabilizer-lite: strength removes shake; smoothing widens the temporal
+/// low-pass. Optional `keyframes` hold a pre-analyzed motion path (or load from
+/// a `<media>.stabilize.json` sidecar at compose time).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StabilizeFilter {
+    pub strength: AnimatedF32,
+    pub smoothing: AnimatedF32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keyframes: Vec<StabilizeKeyframe>,
+}
+
+impl StabilizeFilter {
+    pub fn off() -> Self {
+        Self {
+            strength: AnimatedF32::constant(0.0),
+            smoothing: AnimatedF32::constant(0.5),
+            keyframes: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FilterParam {
@@ -549,6 +580,8 @@ pub enum FilterParam {
     ChromaKeyTolerance,
     ChromaKeySoftness,
     ChromaKeySpillSuppression,
+    StabilizeStrength,
+    StabilizeSmoothing,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -561,6 +594,7 @@ pub enum Effect {
     Crop(CropFilter),
     Sharpen(SharpenFilter),
     ChromaKey(ChromaKeyFilter),
+    Stabilize(StabilizeFilter),
 }
 
 pub fn color_grade_mut(effects: &mut Vec<Effect>) -> &mut ColorGrade {
@@ -653,6 +687,19 @@ pub fn chroma_key_mut(effects: &mut Vec<Effect>) -> &mut ChromaKeyFilter {
     }
 }
 
+pub fn stabilize_mut(effects: &mut Vec<Effect>) -> &mut StabilizeFilter {
+    if !effects.iter().any(|e| matches!(e, Effect::Stabilize(_))) {
+        effects.push(Effect::Stabilize(StabilizeFilter::off()));
+    }
+    match effects
+        .iter_mut()
+        .find(|e| matches!(e, Effect::Stabilize(_)))
+    {
+        Some(Effect::Stabilize(filter)) => filter,
+        _ => unreachable!("stabilize filter just inserted"),
+    }
+}
+
 pub fn blur(effects: &[Effect]) -> Option<&BlurFilter> {
     effects.iter().find_map(|e| match e {
         Effect::Blur(filter) => Some(filter),
@@ -688,6 +735,13 @@ pub fn chroma_key(effects: &[Effect]) -> Option<&ChromaKeyFilter> {
     })
 }
 
+pub fn stabilize(effects: &[Effect]) -> Option<&StabilizeFilter> {
+    effects.iter().find_map(|e| match e {
+        Effect::Stabilize(filter) => Some(filter),
+        _ => None,
+    })
+}
+
 pub fn has_filter(effects: &[Effect], kind: FilterKind) -> bool {
     effects.iter().any(|e| match (kind, e) {
         (FilterKind::Blur, Effect::Blur(f)) => f.radius.base > 1.0e-4 || !f.radius.keys.is_empty(),
@@ -710,6 +764,9 @@ pub fn has_filter(effects: &[Effect], kind: FilterKind) -> bool {
         (FilterKind::ChromaKey, Effect::ChromaKey(f)) => {
             f.tolerance.base > 1.0e-4 || !f.tolerance.keys.is_empty()
         }
+        (FilterKind::Stabilize, Effect::Stabilize(f)) => {
+            f.strength.base > 1.0e-4 || !f.strength.keys.is_empty()
+        }
         _ => false,
     })
 }
@@ -721,6 +778,7 @@ pub enum FilterKind {
     Crop,
     Sharpen,
     ChromaKey,
+    Stabilize,
 }
 
 impl FilterKind {
@@ -731,6 +789,7 @@ impl FilterKind {
             Self::Crop => "Crop",
             Self::Sharpen => "Sharpen",
             Self::ChromaKey => "Chroma Key",
+            Self::Stabilize => "Stabilize",
         }
     }
 }
@@ -796,6 +855,16 @@ mod tests {
                 softness: AnimatedF32::constant(0.15),
                 spill_suppression: AnimatedF32::constant(0.6),
             }),
+            Effect::Stabilize(StabilizeFilter {
+                strength: AnimatedF32::constant(0.85),
+                smoothing: AnimatedF32::constant(0.6),
+                keyframes: vec![StabilizeKeyframe {
+                    frame: 0,
+                    dx: 0.0,
+                    dy: 0.0,
+                    rotation_deg: 0.0,
+                }],
+            }),
         ];
         let json = serde_json::to_string(&effects).unwrap();
         let parsed: Vec<Effect> = serde_json::from_str(&json).unwrap();
@@ -803,6 +872,7 @@ mod tests {
         assert!(has_filter(&effects, FilterKind::Blur));
         assert!(has_filter(&effects, FilterKind::Vignette));
         assert!(has_filter(&effects, FilterKind::ChromaKey));
+        assert!(has_filter(&effects, FilterKind::Stabilize));
     }
 
     #[test]

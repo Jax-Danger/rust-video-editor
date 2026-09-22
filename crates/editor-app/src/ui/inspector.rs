@@ -1,9 +1,9 @@
 use editor_core::{
     blur, chroma_key, clip_relative, color_grade, crop, set_clip_gain_at, set_clip_speed,
-    set_clip_title, set_filter_at, set_grade_at, set_transform_at, sharpen, source_frame_at,
-    toggle_filter_key, toggle_grade_key, toggle_transform_key, toggle_volume_key, transform,
-    vignette, ClipId, ClipSpeed, FilterParam, GradeParam, LabelColor, MarkerId, TextAlign, Title,
-    TrackKind, TransformParam,
+    set_clip_title, set_filter_at, set_grade_at, set_transform_at, sharpen, stabilize,
+    source_frame_at, toggle_filter_key, toggle_grade_key, toggle_transform_key, toggle_volume_key,
+    transform, vignette, ClipId, ClipSpeed, FilterParam, GradeParam, LabelColor, MarkerId,
+    TextAlign, Title, TrackKind, TransformParam,
 };
 use egui::{pos2, Align2, Rect, RichText, Sense, TextEdit, Vec2};
 
@@ -1256,11 +1256,29 @@ fn effects_controls(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId, r
         "Spill suppression",
         0.0..=1.0,
     );
+    filter_slider(
+        ui,
+        app,
+        clip_id,
+        rel,
+        FilterParam::StabilizeStrength,
+        "Stabilize",
+        0.0..=1.0,
+    );
+    filter_slider(
+        ui,
+        app,
+        clip_id,
+        rel,
+        FilterParam::StabilizeSmoothing,
+        "Stabilize smoothing",
+        0.05..=1.0,
+    );
 }
 
 fn filter_value(app: &MeridianApp, clip: ClipId, rel: i64, param: FilterParam) -> (f32, bool) {
     let neutral = match param {
-        FilterParam::VignetteSoftness => 0.5,
+        FilterParam::VignetteSoftness | FilterParam::StabilizeSmoothing => 0.5,
         FilterParam::ChromaKeyGreen => 1.0,
         FilterParam::ChromaKeySoftness => 0.15,
         FilterParam::ChromaKeySpillSuppression => 0.5,
@@ -1289,6 +1307,8 @@ fn filter_value(app: &MeridianApp, clip: ClipId, rel: i64, param: FilterParam) -
         FilterParam::ChromaKeySpillSuppression => {
             chroma_key(&clip.effects).map(|f| &f.spill_suppression)
         }
+        FilterParam::StabilizeStrength => stabilize(&clip.effects).map(|f| &f.strength),
+        FilterParam::StabilizeSmoothing => stabilize(&clip.effects).map(|f| &f.smoothing),
     };
     if let Some(anim) = anim {
         (anim.value_at(rel), anim.has_key(rel))
