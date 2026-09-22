@@ -62,7 +62,13 @@ pub fn audio_workspace(ui: &mut egui::Ui, app: &mut MeridianApp) {
         let mut bay_ui = ui.new_child(egui::UiBuilder::new().max_rect(bay));
         mixer_bay(&mut bay_ui, app);
     }
-    paint_program_meter(&ui.painter_at(meter_rect), meter_rect, &meter, &badge);
+    // The bay child can shrink this Ui's clip. Paint the program meter on the
+    // panel layer so the column stays at the right edge of the page.
+    let painter = ui
+        .ctx()
+        .layer_painter(ui.layer_id())
+        .with_clip_rect(meter_rect);
+    paint_program_meter(&painter, meter_rect, &meter, &badge);
 }
 
 fn paint_program_meter(
