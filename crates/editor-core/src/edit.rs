@@ -17,7 +17,8 @@ use crate::effects::{
 };
 use crate::model::{
     Bin, BinId, CaptionCue, Clip, ClipId, ClipSpeed, CueId, LabelColor, Marker, MarkerId,
-    MediaAsset, MediaId, Project, Sequence, SequenceId, Title, TrackId, TrackKind, Transition,
+    MediaAsset, MediaId, Project, Sequence, SequenceId, Title, Track, TrackId, TrackKind,
+    Transition,
     TransitionAlign, TransitionId, TransitionKind,
 };
 use crate::time::{convert_frames, mul_div_round, Frame, Timebase};
@@ -1969,7 +1970,275 @@ pub fn clip_from_media(
         multicam: None,
         nested: None,
         track_matte: None,
+        hold_frame: None,
     })
+}
+
+/// Default freeze duration: two seconds on the sequence timebase.
+pub fn default_freeze_duration(timebase: Timebase) -> i64 {
+    let frames = (timebase.fps_f64() * 2.0).round() as i64;
+    frames.max(1)
+}
+
+/// Sample one source frame for the whole clip during preview and export.
+pub fn set_clip_hold(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    clip_id: ClipId,
+    hold: Frame,
+) -> Result<(), EditError> {
+    map_sequence(project, sequence_id, |sequence, _alloc| {
+        let group = linked_group(sequence, clip_id);
+        for id in &group {
+            let (track_index, clip_index) =
+                sequence.locate_clip(*id).ok_or(EditError::ClipNotFound)?;
+            if sequence.tracks[track_index].locked {
+                return Err(EditError::TrackLocked);
+            }
+            let clip = &mut sequence.tracks[track_index].clips[clip_index];
+            if clip.is_title() || clip.is_adjustment() {
+                return Err(EditError::WrongTrackKind);
+            }
+            clip.hold_frame = Some(hold);
+            clip.speed = ClipSpeed::normal();
+            clip.source_in = hold;
+            clip.source_out = Frame(hold.0 + 1);
+        }
+        Ok(())
+    })
+}
+
+/// Clear a clip hold and restore a one-source-frame span at the held frame.
+pub fn clear_clip_hold(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    clip_id: ClipId,
+) -> Result<(), EditError> {
+    map_sequence(project, sequence_id, |sequence, _alloc| {
+        let group = linked_group(sequence, clip_id);
+        for id in &group {
+            let (track_index, clip_index) =
+                sequence.locate_clip(*id).ok_or(EditError::ClipNotFound)?;
+            if sequence.tracks[track_index].locked {
+                return Err(EditError::TrackLocked);
+            }
+            let clip = &mut sequence.tracks[track_index].clips[clip_index];
+            if clip.hold_frame.is_none() {
+                continue;
+            }
+            let hold = clip.hold_frame.unwrap();
+            clip.hold_frame = None;
+            clip.source_in = hold;
+            clip.source_out = Frame(hold.0 + 1);
+        }
+        Ok(())
+    })
+}
+
+/// Turn the clip at `at` into a hold of `duration` sequence frames starting at
+/// `at`. When `at` splits a clip, only the right-hand part becomes a hold.
+/// Linked clips on targeted tracks take the same hold and duration.
+pub fn freeze_at_playhead(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    at: Frame,
+    duration: i64,
+    track_ids: &[TrackId],
+) -> Result<Vec<ClipId>, EditError> {
+    if duration < 1 {
+        return Err(EditError::InvalidDuration);
+    }
+    if track_ids.is_empty() {
+        return Err(EditError::TrackNotFound);
+    }
+    let mut frozen = Vec::new();
+    map_sequence(project, sequence_id, |sequence, alloc| {
+        let allowed: std::collections::HashSet<TrackId> = track_ids.iter().copied().collect();
+        let timebase = sequence.timebase;
+        let targets: Vec<ClipId> = sequence
+            .tracks
+            .iter()
+            .filter(|track| allowed.contains(&track.id) && !track.locked)
+            .filter(|track| track.kind != TrackKind::Caption)
+            .filter_map(|track| clip_at_edit(track, at))
+            .collect();
+        for clip_id in targets {
+            if let Some(id) = apply_freeze_to_clip(sequence, clip_id, at, duration, timebase, alloc)? {
+                frozen.push(id);
+            }
+        }
+        if frozen.is_empty() {
+            return Err(EditError::NotInsideClip);
+        }
+        Ok(())
+    })?;
+    Ok(frozen)
+}
+
+/// Replace selected clips with a hold of `duration` sequence frames. The held
+/// source frame is taken at `at` when the playhead lies inside the clip, or at
+/// the clip in-point otherwise.
+pub fn freeze_clips_at(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    clip_ids: &[ClipId],
+    at: Frame,
+    duration: i64,
+) -> Result<Vec<ClipId>, EditError> {
+    if duration < 1 {
+        return Err(EditError::InvalidDuration);
+    }
+    if clip_ids.is_empty() {
+        return Err(EditError::ClipNotFound);
+    }
+    let mut frozen = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    map_sequence(project, sequence_id, |sequence, _alloc| {
+        let timebase = sequence.timebase;
+        for clip_id in clip_ids {
+            if !seen.insert(clip_id) {
+                continue;
+            }
+            if let Some(id) =
+                apply_whole_clip_freeze(sequence, *clip_id, at, duration, timebase)?
+            {
+                frozen.push(id);
+            }
+        }
+        if frozen.is_empty() {
+            return Err(EditError::ClipNotFound);
+        }
+        Ok(())
+    })?;
+    Ok(frozen)
+}
+
+fn clip_at_edit(track: &Track, at: Frame) -> Option<ClipId> {
+    if let Some(clip) = track.clips.iter().find(|clip| clip.timeline_in == at) {
+        return Some(clip.id);
+    }
+    track
+        .clips
+        .iter()
+        .find(|clip| clip.covers(at))
+        .map(|clip| clip.id)
+}
+
+fn apply_whole_clip_freeze(
+    sequence: &mut Sequence,
+    clip_id: ClipId,
+    at: Frame,
+    duration: i64,
+    timebase: Timebase,
+) -> Result<Option<ClipId>, EditError> {
+    let primary = sequence
+        .clip(clip_id)
+        .ok_or(EditError::ClipNotFound)?
+        .clone();
+    if primary.is_title() || primary.is_adjustment() {
+        return Ok(None);
+    }
+    let group = linked_group(sequence, clip_id);
+    let mut applied = None;
+    for id in &group {
+        let (ti, ci) = sequence.locate_clip(*id).ok_or(EditError::ClipNotFound)?;
+        if sequence.tracks[ti].locked {
+            return Err(EditError::TrackLocked);
+        }
+        let clip = &sequence.tracks[ti].clips[ci];
+        let sample_at = if clip.covers(at) || clip.timeline_in == at {
+            at
+        } else {
+            clip.timeline_in
+        };
+        let hold = source_frame_at(clip, sample_at, timebase);
+        let old_out = clip.timeline_out.0;
+        let new_out = clip.timeline_in.0 + duration;
+        let clip = &mut sequence.tracks[ti].clips[ci];
+        clip.hold_frame = Some(hold);
+        clip.speed = ClipSpeed::normal();
+        clip.source_in = hold;
+        clip.source_out = Frame(hold.0 + 1);
+        clip.timeline_out = Frame(new_out);
+        let delta = new_out - old_out;
+        if delta != 0 {
+            ripple_downstream_except(
+                sequence,
+                sequence.tracks[ti].id,
+                old_out,
+                delta,
+                *id,
+                &group,
+            )?;
+        }
+        applied = Some(*id);
+    }
+    Ok(applied)
+}
+
+fn apply_freeze_to_clip(
+    sequence: &mut Sequence,
+    clip_id: ClipId,
+    at: Frame,
+    duration: i64,
+    timebase: Timebase,
+    alloc: &mut dyn FnMut() -> u64,
+) -> Result<Option<ClipId>, EditError> {
+    let primary = sequence
+        .clip(clip_id)
+        .ok_or(EditError::ClipNotFound)?
+        .clone();
+    if primary.is_title() || primary.is_adjustment() {
+        return Ok(None);
+    }
+    if !primary.covers(at) && primary.timeline_in != at {
+        return Ok(None);
+    }
+    let group = linked_group(sequence, clip_id);
+    let mut pairs = Vec::new();
+    for id in &group {
+        let partner = sequence.clip(*id).ok_or(EditError::ClipNotFound)?;
+        if !partner.covers(at) && partner.timeline_in != at {
+            continue;
+        }
+        let target = if at.0 > partner.timeline_in.0 && at.0 < partner.timeline_out.0 {
+            split_clip(sequence, *id, at, alloc)?
+        } else {
+            *id
+        };
+        pairs.push((*id, target));
+    }
+    relink_splits(sequence, &pairs);
+    let mut applied = None;
+    for (_, target) in pairs {
+        let (ti, ci) = sequence.locate_clip(target).ok_or(EditError::ClipNotFound)?;
+        if sequence.tracks[ti].locked {
+            return Err(EditError::TrackLocked);
+        }
+        let hold = source_frame_at(&sequence.tracks[ti].clips[ci], at, timebase);
+        let clip = &mut sequence.tracks[ti].clips[ci];
+        let freeze_start = at.0.max(clip.timeline_in.0);
+        let old_out = clip.timeline_out.0;
+        let new_out = freeze_start + duration;
+        clip.hold_frame = Some(hold);
+        clip.speed = ClipSpeed::normal();
+        clip.source_in = hold;
+        clip.source_out = Frame(hold.0 + 1);
+        clip.timeline_out = Frame(new_out);
+        let delta = new_out - old_out;
+        if delta != 0 {
+            ripple_downstream_except(
+                sequence,
+                sequence.tracks[ti].id,
+                old_out,
+                delta,
+                target,
+                &group,
+            )?;
+        }
+        applied = Some(target);
+    }
+    Ok(applied)
 }
 
 /// Place a five-second title generator at `at` on the highest video track that
@@ -2150,6 +2419,9 @@ fn source_delta(clip: &Clip, timeline_delta: i64, sequence_timebase: Timebase) -
 /// A 100% forward clip keeps the integer timebase mapping. Any other speed,
 /// including a ramp or reverse, samples the integral of the rate curve.
 pub fn source_frame_at(clip: &Clip, timeline_frame: Frame, sequence_timebase: Timebase) -> Frame {
+    if let Some(hold) = clip.hold_frame {
+        return hold;
+    }
     if !clip.speed.is_identity() {
         return crate::speed::mapped_source_frame(clip, timeline_frame, sequence_timebase);
     }
@@ -2166,6 +2438,9 @@ pub fn timeline_frame_at_source(
     source_frame: Frame,
     sequence_timebase: Timebase,
 ) -> Frame {
+    if clip.hold_frame.is_some() {
+        return clip.timeline_in;
+    }
     if !clip.speed.is_identity() {
         return timeline_frame_for_retimed_source(clip, source_frame, sequence_timebase);
     }
@@ -3038,6 +3313,64 @@ mod tests {
         let later = seq.clip(ClipId(3)).unwrap();
         assert_eq!((later.timeline_in.0, later.timeline_out.0), (48, 96));
         let _ = (video, audio);
+    }
+
+    #[test]
+    fn hold_frame_samples_one_source_frame_for_the_whole_clip() {
+        let (mut sequence, _track) = video_sequence();
+        sequence.tracks[0].clips = vec![Clip::basic(1, 0, 48)];
+        let mut project = project_with(sequence);
+        set_clip_hold(&mut project, SequenceId(1), ClipId(1), Frame(12)).unwrap();
+        let clip = project.sequence(SequenceId(1)).unwrap().clip(ClipId(1)).unwrap();
+        assert_eq!(clip.hold_frame, Some(Frame(12)));
+        assert!(clip.mutes_audio());
+        assert_eq!(source_frame_at(clip, Frame(0), Timebase::fps_24()).0, 12);
+        assert_eq!(source_frame_at(clip, Frame(24), Timebase::fps_24()).0, 12);
+        let json = serde_json::to_string(clip).unwrap();
+        let loaded: Clip = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.hold_frame, Some(Frame(12)));
+    }
+
+    #[test]
+    fn freeze_at_playhead_splits_and_extends_with_hold() {
+        let (mut sequence, track) = video_sequence();
+        sequence.tracks[0].clips = vec![Clip::basic(1, 0, 48), Clip::basic(2, 48, 96)];
+        let mut project = project_with(sequence);
+        let frozen = freeze_at_playhead(
+            &mut project,
+            SequenceId(1),
+            Frame(24),
+            12,
+            &[track],
+        )
+        .unwrap();
+        assert_eq!(frozen.len(), 1);
+        let seq = project.sequence(SequenceId(1)).unwrap();
+        let left = seq.clip(ClipId(1)).unwrap();
+        let hold = seq.clip(frozen[0]).unwrap();
+        let later = seq.clip(ClipId(2)).unwrap();
+        assert_eq!((left.timeline_in.0, left.timeline_out.0), (0, 24));
+        assert_eq!((hold.timeline_in.0, hold.timeline_out.0), (24, 36));
+        assert_eq!(hold.hold_frame, Some(Frame(24)));
+        assert_eq!(source_frame_at(hold, Frame(30), Timebase::fps_24()).0, 24);
+        assert_eq!((later.timeline_in.0, later.timeline_out.0), (36, 84));
+    }
+
+    #[test]
+    fn freeze_clips_at_replaces_selection_with_hold() {
+        let (mut sequence, _track) = video_sequence();
+        sequence.tracks[0].clips = vec![Clip::basic(1, 0, 48)];
+        let mut project = project_with(sequence);
+        let frozen =
+            freeze_clips_at(&mut project, SequenceId(1), &[ClipId(1)], Frame(10), 8).unwrap();
+        let hold = project
+            .sequence(SequenceId(1))
+            .unwrap()
+            .clip(frozen[0])
+            .unwrap();
+        assert_eq!((hold.timeline_in.0, hold.timeline_out.0), (0, 8));
+        assert_eq!(hold.hold_frame, Some(Frame(10)));
+        assert_eq!(source_frame_at(hold, Frame(4), Timebase::fps_24()).0, 10);
     }
 
     #[test]

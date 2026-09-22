@@ -444,6 +444,7 @@ fn multicam_clip(
         multicam: Some(binding),
         nested: None,
         track_matte: None,
+        hold_frame: None,
     }
 }
 

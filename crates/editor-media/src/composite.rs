@@ -1353,7 +1353,9 @@ fn layer_from_clip(
 
 fn layer_label(track: &Track, clip: &Clip) -> String {
     let mut label = format!("{}  {}", track.name, clip.name);
-    if let Some(badge) = clip.speed.badge() {
+    if clip.is_hold() {
+        label.push_str("  Hold");
+    } else if let Some(badge) = clip.speed.badge() {
         label.push_str("  ");
         label.push_str(&badge);
     }

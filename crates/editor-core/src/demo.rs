@@ -342,6 +342,7 @@ fn placed(
         multicam: None,
         nested: None,
         track_matte: None,
+        hold_frame: None,
     }
 }
 

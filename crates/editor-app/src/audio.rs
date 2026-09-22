@@ -540,7 +540,7 @@ fn collect_filtered(
         if !resolved.is_file() {
             continue;
         }
-        if clip.speed.mutes_audio() {
+        if clip.mutes_audio() {
             continue;
         }
         let at_in = source_frame_at(clip, clip.timeline_in, sequence.timebase);

@@ -304,6 +304,24 @@ Preview and Deliver sample picture through one function, `source_frame_at`. A 20
 
 Audio on a retimed clip is muted during playback and left out of the Deliver graph. Deliver names the clip in its report. A constant 100% forward clip, and a ramp that sits on 100% at both ends, still play. Reverse is muted too. The picture stays on the timeline clock; the sound does not play at the wrong rate and drift. Pitch-preserving resample is a follow-up.
 
+## Freeze frame / Hold
+
+**Freeze frame at playhead** (`Shift+F`, or **Edit → Freeze Frame at Playhead**) turns the frame under the program playhead into a two-second hold on targeted tracks. If clips are selected, only those clips freeze at the playhead. The edit razors at the playhead when needed, samples that source frame for the hold segment, and ripples later clips on sync-locked tracks. Linked picture and audio clips follow together.
+
+The inspector **Hold** section can also freeze a whole clip:
+
+- **Hold one source frame** samples a single source frame for the entire clip in preview and Deliver
+- **Set from playhead** updates the held frame to the playhead position
+- **Freeze at playhead** runs the same edit as `Shift+F`
+
+Hold is stored on the clip and omitted from JSON when unset:
+
+```json
+"hold_frame": 142
+```
+
+Preview and Deliver read it through `source_frame_at`, so the held frame matches in both paths. Audio on a hold clip is muted, like a retimed clip. The timeline label shows `Hold`.
+
 ## Clip mask and track matte
 
 Select a video clip. The inspector **Mask** section adds a rectangular or elliptical soft mask in layer UV space. **Center X/Y**, **Width**, **Height**, and **Feather** are keyframeable through the usual diamond controls. **Invert mask** swaps inside and outside. A default full-frame mask with zero feather is omitted from the composite path.
@@ -540,7 +558,7 @@ A progress bar follows ffmpeg's `out_time`. **Cancel** sends `SIGTERM`. A failed
 
 ## Tests
 
-`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, deliver presets (apply, custom JSON, last-settings round-trip), the sample project round-trip, imported media paths in JSON, media-pool bins (create, rename, move, delete, JSON round-trip), sequence markers (add, edit, delete, JSON round-trip), proxy attach and relink, timeline culling on an 800-clip sequence, ruler spacing across an hour, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, proxy argument planning and preview fallback, the disk frame cache, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, pan, fader, burned captions, deliver bitrate hints, audio-only WAV planning, retimed source frames, muted retimed audio), multicam sync offsets, razor angle switches, group-time cuts, JSON round-trip, and raster frames that follow the active angle, nested sequence create/frame mapping/JSON round-trip/export raster, the mix bus (pan law, mute, solo, keyframed gain, 3-band EQ, peak and RMS), clip speed (constant 25–400%, reverse, a linear ramp, JSON round-trip, and duration ripple), adjustment layers (JSON round-trip, track placement, composite stacking), shape mask and track matte JSON round-trip, 3D LUT `.cube` parse/tetrahedral sampling/JSON round-trip/mix, recovery sidecars (path, newer-than-project offer, autosave idle and interval, atomic write that leaves the project file untouched, discard), and the shared composite (luma curve, lift/gamma/gain wheels, grade split, dissolve mix, wipe angle, push, dip, slide, blur dissolve, iris, clip filters including shape mask alpha, track matte alpha multiply, stabilize on synthetic shake, 3D LUT look after grade, anchor, caption burn-in, adjustment grade-below). It does not spawn ffmpeg or whisper.
+`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, deliver presets (apply, custom JSON, last-settings round-trip), the sample project round-trip, imported media paths in JSON, media-pool bins (create, rename, move, delete, JSON round-trip), sequence markers (add, edit, delete, JSON round-trip), proxy attach and relink, timeline culling on an 800-clip sequence, ruler spacing across an hour, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, proxy argument planning and preview fallback, the disk frame cache, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, pan, fader, burned captions, deliver bitrate hints, audio-only WAV planning, retimed source frames, muted retimed audio), multicam sync offsets, razor angle switches, group-time cuts, JSON round-trip, and raster frames that follow the active angle, nested sequence create/frame mapping/JSON round-trip/export raster, the mix bus (pan law, mute, solo, keyframed gain, 3-band EQ, peak and RMS), clip speed (constant 25–400%, reverse, a linear ramp, JSON round-trip, and duration ripple), freeze frame and clip hold (`source_frame_at`, razor split, ripple, JSON round-trip, muted audio), adjustment layers (JSON round-trip, track placement, composite stacking), shape mask and track matte JSON round-trip, 3D LUT `.cube` parse/tetrahedral sampling/JSON round-trip/mix, recovery sidecars (path, newer-than-project offer, autosave idle and interval, atomic write that leaves the project file untouched, discard), and the shared composite (luma curve, lift/gamma/gain wheels, grade split, dissolve mix, wipe angle, push, dip, slide, blur dissolve, iris, clip filters including shape mask alpha, track matte alpha multiply, stabilize on synthetic shake, 3D LUT look after grade, anchor, caption burn-in, adjustment grade-below). It does not spawn ffmpeg or whisper.
 
 `cargo test -p editor-media --features ffmpeg` also encodes a short H.264/AAC mp4 when `ffmpeg` is on `PATH`. `cargo test -p editor-app --features whisper` builds the local speech-to-text path; the binary and model are resolved at runtime, not at compile time.
 

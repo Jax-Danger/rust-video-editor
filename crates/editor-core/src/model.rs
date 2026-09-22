@@ -562,6 +562,10 @@ pub struct Clip {
     /// Optional track matte: alpha or luma from another video track.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub track_matte: Option<TrackMatteBinding>,
+    /// When set, preview and export show this single source frame for the
+    /// whole clip instead of advancing through [`Self::source_in`]..[`Self::source_out`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_frame: Option<Frame>,
 }
 
 impl Clip {
@@ -614,6 +618,7 @@ impl Clip {
             multicam: None,
             nested: None,
             track_matte: None,
+            hold_frame: None,
         }
     }
 
@@ -645,6 +650,7 @@ impl Clip {
             multicam: None,
             nested: None,
             track_matte: None,
+            hold_frame: None,
         }
     }
 
@@ -681,7 +687,17 @@ impl Clip {
             multicam: None,
             nested: None,
             track_matte: None,
+            hold_frame: None,
         }
+    }
+
+    pub fn is_hold(&self) -> bool {
+        self.hold_frame.is_some()
+    }
+
+    /// Hold clips and retimed clips do not play audio during preview or export.
+    pub fn mutes_audio(&self) -> bool {
+        self.is_hold() || self.speed.mutes_audio()
     }
 
     pub fn is_title(&self) -> bool {
