@@ -104,9 +104,9 @@ pub use nest::{
 };
 pub use recovery::{
     autosave_delay, autosave_due, forget_recovery, is_sidecar_recovery_path, launch_recovery_offer,
-    load_recovery, offer_for_project_file, publish_recovery, recovery_index_path,
-    recovery_is_newer, recovery_path_for_project, unsaved_recovery_path, RecoveryDocument,
-    RecoveryError, RecoveryOffer, AUTOSAVE_IDLE, AUTOSAVE_INTERVAL,
+    load_recovery, offer_for_project_file, project_support_dir, publish_recovery,
+    recovery_index_path, recovery_is_newer, recovery_path_for_project, unsaved_recovery_path,
+    RecoveryDocument, RecoveryError, RecoveryOffer, AUTOSAVE_IDLE, AUTOSAVE_INTERVAL,
 };
 pub use scale::{
     align_frame, clamp_timeline_zoom, clip_index_at, frame_at_x, ruler_mark_count, ruler_step,

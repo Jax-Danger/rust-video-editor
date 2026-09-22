@@ -79,15 +79,13 @@ pub fn unsaved_proxy_dir() -> PathBuf {
     cache_root().join("proxies")
 }
 
-/// `<project stem>.meridian/proxies` beside the project file.
+/// `<project support dir>/proxies` beside the project file.
+///
+/// `northline.json` → `northline.meridian/proxies`.
+/// `northline.meridian` → `northline.meridian.meridian/proxies` so the
+/// directory does not collide with the project file.
 pub fn project_proxy_dir(project_file: &Path) -> PathBuf {
-    let parent = project_file.parent().unwrap_or_else(|| Path::new("."));
-    let stem = project_file
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .filter(|stem| !stem.is_empty())
-        .unwrap_or("project");
-    parent.join(format!("{stem}.meridian")).join("proxies")
+    editor_core::project_support_dir(project_file).join("proxies")
 }
 
 pub fn proxy_output_path(dir: &Path, source: &Path) -> PathBuf {
@@ -294,6 +292,10 @@ mod tests {
         let project = dir.join("northline.json");
         let beside = project_proxy_dir(&project);
         assert!(beside.ends_with("northline.meridian/proxies"));
+        let meridian = dir.join("northline.meridian");
+        let meridian_beside = project_proxy_dir(&meridian);
+        assert!(meridian_beside.ends_with("northline.meridian.meridian/proxies"));
+        assert_ne!(meridian_beside.parent(), Some(meridian.as_path()));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
