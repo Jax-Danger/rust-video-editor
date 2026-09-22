@@ -104,6 +104,7 @@ fn deliver_card(
         .color(THEME.text_dim),
     );
     ui.add_space(8.0);
+    let running = app.export_running();
     ui.horizontal(|ui| {
         if widgets::action_button(ui, "Export Still at Playhead", !running) {
             app.export_still_at_playhead();

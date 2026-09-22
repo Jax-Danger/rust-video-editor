@@ -4,8 +4,9 @@ use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
-use crate::effects::{AnimatedF32, Effect};
 use crate::compressor::TrackCompressor;
+use crate::duck::TrackDuck;
+use crate::effects::{AnimatedF32, Effect};
 use crate::eq::TrackEq3;
 use crate::time::{Frame, Timebase};
 
@@ -762,6 +763,9 @@ pub struct Track {
     /// Dynamics compressor applied after EQ and before the fader.
     #[serde(default, skip_serializing_if = "TrackCompressor::is_bypass")]
     pub compressor: TrackCompressor,
+    /// Sidechain duck from another audio track, after the compressor.
+    #[serde(default, skip_serializing_if = "TrackDuck::is_bypass")]
+    pub duck: TrackDuck,
     #[serde(default)]
     pub clips: Vec<Clip>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -788,6 +792,7 @@ impl Track {
             pan: 0.0,
             eq: TrackEq3::default(),
             compressor: TrackCompressor::default(),
+            duck: TrackDuck::default(),
             clips: Vec::new(),
             transitions: Vec::new(),
             cues: Vec::new(),

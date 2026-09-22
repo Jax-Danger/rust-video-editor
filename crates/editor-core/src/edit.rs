@@ -1442,6 +1442,99 @@ pub enum CompressorParam {
     Makeup,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DuckParam {
+    Threshold,
+    Amount,
+    Attack,
+    Release,
+}
+
+pub fn set_track_duck_enabled(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    track_id: TrackId,
+    enabled: bool,
+) -> Result<(), EditError> {
+    map_sequence(project, sequence_id, |sequence, _alloc| {
+        let track = sequence
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .ok_or(EditError::TrackNotFound)?;
+        if track.kind != TrackKind::Audio {
+            return Err(EditError::WrongTrackKind);
+        }
+        track.duck.enabled = enabled;
+        Ok(())
+    })
+}
+
+pub fn set_track_duck_source(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    track_id: TrackId,
+    source: Option<TrackId>,
+) -> Result<(), EditError> {
+    map_sequence(project, sequence_id, |sequence, _alloc| {
+        if let Some(source_id) = source {
+            if source_id == track_id {
+                return Err(EditError::WrongTrackKind);
+            }
+            let source_track = sequence
+                .track(source_id)
+                .ok_or(EditError::TrackNotFound)?;
+            if source_track.kind != TrackKind::Audio {
+                return Err(EditError::WrongTrackKind);
+            }
+        }
+        let track = sequence
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .ok_or(EditError::TrackNotFound)?;
+        if track.kind != TrackKind::Audio {
+            return Err(EditError::WrongTrackKind);
+        }
+        track.duck.source = source.map(|id| id.0);
+        Ok(())
+    })
+}
+
+pub fn set_track_duck(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    track_id: TrackId,
+    param: DuckParam,
+    value: f32,
+) -> Result<(), EditError> {
+    map_sequence(project, sequence_id, |sequence, _alloc| {
+        let track = sequence
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .ok_or(EditError::TrackNotFound)?;
+        if track.kind != TrackKind::Audio {
+            return Err(EditError::WrongTrackKind);
+        }
+        match param {
+            DuckParam::Threshold => {
+                track.duck.threshold_db = crate::duck::clamp_duck_threshold(value);
+            }
+            DuckParam::Amount => {
+                track.duck.amount_db = crate::duck::clamp_duck_amount(value);
+            }
+            DuckParam::Attack => {
+                track.duck.attack_ms = crate::duck::clamp_duck_attack(value);
+            }
+            DuckParam::Release => {
+                track.duck.release_ms = crate::duck::clamp_duck_release(value);
+            }
+        }
+        Ok(())
+    })
+}
+
 pub fn set_track_compressor(
     project: &mut Project,
     sequence_id: SequenceId,
@@ -3161,6 +3254,49 @@ mod tests {
         project.next_id = 50_000;
         project.sequences.push(sequence);
         project
+    }
+
+    #[test]
+    fn duck_settings_round_trip_and_reject_a_self_source() {
+        let mut sequence = Sequence::new(SequenceId(1), "Duck", 1920, 1080, Timebase::fps_24());
+        sequence.add_track(TrackId(2), TrackKind::Audio, "Music");
+        sequence.add_track(TrackId(3), TrackKind::Audio, "Dial");
+        sequence.add_track(TrackId(4), TrackKind::Video, "V1");
+        let mut project = project_with(sequence);
+        let seq = project.active_sequence.unwrap();
+        set_track_duck_enabled(&mut project, seq, TrackId(2), true).unwrap();
+        set_track_duck_source(&mut project, seq, TrackId(2), Some(TrackId(3))).unwrap();
+        set_track_duck(&mut project, seq, TrackId(2), DuckParam::Threshold, -30.0).unwrap();
+        set_track_duck(&mut project, seq, TrackId(2), DuckParam::Amount, 15.0).unwrap();
+        set_track_duck(&mut project, seq, TrackId(2), DuckParam::Attack, 20.0).unwrap();
+        set_track_duck(&mut project, seq, TrackId(2), DuckParam::Release, 400.0).unwrap();
+        assert_eq!(
+            set_track_duck_source(&mut project, seq, TrackId(2), Some(TrackId(2))),
+            Err(EditError::WrongTrackKind)
+        );
+        assert_eq!(
+            set_track_duck_source(&mut project, seq, TrackId(2), Some(TrackId(4))),
+            Err(EditError::WrongTrackKind)
+        );
+        let track = &project.active().unwrap().tracks[0];
+        assert!(track.duck.enabled);
+        assert_eq!(track.duck.source, Some(3));
+        assert!((track.duck.threshold_db + 30.0).abs() < 1.0e-4);
+        assert!((track.duck.amount_db - 15.0).abs() < 1.0e-4);
+        assert!((track.duck.attack_ms - 20.0).abs() < 1.0e-4);
+        assert!((track.duck.release_ms - 400.0).abs() < 1.0e-4);
+        let json = serde_json::to_string(project.active().unwrap()).unwrap();
+        assert!(json.contains("\"duck\""), "{json}");
+        let loaded: Sequence = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.tracks[0].duck, project.active().unwrap().tracks[0].duck);
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for track in value["tracks"].as_array_mut().unwrap() {
+            track.as_object_mut().unwrap().remove("duck");
+        }
+        let loaded: Sequence = serde_json::from_str(&value.to_string()).unwrap();
+        assert!(loaded.tracks[0].duck.is_bypass());
+        let fresh = crate::model::Track::new(TrackId(1), TrackKind::Audio, "A1");
+        assert!(!serde_json::to_string(&fresh).unwrap().contains("duck"));
     }
 
     #[test]

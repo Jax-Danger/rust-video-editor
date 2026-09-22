@@ -10,9 +10,10 @@
 use std::path::{Path, PathBuf};
 
 use editor_core::{
-    ffmpeg_compressor_filter, ffmpeg_eq_filters, ffmpeg_pan_filter, ffmpeg_volume_arg, mix_regions,
-    multicam_audio_spans, nested_audio_spans, source_frame_at, ExportRange, Frame, GainCurve,
-    MediaAsset, MulticamGroup, Sequence, Timebase, TrackCompressor, TrackEq3, TrackKind,
+    ffmpeg_compressor_filter, ffmpeg_duck_filter, ffmpeg_eq_filters, ffmpeg_pan_filter,
+    ffmpeg_volume_arg, mix_regions, multicam_audio_spans, nested_audio_spans, source_frame_at,
+    ExportRange, Frame, GainCurve, MediaAsset, MulticamGroup, Sequence, Timebase, TrackCompressor,
+    TrackDuck, TrackEq3, TrackKind,
 };
 
 use crate::composite::{active_captions, program_stack_with, ComposeEnv, ProgramLayer};
@@ -44,6 +45,10 @@ pub struct WavPiece {
     pub eq: TrackEq3,
     /// Pre-fader compressor on the parent track.
     pub compressor: TrackCompressor,
+    /// Parent track. Used to wire sidechain ducking between tracks.
+    pub track_id: u64,
+    /// Sidechain duck on the parent track. Inactive ducks are ignored.
+    pub duck: TrackDuck,
     /// Keyed clip gain × track fader, in sequence frames.
     pub gain_keys: Vec<editor_core::GainKey>,
 }
@@ -1011,6 +1016,146 @@ impl Graph {
     }
 }
 
+struct ClipLayer {
+    track_id: u64,
+    label: String,
+    duck: TrackDuck,
+}
+
+fn mix_labels(graph: &mut Graph, labels: Vec<String>) -> String {
+    if labels.len() == 1 {
+        return labels.into_iter().next().unwrap_or_default();
+    }
+    let label = graph.lab();
+    let inputs: String = labels.iter().map(|item| format!("[{item}]")).collect();
+    graph.filters.push(format!(
+        "{inputs}amix=inputs={}:duration=longest:dropout_transition=0:normalize=0[{label}]",
+        labels.len()
+    ));
+    label
+}
+
+/// Sum clips on each track, then sidechain-compress any track that ducks.
+///
+/// Tracks with no active duck keep the flat clip amix so an unducked export
+/// graph stays the same. Detection uses the pre-duck track sum.
+fn mix_clip_layers(graph: &mut Graph, layers: &[ClipLayer], dur: f64) -> String {
+    if layers.is_empty() {
+        let label = graph.lab();
+        graph.filters.push(format!(
+            "anullsrc=channel_layout=stereo:sample_rate=48000:d={},aformat=sample_fmts=fltp:channel_layouts=stereo[{label}]",
+            secs(dur)
+        ));
+        return label;
+    }
+    if !layers.iter().any(|layer| layer.duck.is_active()) {
+        return mix_labels(graph, layers.iter().map(|layer| layer.label.clone()).collect());
+    }
+
+    let mut order: Vec<u64> = Vec::new();
+    let mut groups: Vec<(u64, Vec<String>, TrackDuck)> = Vec::new();
+    for layer in layers {
+        if let Some(group) = groups.iter_mut().find(|group| group.0 == layer.track_id) {
+            group.1.push(layer.label.clone());
+        } else {
+            order.push(layer.track_id);
+            groups.push((layer.track_id, vec![layer.label.clone()], layer.duck));
+        }
+    }
+
+    let pre: Vec<(u64, String, TrackDuck)> = groups
+        .into_iter()
+        .map(|(id, labels, duck)| (id, mix_labels(graph, labels), duck))
+        .collect();
+
+    let mut users: Vec<(u64, usize)> = Vec::new();
+    for (id, _, duck) in &pre {
+        let Some(source) = duck.source else {
+            continue;
+        };
+        if !duck.is_active() || source == *id {
+            continue;
+        }
+        if !pre.iter().any(|(track_id, _, _)| *track_id == source) {
+            continue;
+        }
+        if let Some(slot) = users.iter_mut().find(|(track_id, _)| *track_id == source) {
+            slot.1 += 1;
+        } else {
+            users.push((source, 1));
+        }
+    }
+
+    let mut keep: Vec<(u64, String)> = Vec::new();
+    let mut sidechains: Vec<(u64, Vec<String>)> = Vec::new();
+    for (id, label, _) in &pre {
+        let uses = users
+            .iter()
+            .find(|(track_id, _)| track_id == id)
+            .map(|(_, count)| *count)
+            .unwrap_or(0);
+        if uses == 0 {
+            keep.push((*id, label.clone()));
+            continue;
+        }
+        let total = uses + 1;
+        let mut outs = Vec::with_capacity(total);
+        let mut spec = format!("[{label}]asplit={total}");
+        for _ in 0..total {
+            let out = graph.lab();
+            spec.push_str(&format!("[{out}]"));
+            outs.push(out);
+        }
+        graph.filters.push(spec);
+        keep.push((*id, outs.remove(0)));
+        sidechains.push((*id, outs));
+    }
+
+    let mut cursor: Vec<(u64, usize)> = Vec::new();
+    for (id, _, duck) in &pre {
+        let Some(source) = duck.source else {
+            continue;
+        };
+        if !duck.is_active() || source == *id {
+            continue;
+        }
+        let Some(filter) = ffmpeg_duck_filter(duck) else {
+            continue;
+        };
+        let Some(chains) = sidechains.iter().find(|(track_id, _)| *track_id == source) else {
+            continue;
+        };
+        let index = if let Some(slot) = cursor.iter_mut().find(|(track_id, _)| *track_id == source)
+        {
+            let index = slot.1;
+            slot.1 += 1;
+            index
+        } else {
+            cursor.push((source, 1));
+            0
+        };
+        let Some(sidechain) = chains.1.get(index) else {
+            continue;
+        };
+        let Some(main) = keep.iter().find(|(track_id, _)| *track_id == *id) else {
+            continue;
+        };
+        let out = graph.lab();
+        graph
+            .filters
+            .push(format!("[{}][{sidechain}]{filter}[{out}]", main.1));
+        if let Some(slot) = keep.iter_mut().find(|(track_id, _)| *track_id == *id) {
+            slot.1 = out;
+        }
+    }
+
+    let labels = order
+        .iter()
+        .filter_map(|id| keep.iter().find(|(track_id, _)| track_id == id).map(|(_, label)| label.clone()))
+        .collect();
+    mix_labels(graph, labels)
+}
+
 fn slice_audio(
     graph: &mut Graph,
     pieces: &[WavPiece],
@@ -1020,7 +1165,7 @@ fn slice_audio(
     dur: f64,
     master: f32,
 ) -> String {
-    let mut layers = Vec::new();
+    let mut layers: Vec<ClipLayer> = Vec::new();
     for piece in pieces {
         if piece.timeline_out <= start || piece.timeline_in >= end {
             continue;
@@ -1065,26 +1210,13 @@ fn slice_audio(
             delay_ms.round() as i64,
         ));
         graph.filters.push(filter);
-        layers.push(label);
+        layers.push(ClipLayer {
+            track_id: piece.track_id,
+            label,
+            duck: piece.duck,
+        });
     }
-    let summed = if layers.is_empty() {
-        let label = graph.lab();
-        graph.filters.push(format!(
-            "anullsrc=channel_layout=stereo:sample_rate=48000:d={},aformat=sample_fmts=fltp:channel_layouts=stereo[{label}]",
-            secs(dur)
-        ));
-        label
-    } else if layers.len() == 1 {
-        layers.remove(0)
-    } else {
-        let label = graph.lab();
-        let inputs: String = layers.iter().map(|label| format!("[{label}]")).collect();
-        graph.filters.push(format!(
-            "{inputs}amix=inputs={}:duration=longest:dropout_transition=0:normalize=0[{label}]",
-            layers.len()
-        ));
-        label
-    };
+    let summed = mix_clip_layers(graph, &layers, dur);
     let master = editor_core::clamp_gain(master);
     let mixed = if (master - 1.0).abs() > 1.0e-4 {
         let label = graph.lab();
@@ -1120,6 +1252,7 @@ fn audible_pieces(
             .find(|track| track.id.0 == region.track_id);
         let track_eq = track.map(|track| track.eq).unwrap_or_default();
         let track_compressor = track.map(|track| track.compressor).unwrap_or_default();
+        let track_duck = track.map(|track| track.duck).unwrap_or_default();
         let Some(clip) = sequence
             .tracks
             .iter()
@@ -1149,6 +1282,8 @@ fn audible_pieces(
                         region.pan,
                         track_eq,
                         track_compressor,
+                        region.track_id,
+                        track_duck,
                         &region.gain_keys,
                     );
                 }
@@ -1170,6 +1305,8 @@ fn audible_pieces(
                     region.pan,
                     track_eq,
                     track_compressor,
+                    region.track_id,
+                    track_duck,
                     &region.gain_keys,
                 );
             }
@@ -1210,6 +1347,8 @@ fn audible_pieces(
             pan: region.pan,
             eq: track_eq,
             compressor: track_compressor,
+            track_id: region.track_id,
+            duck: track_duck,
             gain_keys: region.gain_keys,
         });
     }
@@ -1229,6 +1368,8 @@ fn push_wav(
     pan: f32,
     eq: TrackEq3,
     compressor: TrackCompressor,
+    track_id: u64,
+    duck: TrackDuck,
     gain_keys: &[editor_core::GainKey],
 ) {
     let Some(asset) = media.iter().find(|item| item.id == media_id) else {
@@ -1252,6 +1393,8 @@ fn push_wav(
         pan,
         eq,
         compressor,
+        track_id,
+        duck,
         gain_keys: gain_keys.to_vec(),
     });
 }
@@ -1432,8 +1575,8 @@ fn container_name(container: &str) -> &'static str {
 mod tests {
     use super::*;
     use editor_core::{
-        Clip, ClipId, ColorGrade, CueId, Effect, MediaId, SequenceId, TrackEq3, TrackId,
-        TrackKind, Transform, Transition, TransitionAlign, TransitionId, TransitionKind,
+        Clip, ClipId, ColorGrade, CueId, Effect, MediaId, SequenceId, TrackDuck, TrackEq3,
+        TrackId, TrackKind, Transform, Transition, TransitionAlign, TransitionId, TransitionKind,
     };
 
     fn touch(dir: &std::path::Path, name: &str) -> String {
@@ -2024,6 +2167,83 @@ mod tests {
         assert!(
             script.filter.contains("attack=10.00"),
             "attack missing: {}",
+            script.filter
+        );
+        assert!(
+            !script.filter.contains("sidechaincompress"),
+            "unducked track should stay dry: {}",
+            script.filter
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ducking_sidechains_the_source_track_in_the_export_graph() {
+        let dir = std::env::temp_dir().join(format!("meridian-plan-duck-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let music = touch(&dir, "music.wav");
+        let voice = touch(&dir, "voice.wav");
+        let mut sequence = Sequence::new(SequenceId(1), "Duck", 320, 180, Timebase::fps_24());
+        sequence.add_track(TrackId(2), TrackKind::Audio, "Music");
+        sequence.add_track(TrackId(3), TrackKind::Audio, "Dial");
+        let mut bed = Clip::basic(10, 0, 24);
+        bed.media_id = Some(MediaId(1));
+        let mut dial = Clip::basic(11, 0, 24);
+        dial.media_id = Some(MediaId(2));
+        sequence.tracks[0].clips = vec![bed];
+        sequence.tracks[1].clips = vec![dial];
+        sequence.tracks[0].duck = TrackDuck {
+            enabled: true,
+            source: Some(3),
+            threshold_db: -24.0,
+            amount_db: 18.0,
+            attack_ms: 15.0,
+            release_ms: 300.0,
+        };
+        let media = vec![asset(1, &music, false, true), asset(2, &voice, false, true)];
+        let script = plan_encode(
+            &sequence,
+            &media,
+            ExportRange::WholeSequence,
+            "H.264",
+            "mp4",
+            false,
+            EncodeHints::default(),
+        )
+        .unwrap();
+        assert!(
+            script.filter.contains("sidechaincompress="),
+            "duck missing: {}",
+            script.filter
+        );
+        assert!(
+            script.filter.contains("threshold=0.063096"),
+            "threshold missing: {}",
+            script.filter
+        );
+        assert!(
+            script.filter.contains("ratio=4.00"),
+            "ratio missing: {}",
+            script.filter
+        );
+        assert!(
+            script.filter.contains("attack=15.00"),
+            "attack missing: {}",
+            script.filter
+        );
+        assert!(
+            script.filter.contains("release=300.00"),
+            "release missing: {}",
+            script.filter
+        );
+        assert!(
+            script.filter.contains("asplit="),
+            "source was not split for the sidechain: {}",
+            script.filter
+        );
+        assert!(
+            script.filter.contains("amix=inputs=2"),
+            "both tracks should still reach the bus: {}",
             script.filter
         );
         let _ = std::fs::remove_dir_all(&dir);

@@ -1,20 +1,28 @@
 //! Fairlight-inspired mixer: one strip per audio track, plus the master bus.
 //!
 //! Faders are decibels (−∞…+12). Pan is constant-power and unity at center.
-//! Each strip has a 3-band EQ (L/M/H ±12 dB, optional low-cut) and a dynamics
-//! compressor (threshold, ratio, attack, release, makeup). Meters show peak, a
-//! brighter RMS fill, and a peak-hold tick. Mute, solo, fader, pan, EQ,
-//! compressor, and clip gain all feed the same bus playback and export use.
+//! Each strip has a 3-band EQ (L/M/H ±12 dB, optional low-cut), a dynamics
+//! compressor (threshold, ratio, attack, release, makeup), and sidechain
+//! ducking (enable, source track, threshold, amount, attack, release). Meters
+//! show peak, a brighter RMS fill, and a peak-hold tick. Mute, solo, fader,
+//! pan, EQ, compressor, duck, and clip gain all feed the same bus playback
+//! and export use.
 
 use editor_core::{
-    clamp_attack_ms, clamp_eq_db, clamp_makeup_db, clamp_ratio, clamp_release_ms,
-    clamp_threshold_db, fader_pos_to_linear, format_db, format_eq_db, format_makeup_db,
-    format_pan, format_ratio, format_threshold_db, format_time_ms, linear_to_fader_pos,
-    meter_amount, set_clip_gain_at, set_master_fader, set_track_compressor, set_track_eq,
+    clamp_attack_ms, clamp_duck_amount, clamp_duck_attack, clamp_duck_release,
+    clamp_duck_threshold, clamp_eq_db, clamp_makeup_db, clamp_ratio, clamp_release_ms,
+    clamp_threshold_db, fader_pos_to_linear, format_db, format_duck_amount, format_duck_threshold,
+    format_eq_db, format_makeup_db, format_pan, format_ratio, format_threshold_db, format_time_ms,
+    linear_to_fader_pos, meter_amount, set_clip_gain_at, set_master_fader, set_track_compressor,
+    set_track_duck, set_track_duck_enabled, set_track_duck_source, set_track_eq,
     set_track_eq_low_cut, set_track_fader, set_track_pan, toggle_volume_key, ClipId,
-    CompressorParam, EqBand, Frame, TrackCompressor, TrackEq3, TrackId, TrackKind, ATTACK_MS_MAX,
-    ATTACK_MS_MIN, EQ_DB_MAX, EQ_DB_MIN, MAKEUP_DB_MAX, MAKEUP_DB_MIN, RATIO_MAX, RATIO_MIN,
-    RELEASE_MS_MAX, RELEASE_MS_MIN, THRESHOLD_DB_MAX, THRESHOLD_DB_MIN,
+    CompressorParam, DuckParam, EqBand, Frame, TrackCompressor, TrackDuck, TrackEq3, TrackId,
+    TrackKind, AMOUNT_DB_MAX, AMOUNT_DB_MIN, ATTACK_MS_MAX, ATTACK_MS_MIN,
+    DEFAULT_DUCK_AMOUNT_DB, DEFAULT_DUCK_ATTACK_MS, DEFAULT_DUCK_RELEASE_MS,
+    DEFAULT_DUCK_THRESHOLD_DB, DUCK_ATTACK_MS_MAX, DUCK_ATTACK_MS_MIN, DUCK_RELEASE_MS_MAX,
+    DUCK_RELEASE_MS_MIN, DUCK_THRESHOLD_DB_MAX, DUCK_THRESHOLD_DB_MIN, EQ_DB_MAX, EQ_DB_MIN,
+    MAKEUP_DB_MAX, MAKEUP_DB_MIN, RATIO_MAX, RATIO_MIN, RELEASE_MS_MAX, RELEASE_MS_MIN,
+    THRESHOLD_DB_MAX, THRESHOLD_DB_MIN,
 };
 use egui::{pos2, Align2, Color32, Id, Rect, Sense, Shape, Stroke, Vec2};
 
@@ -32,6 +40,7 @@ struct StripSnap {
     pan: f32,
     eq: TrackEq3,
     compressor: TrackCompressor,
+    duck: TrackDuck,
     muted: bool,
     solo: bool,
     clip_id: Option<ClipId>,
@@ -72,8 +81,12 @@ pub(crate) fn mixer_bay(ui: &mut egui::Ui, app: &mut MeridianApp) {
                         );
                     });
                 }
+                let lanes: Vec<(TrackId, String)> = strips
+                    .iter()
+                    .map(|strip| (strip.id, strip.name.clone()))
+                    .collect();
                 for strip in &strips {
-                    channel_strip(ui, app, strip, height);
+                    channel_strip(ui, app, strip, &lanes, height);
                 }
                 master_strip(ui, app, master, master_meter, height);
                 ui.add_space(10.0);
@@ -101,6 +114,7 @@ fn snapshot(app: &MeridianApp, playhead: i64) -> Vec<StripSnap> {
             pan: track.pan,
             eq: track.eq,
             compressor: track.compressor,
+            duck: track.duck,
             muted: track.muted,
             solo: track.solo,
             clip_id: clip.map(|clip| clip.id),
@@ -116,7 +130,13 @@ fn snapshot(app: &MeridianApp, playhead: i64) -> Vec<StripSnap> {
     strips
 }
 
-fn channel_strip(ui: &mut egui::Ui, app: &mut MeridianApp, strip: &StripSnap, height: f32) {
+fn channel_strip(
+    ui: &mut egui::Ui,
+    app: &mut MeridianApp,
+    strip: &StripSnap,
+    lanes: &[(TrackId, String)],
+    height: f32,
+) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(STRIP_W, height), Sense::hover());
     paint_well(ui, rect);
     let accent = Rect::from_min_size(rect.min, Vec2::new(rect.width(), 3.0));
@@ -196,15 +216,21 @@ fn channel_strip(ui: &mut egui::Ui, app: &mut MeridianApp, strip: &StripSnap, he
         );
     }
 
-    let gain_top = rect.bottom() - 182.0;
     let meter_top = db.bottom() + 8.0;
+    let room = (rect.bottom() - 4.0 - meter_top).max(0.0);
+    let fader_h = if room < 96.0 {
+        room * 0.42
+    } else {
+        (room * 0.46).clamp(72.0, 200.0)
+    };
+    let meter_bottom = meter_top + fader_h;
     let meter_rect = Rect::from_min_max(
         pos2(rect.left() + 14.0, meter_top),
-        pos2(rect.left() + 36.0, gain_top - 8.0),
+        pos2(rect.left() + 36.0, meter_bottom),
     );
     let fader_rect = Rect::from_min_max(
         pos2(rect.left() + 52.0, meter_top),
-        pos2(rect.left() + 78.0, gain_top - 8.0),
+        pos2(rect.left() + 78.0, meter_bottom),
     );
     if meter_rect.height() > 24.0 {
         let columns = meter_columns(meter_rect);
@@ -235,42 +261,66 @@ fn channel_strip(ui: &mut egui::Ui, app: &mut MeridianApp, strip: &StripSnap, he
         );
     }
 
-    let pan_rect = Rect::from_min_size(
-        pos2(rect.left() + 10.0, gain_top),
-        Vec2::new(rect.width() - 20.0, 22.0),
+    let controls = Rect::from_min_max(
+        pos2(rect.left(), meter_bottom + 6.0),
+        pos2(rect.right(), rect.bottom() - 2.0),
     );
-    pan_slider(ui, app, pan_rect, strip);
-    let label = Rect::from_min_size(
-        pos2(rect.left() + 8.0, pan_rect.bottom() + 2.0),
-        Vec2::new(rect.width() - 16.0, 14.0),
-    );
-    ui.painter().text(
-        label.center(),
-        Align2::CENTER_CENTER,
-        format!("Pan {}", format_pan(strip.pan)),
-        THEME.mono(10.0),
-        THEME.text_dim,
-    );
-
-    let eq_top = label.bottom() + 4.0;
-    let eq_rect = Rect::from_min_size(
-        pos2(rect.left() + 8.0, eq_top),
-        Vec2::new(rect.width() - 16.0, 54.0),
-    );
-    eq_section(ui, app, eq_rect, strip);
-
-    let dyn_rect = Rect::from_min_size(
-        pos2(rect.left() + 8.0, eq_rect.bottom() + 4.0),
-        Vec2::new(rect.width() - 16.0, 70.0),
-    );
-    dynamics_section(ui, app, dyn_rect, strip);
-
-    if strip.clip_id.is_some() {
-        let gain_rect = Rect::from_min_size(
-            pos2(rect.left() + 8.0, dyn_rect.bottom() + 4.0),
-            Vec2::new(rect.width() - 16.0, 28.0),
-        );
-        clip_gain_row(ui, app, gain_rect, strip);
+    if controls.height() > 8.0 {
+        let mut body = ui.new_child(egui::UiBuilder::new().max_rect(controls));
+        egui::ScrollArea::vertical()
+            .id_salt(("mix_strip_body", strip.id.0))
+            .auto_shrink([false, false])
+            .show(&mut body, |ui| {
+                let width = ui.available_width();
+                let clip_h = if strip.clip_id.is_some() { 32.0 } else { 0.0 };
+                let content_h = 22.0 + 16.0 + 58.0 + 74.0 + 84.0 + clip_h;
+                let (content, _) =
+                    ui.allocate_exact_size(Vec2::new(width, content_h), Sense::hover());
+                let mut y = content.top();
+                let pan_rect = Rect::from_min_size(
+                    pos2(content.left() + 10.0, y),
+                    Vec2::new(content.width() - 20.0, 22.0),
+                );
+                y += 24.0;
+                let label = Rect::from_min_size(
+                    pos2(content.left() + 8.0, y),
+                    Vec2::new(content.width() - 16.0, 14.0),
+                );
+                y += 16.0;
+                let eq_rect = Rect::from_min_size(
+                    pos2(content.left() + 8.0, y),
+                    Vec2::new(content.width() - 16.0, 54.0),
+                );
+                y += 58.0;
+                let dyn_rect = Rect::from_min_size(
+                    pos2(content.left() + 8.0, y),
+                    Vec2::new(content.width() - 16.0, 70.0),
+                );
+                y += 74.0;
+                let duck_rect = Rect::from_min_size(
+                    pos2(content.left() + 8.0, y),
+                    Vec2::new(content.width() - 16.0, 80.0),
+                );
+                y += 84.0;
+                pan_slider(ui, app, pan_rect, strip);
+                ui.painter().text(
+                    label.center(),
+                    Align2::CENTER_CENTER,
+                    format!("Pan {}", format_pan(strip.pan)),
+                    THEME.mono(10.0),
+                    THEME.text_dim,
+                );
+                eq_section(ui, app, eq_rect, strip);
+                dynamics_section(ui, app, dyn_rect, strip);
+                duck_section(ui, app, duck_rect, strip, lanes);
+                if strip.clip_id.is_some() {
+                    let gain_rect = Rect::from_min_size(
+                        pos2(content.left() + 8.0, y),
+                        Vec2::new(content.width() - 16.0, 28.0),
+                    );
+                    clip_gain_row(ui, app, gain_rect, strip);
+                }
+            });
     }
 }
 
@@ -585,6 +635,247 @@ fn dyn_row<F>(
                     .active_sequence
                     .ok_or(editor_core::EditError::NoActiveSequence)?;
                 set_track_compressor(project, seq, track_id, param, next)
+            });
+        }
+    }
+    if response.drag_stopped() {
+        app.session.end_interactive();
+    }
+}
+
+fn duck_section(
+    ui: &mut egui::Ui,
+    app: &mut MeridianApp,
+    rect: Rect,
+    strip: &StripSnap,
+    lanes: &[(TrackId, String)],
+) {
+    let painter = ui.painter();
+    painter.text(
+        rect.left_top(),
+        Align2::LEFT_TOP,
+        "DUCK",
+        THEME.font(10.0),
+        THEME.text_mute,
+    );
+    let enable = Rect::from_min_size(pos2(rect.right() - 28.0, rect.top()), Vec2::new(28.0, 14.0));
+    if pill(
+        ui,
+        enable,
+        Id::new(("mix_duck_on", strip.id.0)),
+        "ON",
+        strip.duck.enabled,
+        THEME.audio,
+    ) {
+        let track = strip.id;
+        let enabled = !strip.duck.enabled;
+        let _ = app.session.edit("Duck", |project| {
+            let seq = project
+                .active_sequence
+                .ok_or(editor_core::EditError::NoActiveSequence)?;
+            set_track_duck_enabled(project, seq, track, enabled)
+        });
+    }
+    let source_rect = Rect::from_min_size(
+        pos2(rect.left(), rect.top() + 14.0),
+        Vec2::new(rect.width(), 16.0),
+    );
+    duck_source(ui, app, source_rect, strip, lanes);
+    let row_h = 12.0;
+    let start_y = rect.top() + 32.0;
+    let row_w = rect.width();
+    duck_row(
+        ui,
+        app,
+        Rect::from_min_size(pos2(rect.left(), start_y), Vec2::new(row_w, row_h)),
+        strip,
+        DuckParam::Threshold,
+        "THR",
+        strip.duck.threshold_db,
+        DUCK_THRESHOLD_DB_MIN,
+        DUCK_THRESHOLD_DB_MAX,
+        format_duck_threshold,
+    );
+    duck_row(
+        ui,
+        app,
+        Rect::from_min_size(pos2(rect.left(), start_y + row_h), Vec2::new(row_w, row_h)),
+        strip,
+        DuckParam::Amount,
+        "AMT",
+        strip.duck.amount_db,
+        AMOUNT_DB_MIN,
+        AMOUNT_DB_MAX,
+        format_duck_amount,
+    );
+    duck_row(
+        ui,
+        app,
+        Rect::from_min_size(pos2(rect.left(), start_y + row_h * 2.0), Vec2::new(row_w, row_h)),
+        strip,
+        DuckParam::Attack,
+        "ATK",
+        strip.duck.attack_ms,
+        DUCK_ATTACK_MS_MIN,
+        DUCK_ATTACK_MS_MAX,
+        format_time_ms,
+    );
+    duck_row(
+        ui,
+        app,
+        Rect::from_min_size(pos2(rect.left(), start_y + row_h * 3.0), Vec2::new(row_w, row_h)),
+        strip,
+        DuckParam::Release,
+        "REL",
+        strip.duck.release_ms,
+        DUCK_RELEASE_MS_MIN,
+        DUCK_RELEASE_MS_MAX,
+        format_time_ms,
+    );
+}
+
+fn duck_source(
+    ui: &mut egui::Ui,
+    app: &mut MeridianApp,
+    rect: Rect,
+    strip: &StripSnap,
+    lanes: &[(TrackId, String)],
+) {
+    let selected = strip.duck.source.and_then(|id| {
+        lanes
+            .iter()
+            .find(|(lane, _)| lane.0 == id && *lane != strip.id)
+            .map(|(_, name)| name.clone())
+    });
+    let label = selected.unwrap_or_else(|| {
+        if strip.duck.source.is_some() {
+            "Missing".into()
+        } else {
+            "None".into()
+        }
+    });
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+    let track_id = strip.id;
+    let current = strip.duck.source;
+    egui::ComboBox::from_id_salt(("duck_src", strip.id.0))
+        .width(rect.width())
+        .selected_text(label)
+        .show_ui(&mut child, |ui| {
+            if ui
+                .selectable_label(current.is_none(), "None")
+                .on_hover_text("No sidechain")
+                .clicked()
+            {
+                let _ = app.session.edit("Duck source", |project| {
+                    let seq = project
+                        .active_sequence
+                        .ok_or(editor_core::EditError::NoActiveSequence)?;
+                    set_track_duck_source(project, seq, track_id, None)
+                });
+            }
+            for (id, name) in lanes {
+                if *id == track_id {
+                    continue;
+                }
+                if ui
+                    .selectable_label(current == Some(id.0), name)
+                    .clicked()
+                {
+                    let source = *id;
+                    let _ = app.session.edit("Duck source", |project| {
+                        let seq = project
+                            .active_sequence
+                            .ok_or(editor_core::EditError::NoActiveSequence)?;
+                        set_track_duck_source(project, seq, track_id, Some(source))
+                    });
+                }
+            }
+        });
+}
+
+fn duck_row<F>(
+    ui: &mut egui::Ui,
+    app: &mut MeridianApp,
+    rect: Rect,
+    strip: &StripSnap,
+    param: DuckParam,
+    label: &str,
+    value: f32,
+    min: f32,
+    max: f32,
+    format: F,
+) where
+    F: Fn(f32) -> String,
+{
+    let painter = ui.painter();
+    painter.text(
+        rect.left_center(),
+        Align2::LEFT_CENTER,
+        label,
+        THEME.mono(9.0),
+        THEME.text_dim,
+    );
+    let track = Rect::from_min_max(
+        pos2(rect.left() + 24.0, rect.center().y - 2.0),
+        pos2(rect.right() - 28.0, rect.center().y + 2.0),
+    );
+    let response = ui.interact(
+        track.expand2(Vec2::new(0.0, 5.0)),
+        Id::new(("mix_duck", strip.id.0, label)),
+        Sense::click_and_drag(),
+    );
+    painter.rect_filled(track, 2.0, THEME.inset);
+    let t = if max > min {
+        ((value - min) / (max - min)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let knob = pos2(track.left() + track.width() * t, track.center().y);
+    painter.circle_filled(knob, 3.0, THEME.text);
+    painter.circle_stroke(knob, 3.0, Stroke::new(1.0_f32, THEME.audio));
+    painter.text(
+        pos2(rect.right(), rect.center().y),
+        Align2::RIGHT_CENTER,
+        format(value),
+        THEME.mono(8.0),
+        THEME.text_mute,
+    );
+    let default = match param {
+        DuckParam::Threshold => DEFAULT_DUCK_THRESHOLD_DB,
+        DuckParam::Amount => DEFAULT_DUCK_AMOUNT_DB,
+        DuckParam::Attack => DEFAULT_DUCK_ATTACK_MS,
+        DuckParam::Release => DEFAULT_DUCK_RELEASE_MS,
+    };
+    if response.double_clicked() {
+        app.session.end_interactive();
+        let track_id = strip.id;
+        let _ = app.session.edit("Duck", |project| {
+            let seq = project
+                .active_sequence
+                .ok_or(editor_core::EditError::NoActiveSequence)?;
+            set_track_duck(project, seq, track_id, param, default)
+        });
+        return;
+    }
+    if response.drag_started() {
+        app.session.begin_interactive("Duck");
+    }
+    if response.dragged() || response.clicked() {
+        if let Some(pointer) = response.interact_pointer_pos() {
+            let pos = ((pointer.x - track.left()) / track.width()).clamp(0.0, 1.0);
+            let next = min + pos * (max - min);
+            let next = match param {
+                DuckParam::Threshold => clamp_duck_threshold(next),
+                DuckParam::Amount => clamp_duck_amount(next),
+                DuckParam::Attack => clamp_duck_attack(next),
+                DuckParam::Release => clamp_duck_release(next),
+            };
+            let track_id = strip.id;
+            let _ = app.session.edit("Duck", |project| {
+                let seq = project
+                    .active_sequence
+                    .ok_or(editor_core::EditError::NoActiveSequence)?;
+                set_track_duck(project, seq, track_id, param, next)
             });
         }
     }

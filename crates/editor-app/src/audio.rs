@@ -13,7 +13,7 @@ use editor_core::{
     Frame, MediaAsset, MulticamGroup, Sequence, TrackKind,
 };
 #[cfg(feature = "ffmpeg")]
-use editor_core::{channel_clips, mix_frame, CompressorProcessor, EqProcessor};
+use editor_core::{channel_clips, mix_ducked_frame, CompressorProcessor, DuckMix, EqProcessor};
 use editor_media::resolve_media_path;
 
 #[cfg(feature = "ffmpeg")]
@@ -774,6 +774,7 @@ struct BusSource {
     acc: Vec<(u64, f32, f32)>,
     eq: Vec<(u64, EqProcessor)>,
     compressor: Vec<(u64, CompressorProcessor)>,
+    duck: DuckMix,
     control: std::sync::Arc<MixControl>,
     cached: std::sync::Arc<BusState>,
     fps: f64,
@@ -836,6 +837,7 @@ impl BusSource {
             track_ids,
             eq,
             compressor,
+            duck: DuckMix::default(),
             control,
             cached,
             fps: fps.max(1.0),
@@ -922,7 +924,7 @@ impl BusSource {
         }
         self.apply_track_eq();
         self.apply_track_compressor();
-        let mixed = mix_frame(&self.acc, &bus);
+        let mixed = mix_ducked_frame(&mut self.acc, &bus, &mut self.duck);
         self.window = self.window.saturating_add(1);
         self.master_clip |= mixed.overload;
         self.master_peak[0] = self.master_peak[0].max(mixed.left.abs());
