@@ -647,6 +647,8 @@ pub enum LayerSource {
     Solid {
         rgb: [f32; 3],
     },
+    /// Grade and filters apply to the composite accumulated so far.
+    Adjustment,
 }
 
 /// One layer, bottom to top. Higher timeline tracks are later.
@@ -667,6 +669,10 @@ pub struct ProgramLayer {
 impl ProgramLayer {
     pub fn is_title(&self) -> bool {
         matches!(self.source, LayerSource::Title(_))
+    }
+
+    pub fn is_adjustment(&self) -> bool {
+        matches!(self.source, LayerSource::Adjustment)
     }
 }
 
@@ -855,6 +861,19 @@ fn layer_from_clip(
     if place.opacity <= 0.001 {
         return Ok(None);
     }
+    if clip.is_adjustment() {
+        return Ok(Some(ProgramLayer {
+            source: LayerSource::Adjustment,
+            width: canvas_w,
+            height: canvas_h,
+            grade: GradeSample::from_effects(&clip.effects, rel),
+            filters: FilterSample::from_effects(&clip.effects, rel),
+            place,
+            label: layer_label(track, clip),
+            using_proxy: false,
+            clip_id: clip.id.0,
+        }));
+    }
     if let Some(title) = clip.title.clone() {
         let (width, height) = layer_pixel_size(canvas_w, canvas_h, &place);
         return Ok(Some(ProgramLayer {
@@ -969,31 +988,42 @@ pub fn composite(
         return dst;
     }
     for layer in layers {
-        if !layer.place.contributes()
-            || layer.rgba.len() < 4
-            || layer.width == 0
-            || layer.height == 0
-        {
-            continue;
-        }
-        if straight_full_frame(layer, dst_w, dst_h) {
-            match mask_window(layer.place.mask) {
-                MaskWindow::Empty => {}
-                MaskWindow::All => grade_over(&mut dst, dst_w, dst_h, layer, 0, 0, dst_w, dst_h),
-                MaskWindow::Uv { u0, v0, u1, v1 } => {
-                    let x0 = (u0.clamp(0.0, 1.0) * dst_w as f32).floor() as u32;
-                    let y0 = (v0.clamp(0.0, 1.0) * dst_h as f32).floor() as u32;
-                    let x1 = (u1.clamp(0.0, 1.0) * dst_w as f32).ceil() as u32;
-                    let y1 = (v1.clamp(0.0, 1.0) * dst_h as f32).ceil() as u32;
-                    grade_over(&mut dst, dst_w, dst_h, layer, x0, y0, x1, y1);
-                }
-                MaskWindow::PerPixel => grade_over_masked(&mut dst, dst_w, dst_h, layer),
-            }
-        } else {
-            blit(&mut dst, dst_w, dst_h, seq_w, seq_h, layer);
-        }
+        composite_layer_over(&mut dst, dst_w, dst_h, seq_w, seq_h, layer);
     }
     dst
+}
+
+fn composite_layer_over(
+    dst: &mut [u8],
+    dst_w: u32,
+    dst_h: u32,
+    seq_w: f32,
+    seq_h: f32,
+    layer: &BlitLayer<'_>,
+) {
+    if !layer.place.contributes()
+        || layer.rgba.len() < 4
+        || layer.width == 0
+        || layer.height == 0
+    {
+        return;
+    }
+    if straight_full_frame(layer, dst_w, dst_h) {
+        match mask_window(layer.place.mask) {
+            MaskWindow::Empty => {}
+            MaskWindow::All => grade_over(dst, dst_w, dst_h, layer, 0, 0, dst_w, dst_h),
+            MaskWindow::Uv { u0, v0, u1, v1 } => {
+                let x0 = (u0.clamp(0.0, 1.0) * dst_w as f32).floor() as u32;
+                let y0 = (v0.clamp(0.0, 1.0) * dst_h as f32).floor() as u32;
+                let x1 = (u1.clamp(0.0, 1.0) * dst_w as f32).ceil() as u32;
+                let y1 = (v1.clamp(0.0, 1.0) * dst_h as f32).ceil() as u32;
+                grade_over(dst, dst_w, dst_h, layer, x0, y0, x1, y1);
+            }
+            MaskWindow::PerPixel => grade_over_masked(dst, dst_w, dst_h, layer),
+        }
+    } else {
+        blit(dst, dst_w, dst_h, seq_w, seq_h, layer);
+    }
 }
 
 fn solid_rgba(width: u32, height: u32, rgb: [f32; 3]) -> Vec<u8> {
@@ -1149,7 +1179,8 @@ fn apply_vignette(rgba: &mut [u8], width: u32, height: u32, amount: f32, softnes
 }
 
 /// Rasterize title generators and composite every layer. `media_rgba` is only
-/// called for decoded picture; titles never go through it.
+/// called for decoded picture; titles never go through it. Adjustment layers
+/// grade and filter the composite accumulated so far.
 pub fn compose_layers(
     dst_w: u32,
     dst_h: u32,
@@ -1158,15 +1189,27 @@ pub fn compose_layers(
     layers: &[ProgramLayer],
     mut media_rgba: impl FnMut(&ProgramLayer) -> Result<Vec<u8>, String>,
 ) -> Result<Vec<u8>, String> {
-    let mut owned: Vec<(Vec<u8>, u32, u32, GradeSample, Place)> = Vec::new();
+    let len = (dst_w as usize)
+        .checked_mul(dst_h as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .unwrap_or(0);
+    let mut dst = vec![0u8; len];
+    if dst_w == 0 || dst_h == 0 || seq_w <= 1.0 || seq_h <= 1.0 {
+        return Ok(dst);
+    }
     for layer in layers {
         if !layer.place.contributes() || layer.width == 0 || layer.height == 0 {
+            continue;
+        }
+        if matches!(layer.source, LayerSource::Adjustment) {
+            apply_adjustment_layer(&mut dst, dst_w, dst_h, layer);
             continue;
         }
         let mut rgba = match &layer.source {
             LayerSource::Title(title) => render_title(title, layer.width, layer.height),
             LayerSource::Media { .. } => media_rgba(layer)?,
             LayerSource::Solid { rgb } => solid_rgba(layer.width, layer.height, *rgb),
+            LayerSource::Adjustment => unreachable!(),
         };
         if rgba.len() < 4 {
             continue;
@@ -1180,25 +1223,84 @@ pub fn compose_layers(
                 layer.place.blur_radius,
             );
         }
-        owned.push((
-            rgba,
-            layer.width,
-            layer.height,
-            layer.grade.clone(),
-            layer.place,
-        ));
+        let blit = BlitLayer {
+            rgba: &rgba,
+            width: layer.width,
+            height: layer.height,
+            grade: layer.grade.clone(),
+            place: layer.place,
+        };
+        composite_layer_over(&mut dst, dst_w, dst_h, seq_w, seq_h, &blit);
     }
-    let blits: Vec<BlitLayer<'_>> = owned
-        .iter()
-        .map(|(rgba, width, height, grade, place)| BlitLayer {
-            rgba,
-            width: *width,
-            height: *height,
-            grade: grade.clone(),
-            place: *place,
-        })
-        .collect();
-    Ok(composite(dst_w, dst_h, seq_w, seq_h, &blits))
+    Ok(dst)
+}
+
+fn apply_grade_to_rgba(rgba: &mut [u8], grade: &GradeSample) {
+    if grade.is_neutral() {
+        return;
+    }
+    for px in rgba.chunks_exact_mut(4) {
+        if px[3] == 0 {
+            continue;
+        }
+        let rgb = grade.apply([
+            px[0] as f32 / 255.0,
+            px[1] as f32 / 255.0,
+            px[2] as f32 / 255.0,
+        ]);
+        px[0] = (rgb[0] * 255.0).round().clamp(0.0, 255.0) as u8;
+        px[1] = (rgb[1] * 255.0).round().clamp(0.0, 255.0) as u8;
+        px[2] = (rgb[2] * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+}
+
+fn apply_adjustment_layer(dst: &mut [u8], width: u32, height: u32, layer: &ProgramLayer) {
+    let strength = layer.place.opacity.clamp(0.0, 1.0);
+    let masked = !matches!(layer.place.mask, CanvasMask::None);
+    let needs_blend = strength < 0.999 || masked;
+    let before = if needs_blend {
+        Some(dst.to_vec())
+    } else {
+        None
+    };
+    if !layer.filters.is_neutral() || layer.place.blur_radius >= 0.5 {
+        apply_filters(dst, width, height, &layer.filters, layer.place.blur_radius);
+    }
+    if !layer.grade.is_neutral() {
+        apply_grade_to_rgba(dst, &layer.grade);
+    }
+    if let Some(before) = before {
+        blend_adjustment(dst, &before, width, height, strength, layer.place.mask);
+    }
+}
+
+fn blend_adjustment(
+    dst: &mut [u8],
+    before: &[u8],
+    width: u32,
+    height: u32,
+    strength: f32,
+    mask: CanvasMask,
+) {
+    for y in 0..height {
+        for x in 0..width {
+            let u = (x as f32 + 0.5) / width as f32;
+            let v = (y as f32 + 0.5) / height as f32;
+            if !mask_allows(mask, u, v) {
+                let index = (y as usize * width as usize + x as usize) * 4;
+                dst[index..index + 4].copy_from_slice(&before[index..index + 4]);
+                continue;
+            }
+            let index = (y as usize * width as usize + x as usize) * 4;
+            let mix = strength;
+            for c in 0..3 {
+                let old = before[index + c] as f32;
+                let new = dst[index + c] as f32;
+                dst[index + c] = (old + (new - old) * mix).round().clamp(0.0, 255.0) as u8;
+            }
+            dst[index + 3] = before[index + 3];
+        }
+    }
 }
 
 fn straight_full_frame(layer: &BlitLayer<'_>, dst_w: u32, dst_h: u32) -> bool {
@@ -2353,10 +2455,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn adjustment_layer_grades_below_not_above() {
+        let bottom = ProgramLayer {
+            source: LayerSource::Solid {
+                rgb: [40.0 / 255.0, 0.0, 0.0],
+            },
+            width: 4,
+            height: 4,
+            grade: GradeSample::neutral(),
+            filters: FilterSample::neutral(),
+            place: Place::identity(),
+            label: "red".into(),
+            using_proxy: false,
+            clip_id: 1,
+        };
+        let adjustment = ProgramLayer {
+            source: LayerSource::Adjustment,
+            width: 4,
+            height: 4,
+            grade: GradeSample {
+                exposure: 1.0,
+                ..GradeSample::neutral()
+            },
+            filters: FilterSample::neutral(),
+            place: Place::identity(),
+            label: "adj".into(),
+            using_proxy: false,
+            clip_id: 2,
+        };
+        let top = ProgramLayer {
+            source: LayerSource::Solid {
+                rgb: [0.0, 0.0, 40.0 / 255.0],
+            },
+            width: 4,
+            height: 4,
+            grade: GradeSample::neutral(),
+            filters: FilterSample::neutral(),
+            place: Place {
+                opacity: 0.5,
+                ..Place::identity()
+            },
+            label: "blue".into(),
+            using_proxy: false,
+            clip_id: 3,
+        };
+        let red_only = compose_layers(4, 4, 4.0, 4.0, &[bottom.clone()], |_| {
+            Err("no media".into())
+        })
+        .unwrap();
+        let graded = compose_layers(4, 4, 4.0, 4.0, &[bottom.clone(), adjustment.clone()], |_| {
+            Err("no media".into())
+        })
+        .unwrap();
+        assert!(
+            graded[0] > red_only[0] + 30,
+            "adjustment should brighten the plate below: {} vs {}",
+            graded[0],
+            red_only[0]
+        );
+        let without = compose_layers(4, 4, 4.0, 4.0, &[bottom.clone(), top.clone()], |_| {
+            Err("no media".into())
+        })
+        .unwrap();
+        let with = compose_layers(
+            4,
+            4,
+            4.0,
+            4.0,
+            &[bottom, adjustment, top],
+            |_| Err("no media".into()),
+        )
+        .unwrap();
+        assert!(
+            with[0] > without[0] + 15,
+            "graded red should show through the semi-transparent top: {} vs {}",
+            with[0],
+            without[0]
+        );
+        assert!(
+            (with[2] as i32 - without[2] as i32).abs() <= 2,
+            "blue channel should match when the top layer is unchanged: {} vs {}",
+            with[2],
+            without[2]
+        );
+    }
+
     fn media_path(layer: &ProgramLayer) -> &str {
         match &layer.source {
             LayerSource::Media { path, .. } => path,
-            LayerSource::Title(_) | LayerSource::Solid { .. } => "",
+            LayerSource::Title(_) | LayerSource::Solid { .. } | LayerSource::Adjustment => "",
         }
     }
 

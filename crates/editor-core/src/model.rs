@@ -466,6 +466,11 @@ pub struct Clip {
     /// compositor rasterizes [`Title`] into the frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<Title>,
+    /// When true, this clip is an adjustment layer. It has no pixels of its
+    /// own; grade and filters apply to the composite below during preview and
+    /// export.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub adjustment: bool,
     /// Playback rate. Omitted from JSON at 100% forward. Preview and export
     /// both read it through [`crate::source_frame_at`].
     #[serde(default, skip_serializing_if = "ClipSpeed::is_identity")]
@@ -517,6 +522,7 @@ impl Clip {
             label: LabelColor::Neutral,
             volume: AnimatedF32::constant(1.0),
             title: None,
+            adjustment: false,
             speed: ClipSpeed::normal(),
         }
     }
@@ -544,12 +550,50 @@ impl Clip {
             label: LabelColor::Rose,
             volume: AnimatedF32::constant(1.0),
             title: Some(title),
+            adjustment: false,
+            speed: ClipSpeed::normal(),
+        }
+    }
+
+    /// An adjustment layer. Source handles are padded like a title so the clip
+    /// can be trimmed longer without media.
+    pub fn adjustment_layer(
+        id: u64,
+        start: i64,
+        end: i64,
+        timebase: Timebase,
+        name: &str,
+    ) -> Self {
+        let dur = (end - start).max(1);
+        let pad = 24 * 60 * 60;
+        Self {
+            id: ClipId(id),
+            media_id: None,
+            name: name.to_string(),
+            timeline_in: Frame(start),
+            timeline_out: Frame(start + dur),
+            source_in: Frame(pad),
+            source_out: Frame(pad + dur),
+            source_min: Frame(0),
+            source_max: Frame(pad + dur + pad),
+            media_timebase: timebase,
+            linked: Vec::new(),
+            enabled: true,
+            effects: Vec::new(),
+            label: LabelColor::Amber,
+            volume: AnimatedF32::constant(1.0),
+            title: None,
+            adjustment: true,
             speed: ClipSpeed::normal(),
         }
     }
 
     pub fn is_title(&self) -> bool {
         self.title.is_some()
+    }
+
+    pub fn is_adjustment(&self) -> bool {
+        self.adjustment
     }
 
     /// Give the clip unused media before (`head`) and after (`tail`) the current source.

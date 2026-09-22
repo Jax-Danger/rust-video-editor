@@ -337,6 +337,7 @@ fn placed(
         label,
         volume: AnimatedF32::constant(1.0),
         title: None,
+        adjustment: false,
         speed: crate::model::ClipSpeed::normal(),
     }
 }

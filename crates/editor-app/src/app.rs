@@ -3,7 +3,8 @@
 use std::collections::HashSet;
 
 use editor_core::{
-    add_title, add_transition, builtin_templates, clip_from_media, expand_linked, link_clips,
+    add_adjustment_layer, add_title, add_transition, builtin_templates, clip_from_media,
+    expand_linked, link_clips,
     plan_export, replace_captions, Bin, BinId, BusState, CaptionTranscriber, ClipId, CueId,
     Direction, EditError, ExportRange, Frame, MediaAsset, MediaId, Project, Session, Timebase,
     Track, TrackFlag, TrackId, TrackKind, TransitionKind, TrimEdge,
@@ -900,6 +901,27 @@ impl MeridianApp {
                     self.selected_cue = None;
                 }
                 format!("Title at {}.", format_tc(playhead, self.timebase()))
+            }
+            Err(err) => err.to_string(),
+        };
+    }
+
+    pub fn add_adjustment_layer(&mut self) {
+        let playhead = self.playhead.max(0);
+        let created = std::cell::Cell::new(None);
+        let result = self.session.edit("New Adjustment Layer", |project| {
+            let sequence = project.active_sequence.ok_or(EditError::NoActiveSequence)?;
+            let id = add_adjustment_layer(project, sequence, Frame(playhead), "Adjustment")?;
+            created.set(Some(id));
+            Ok(())
+        });
+        self.status = match result {
+            Ok(()) => {
+                if let Some(id) = created.get() {
+                    self.selected = vec![id];
+                    self.selected_cue = None;
+                }
+                format!("Adjustment layer at {}.", format_tc(playhead, self.timebase()))
             }
             Err(err) => err.to_string(),
         };
@@ -2088,6 +2110,10 @@ impl MeridianApp {
                         }
                         if ui.button("New Title").clicked() {
                             self.add_title();
+                            ui.close_menu();
+                        }
+                        if ui.button("New Adjustment Layer").clicked() {
+                            self.add_adjustment_layer();
                             ui.close_menu();
                         }
                         ui.separator();

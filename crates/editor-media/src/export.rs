@@ -1277,7 +1277,8 @@ mod tests {
         match &layer.source {
             crate::composite::LayerSource::Media { source_frame, .. } => *source_frame,
             crate::composite::LayerSource::Title(_)
-            | crate::composite::LayerSource::Solid { .. } => {
+            | crate::composite::LayerSource::Solid { .. }
+            | crate::composite::LayerSource::Adjustment => {
                 panic!("expected a media layer")
             }
         }

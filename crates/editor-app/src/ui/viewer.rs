@@ -265,7 +265,10 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
                 .iter()
                 .find(|c| c.covers(Frame(playhead)) && c.enabled)
             {
-                if clip.is_title() {
+                if clip.is_adjustment() {
+                    // Adjustment layers grade the decoded composite; proxy cards
+                    // skip them because they carry no pixels of their own.
+                } else if clip.is_title() {
                     if let Some(layer) = plan
                         .layers
                         .iter()
@@ -548,6 +551,7 @@ enum PlanPixels {
     Media(PreviewQuery),
     Title(editor_core::Title),
     Solid([f32; 3]),
+    Adjustment,
 }
 
 struct PlanLayer {
@@ -606,6 +610,7 @@ impl DecodePlan {
                         bits(channel).hash(&mut hasher);
                     }
                 }
+                PlanPixels::Adjustment => 3u8.hash(&mut hasher),
             }
             bits(layer.grade.exposure).hash(&mut hasher);
             bits(layer.grade.contrast).hash(&mut hasher);
@@ -734,6 +739,7 @@ fn decode_plan(
                 }),
                 LayerSource::Title(title) => PlanPixels::Title(title),
                 LayerSource::Solid { rgb } => PlanPixels::Solid(rgb),
+                LayerSource::Adjustment => PlanPixels::Adjustment,
             };
             PlanLayer {
                 pixels,
@@ -793,6 +799,7 @@ fn program_from_plan(layer: &PlanLayer) -> ProgramLayer {
         },
         PlanPixels::Title(title) => LayerSource::Title(title.clone()),
         PlanPixels::Solid(rgb) => LayerSource::Solid { rgb: *rgb },
+        PlanPixels::Adjustment => LayerSource::Adjustment,
     };
     ProgramLayer {
         source,

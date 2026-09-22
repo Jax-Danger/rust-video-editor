@@ -624,6 +624,8 @@ fn lane(
         if crect.width() >= 18.0 {
             let clip_label = if clip.is_title() {
                 format!("T  {}", clip.name)
+            } else if clip.is_adjustment() {
+                format!("A  {}", clip.name)
             } else if let Some(badge) = clip.speed.badge() {
                 format!("{}  {badge}", clip.name)
             } else {
