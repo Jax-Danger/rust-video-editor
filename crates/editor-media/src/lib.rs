@@ -38,8 +38,11 @@ pub use decode::{
     MAX_PREVIEW_DIMENSION,
 };
 pub use export::{
-    caption_font, cues_to_srt, plan_encode, plan_encode_with, EncodeHints, FfmpegScript, WavPiece,
+    caption_font, cues_to_srt, plan_encode, plan_encode_with, plan_still_frame, still_format,
+    EncodeHints, FfmpegScript, StillFormat, StillPlan, WavPiece,
 };
+#[cfg(feature = "ffmpeg")]
+pub use export::{render_still_rgba, write_still_image};
 #[cfg(feature = "ffmpeg")]
 pub use export::{spawn_export, write_timeline_wav, ExportJob, ExportSnapshot};
 pub use frame_cache::{

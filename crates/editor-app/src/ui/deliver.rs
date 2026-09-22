@@ -94,6 +94,26 @@ fn deliver_card(
     );
 
     ui.add_space(16.0);
+    widgets::section_label(ui, "Stills");
+    ui.add_space(8.0);
+    ui.label(
+        RichText::new(
+            "Save the composited program frame as PNG or JPEG. Grade, LUT, titles, transitions, and burned captions match the video export path.",
+        )
+        .size(12.5)
+        .color(THEME.text_dim),
+    );
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if widgets::action_button(ui, "Export Still at Playhead", !running) {
+            app.export_still_at_playhead();
+        }
+        if widgets::action_button(ui, "Export Stills at Markers", !running) {
+            app.export_stills_at_markers();
+        }
+    });
+
+    ui.add_space(16.0);
     widgets::section_label(ui, "Preset");
     ui.add_space(8.0);
     let presets = app.deliver_presets();
