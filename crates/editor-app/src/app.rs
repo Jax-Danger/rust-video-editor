@@ -1,6 +1,7 @@
 //! Application state, commands, and workspace layout.
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use editor_core::{
     add_adjustment_layer, add_title, add_transition, builtin_templates, clip_from_media,
@@ -8,8 +9,8 @@ use editor_core::{
     nested_sequence_id, plan_export, replace_captions, resolve_source_marks, set_angle_sync,
     switch_angle, Bin, BinId, BusState, CaptionTranscriber, ClipId, CueId, Direction, EditError,
     ExportRange, Frame, LabelColor, MarkerId, MediaAsset, MediaId, MulticamId, Project,
-    SequenceId, Session, Timebase, Track, TrackFlag, TrackId, TrackKind, TransitionKind,
-    TrimEdge,
+    RecoveryOffer, SequenceId, Session, Timebase, Track, TrackFlag, TrackId, TrackKind,
+    TransitionKind, TrimEdge,
 };
 use editor_media::{duration_frames, probe, resolve_media_path};
 use egui::{Event, Key, Modifiers, RichText, ViewportCommand};
@@ -126,6 +127,29 @@ pub enum Modal {
     SaveAs { path: String, error: String },
     Import { path: String, note: String },
     Shortcuts,
+    Recover { offer: RecoveryOffer, error: String },
+}
+
+struct RecoveryClock {
+    tracked_generation: u64,
+    written_generation: u64,
+    last_edit: Option<Instant>,
+    unwritten_since: Option<Instant>,
+    last_path: Option<std::path::PathBuf>,
+    retry_not_before: Option<Instant>,
+}
+
+impl Default for RecoveryClock {
+    fn default() -> Self {
+        Self {
+            tracked_generation: 0,
+            written_generation: 0,
+            last_edit: None,
+            unwritten_since: None,
+            last_path: None,
+            retry_not_before: None,
+        }
+    }
 }
 
 struct CaptionRequest {
@@ -268,6 +292,7 @@ pub struct MeridianApp {
     pub selected_marker: Option<MarkerId>,
     /// Inline rename buffer for a media-pool bin.
     pub renaming_bin: Option<(BinId, String)>,
+    recovery: RecoveryClock,
 }
 
 impl MeridianApp {
@@ -329,8 +354,15 @@ impl MeridianApp {
             selected_bin: None,
             selected_marker: None,
             renaming_bin: None,
+            recovery: RecoveryClock::default(),
         };
         app.reset_track_targets();
+        if let Some(offer) = editor_core::launch_recovery_offer() {
+            app.modal = Modal::Recover {
+                offer,
+                error: String::new(),
+            };
+        }
         app.sync_title(&cc.egui_ctx);
         app
     }
@@ -2060,6 +2092,7 @@ impl MeridianApp {
     }
 
     pub fn open_dense(&mut self) {
+        self.flush_recovery();
         self.session.replace_project(editor_core::dense_project());
         self.path = None;
         self.playhead = 0;
@@ -2071,6 +2104,7 @@ impl MeridianApp {
         self.halt_transport();
         self.workspace = Workspace::Edit;
         self.reset_track_targets();
+        self.note_clean_session();
         self.status = "Opened a 400-clip sequence. Fit shows minutes; zoom in to frames.".into();
     }
 
@@ -2208,12 +2242,203 @@ impl MeridianApp {
         }
     }
 
+    fn note_clean_session(&mut self) {
+        let generation = self.session.generation();
+        self.recovery.tracked_generation = generation;
+        self.recovery.written_generation = generation;
+        self.recovery.last_edit = None;
+        self.recovery.unwritten_since = None;
+        self.recovery.last_path = None;
+        self.recovery.retry_not_before = None;
+    }
+
+    fn tick_recovery(&mut self, ctx: &egui::Context) {
+        if matches!(self.modal, Modal::Recover { .. }) || !self.session.is_dirty() {
+            if !self.session.is_dirty() {
+                let generation = self.session.generation();
+                self.recovery.tracked_generation = generation;
+                self.recovery.unwritten_since = None;
+                self.recovery.last_edit = None;
+            }
+            return;
+        }
+        let now = Instant::now();
+        if let Some(not_before) = self.recovery.retry_not_before {
+            if now < not_before {
+                ctx.request_repaint_after(not_before.saturating_duration_since(now));
+                return;
+            }
+        }
+        let generation = self.session.generation();
+        if self.recovery.tracked_generation != generation {
+            self.recovery.tracked_generation = generation;
+            self.recovery.last_edit = Some(now);
+            if generation != self.recovery.written_generation
+                && self.recovery.unwritten_since.is_none()
+            {
+                self.recovery.unwritten_since = Some(now);
+            }
+        }
+        if generation == self.recovery.written_generation {
+            self.recovery.unwritten_since = None;
+            return;
+        }
+        let since_edit = self
+            .recovery
+            .last_edit
+            .map(|then| now.saturating_duration_since(then))
+            .unwrap_or(Duration::ZERO);
+        let unwritten_for = self
+            .recovery
+            .unwritten_since
+            .map(|then| now.saturating_duration_since(then))
+            .unwrap_or(Duration::ZERO);
+        if editor_core::autosave_due(
+            true,
+            generation,
+            self.recovery.written_generation,
+            since_edit,
+            unwritten_for,
+            editor_core::AUTOSAVE_IDLE,
+            editor_core::AUTOSAVE_INTERVAL,
+        ) {
+            self.write_recovery_now();
+        } else {
+            ctx.request_repaint_after(editor_core::autosave_delay(
+                since_edit,
+                unwritten_for,
+                editor_core::AUTOSAVE_IDLE,
+                editor_core::AUTOSAVE_INTERVAL,
+            ));
+        }
+    }
+
+    fn flush_recovery(&mut self) {
+        if matches!(self.modal, Modal::Recover { .. }) {
+            return;
+        }
+        if !self.session.is_dirty() || self.session.generation() == self.recovery.written_generation
+        {
+            return;
+        }
+        self.write_recovery_now();
+    }
+
+    fn write_recovery_now(&mut self) {
+        let project_path = self.path.clone();
+        let project_path = project_path.as_deref().map(std::path::Path::new);
+        match editor_core::publish_recovery(project_path, self.session.project()) {
+            Ok(path) => {
+                self.recovery.written_generation = self.session.generation();
+                self.recovery.unwritten_since = None;
+                self.recovery.last_path = Some(path);
+                self.recovery.retry_not_before = None;
+            }
+            Err(err) => {
+                self.status = format!("Recovery autosave failed: {err}");
+                self.recovery.retry_not_before = Some(Instant::now() + Duration::from_secs(5));
+            }
+        }
+    }
+
+    fn forget_session_recovery(&mut self) -> Option<String> {
+        let index = editor_core::recovery_index_path();
+        let mut paths = Vec::new();
+        if let Some(path) = self.recovery.last_path.clone() {
+            paths.push(path);
+        }
+        if let Some(path) = self.path.as_deref() {
+            paths.push(editor_core::recovery_path_for_project(
+                std::path::Path::new(path),
+            ));
+        }
+        paths.sort();
+        paths.dedup();
+        let mut error = None;
+        for path in paths {
+            if let Err(err) = editor_core::forget_recovery(&path, &index) {
+                error = Some(err.to_string());
+            }
+        }
+        self.note_clean_session();
+        error
+    }
+
+    fn apply_recovery(&mut self, offer: &RecoveryOffer) -> Result<(), String> {
+        let doc =
+            editor_core::load_recovery(&offer.recovery_path).map_err(|err| err.to_string())?;
+        let project_path = doc.project_path.clone().or_else(|| {
+            offer
+                .project_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+        });
+        if let Some(path) = project_path.as_deref() {
+            if editor_core::is_sidecar_recovery_path(std::path::Path::new(path)) {
+                return Err("Recovery record points at a sidecar, not a project file.".into());
+            }
+        }
+        self.session.restore_unsaved(doc.project);
+        self.path = project_path;
+        self.playhead = 0;
+        self.selected.clear();
+        self.selected_media = None;
+        self.pool_selection.clear();
+        self.halt_transport();
+        self.reset_track_targets();
+        let generation = self.session.generation();
+        self.recovery.tracked_generation = generation;
+        self.recovery.written_generation = generation;
+        self.recovery.last_edit = None;
+        self.recovery.unwritten_since = None;
+        self.recovery.last_path = Some(offer.recovery_path.clone());
+        self.recovery.retry_not_before = None;
+        self.modal = Modal::None;
+        self.status = match &self.path {
+            Some(path) => format!("Restored unsaved edits. {path} was not modified."),
+            None => "Restored unsaved edits. The project has not been saved yet.".into(),
+        };
+        Ok(())
+    }
+
+    fn discard_recovery_offer(&mut self, offer: RecoveryOffer) {
+        if let Err(err) =
+            editor_core::forget_recovery(&offer.recovery_path, &editor_core::recovery_index_path())
+        {
+            self.modal = Modal::Recover {
+                offer,
+                error: err.to_string(),
+            };
+            return;
+        }
+        let project = offer.project_path;
+        self.modal = Modal::None;
+        self.note_clean_session();
+        if let Some(path) = project {
+            if path.is_file() {
+                self.open_path(&path.display().to_string());
+                return;
+            }
+            self.status = format!("Discarded recovery. {} is not on disk.", path.display());
+            return;
+        }
+        self.status = "Discarded recovery.".into();
+    }
+
     pub fn save_to(&mut self, path: &str) {
+        if editor_core::is_sidecar_recovery_path(std::path::Path::new(path)) {
+            self.status = "Choose a project file. Recovery files are not the saved project.".into();
+            return;
+        }
         match self.session.project().save_file(std::path::Path::new(path)) {
             Ok(()) => {
                 self.session.mark_clean();
                 self.path = Some(path.to_string());
-                self.status = format!("Saved {path}.");
+                let cleanup = self.forget_session_recovery();
+                self.status = match cleanup {
+                    None => format!("Saved {path}."),
+                    Some(err) => format!("Saved {path}. Recovery cleanup failed: {err}"),
+                };
                 self.modal = Modal::None;
             }
             Err(err) => self.status = err.to_string(),
@@ -2221,8 +2446,14 @@ impl MeridianApp {
     }
 
     pub fn open_path(&mut self, path: &str) {
-        match Project::load_file(std::path::Path::new(path)) {
+        let file = std::path::Path::new(path);
+        if editor_core::is_sidecar_recovery_path(file) {
+            self.status = "That file is a recovery sidecar. Open the project file, or use the recovery prompt.".into();
+            return;
+        }
+        match Project::load_file(file) {
             Ok(mut project) => {
+                self.flush_recovery();
                 refresh_offline(&mut project);
                 self.session.replace_project(project);
                 self.path = Some(path.to_string());
@@ -2232,8 +2463,15 @@ impl MeridianApp {
                 self.pool_selection.clear();
                 self.halt_transport();
                 self.reset_track_targets();
+                self.note_clean_session();
                 self.status = format!("Opened {path}.");
                 self.modal = Modal::None;
+                if let Some(offer) = editor_core::offer_for_project_file(file) {
+                    self.modal = Modal::Recover {
+                        offer,
+                        error: String::new(),
+                    };
+                }
             }
             Err(err) => self.status = err.to_string(),
         }
@@ -2251,6 +2489,7 @@ impl MeridianApp {
         };
         match editor_core::project_from_template(template, &name) {
             Ok(project) => {
+                self.flush_recovery();
                 self.session.replace_project(project);
                 self.path = None;
                 self.playhead = 0;
@@ -2260,6 +2499,7 @@ impl MeridianApp {
                 self.halt_transport();
                 self.workspace = Workspace::Edit;
                 self.reset_track_targets();
+                self.note_clean_session();
                 self.status = format!("New project from {}.", template.name);
                 self.modal = Modal::None;
             }
@@ -2268,6 +2508,7 @@ impl MeridianApp {
     }
 
     pub fn open_example(&mut self) {
+        self.flush_recovery();
         self.session.replace_project(editor_core::demo_project());
         self.path = None;
         self.playhead = 24;
@@ -2277,6 +2518,7 @@ impl MeridianApp {
         self.halt_transport();
         self.workspace = Workspace::Edit;
         self.reset_track_targets();
+        self.note_clean_session();
         self.status = "Opened example project — Northline — Opening.".into();
     }
 
@@ -2682,6 +2924,10 @@ fn consume_key(ctx: &egui::Context, modifiers: Modifiers, key: Key, allow_repeat
 
 impl eframe::App for MeridianApp {
     fn update(&mut self, ctx: &egui::Context, host: &mut eframe::Frame) {
+        if matches!(self.modal, Modal::Recover { .. }) {
+            self.modals(ctx);
+            return;
+        }
         self.preview_scrub = false;
         self.pump_jobs(ctx);
         self.tick_playback(ctx);
@@ -2770,6 +3016,11 @@ impl eframe::App for MeridianApp {
         if ctx.input(|input| input.pointer.any_released()) {
             self.dragging_media = None;
         }
+        self.tick_recovery(ctx);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.flush_recovery();
     }
 }
 
@@ -3222,6 +3473,73 @@ impl MeridianApp {
             Modal::SaveAs { path, error } => self.modal_path(ctx, false, path, error),
             Modal::Import { path, note } => self.modal_import(ctx, path, note),
             Modal::Shortcuts => self.modal_shortcuts(ctx),
+            Modal::Recover { offer, error } => self.modal_recover(ctx, offer, error),
+        }
+    }
+
+    fn modal_recover(&mut self, ctx: &egui::Context, offer: RecoveryOffer, error: String) {
+        let mut action = None;
+        let project_label = offer
+            .project_path
+            .as_ref()
+            .map(|path| path.display().to_string());
+        let recovery_label = offer.recovery_path.display().to_string();
+        egui::Window::new("Recover unsaved edits")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(theme::dialog_frame())
+            .show(ctx, |ui| {
+                ui.set_min_width(480.0);
+                ui.label("A recovery file is newer than the last saved project. Restore loads those edits into the editor. The project file is not changed until you Save.");
+                ui.add_space(8.0);
+                match &project_label {
+                    Some(path) => {
+                        ui.label(
+                            RichText::new(format!("Project  {path}"))
+                                .size(11.0)
+                                .color(theme::THEME.text_dim),
+                        );
+                    }
+                    None => {
+                        ui.label(
+                            RichText::new("This edit was never saved to a project file.")
+                                .size(11.0)
+                                .color(theme::THEME.text_dim),
+                        );
+                    }
+                }
+                ui.label(
+                    RichText::new(format!("Recovery  {recovery_label}"))
+                        .size(11.0)
+                        .color(theme::THEME.text_mute),
+                );
+                if !error.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(&error).color(theme::DANGER));
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui::widgets::action_button(ui, "Restore", true) {
+                        action = Some(true);
+                    }
+                    if ui::widgets::action_button(ui, "Discard", false) {
+                        action = Some(false);
+                    }
+                });
+            });
+        match action {
+            Some(true) => {
+                if let Err(err) = self.apply_recovery(&offer) {
+                    self.modal = Modal::Recover { offer, error: err };
+                }
+            }
+            Some(false) => self.discard_recovery_offer(offer),
+            None => {
+                if matches!(self.modal, Modal::Recover { .. }) {
+                    self.modal = Modal::Recover { offer, error };
+                }
+            }
         }
     }
 
