@@ -26,3 +26,5 @@ default = []
 ffmpeg = ["editor-media/ffmpeg", "dep:rodio"]
 # Local Whisper captions. Implies ffmpeg so audio can be extracted for the model.
 whisper = ["ffmpeg", "editor-media/whisper"]
+# Program monitor uploads the CPU composite with wgpu instead of glow.
+wgpu = ["eframe/wgpu"]

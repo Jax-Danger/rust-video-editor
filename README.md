@@ -230,6 +230,21 @@ Northline opens with **NORTHLINE** on V3 for the first five seconds.
 
 The **source monitor** decodes the selected pool clip through the same ffmpeg preview path (proxy when preferred). It does not composite grades, titles, or captions — those stay on the program side. The **program monitor** draws mute/solo, grade, transform, dissolve, wipe, push, and caption burn-in as proxy cards when decode is off. Title generators are the exception: proxy and decode both stamp the shared bitmap. With `--features ffmpeg` it decodes every visible video layer under the playhead and runs the same CPU compositor Deliver uses, titles included. Play, keyboard stepping, and mouse scrubbing follow the focused monitor's timebase. If ffmpeg is missing or every layer is offline, the proxy stays up and the viewer says why. Active caption cues are burned into the decoded program picture; on the proxy they are drawn with the UI font in the same bottom safe area.
 
+### Program monitor GPU upload
+
+The composited program frame stays a CPU RGBA buffer. Deliver encodes that same `compose_layers` output and does not read the display texture, so export remains the source of truth. Scopes read the CPU buffer too.
+
+When a composite is ready, the program monitor uploads it to **one** GPU texture and samples that while you scrub or play. A repeated frame is not uploaded again. A new frame at the same canvas size replaces the texels in place. The header badge reads **GPU** while that path is active.
+
+```
+cargo run -p editor-app --features ffmpeg
+cargo run -p editor-app --features "ffmpeg,wgpu"
+```
+
+The first command uses eframe's default glow renderer and uploads with `texSubImage2D`. The second selects the wgpu renderer and uploads with `queue.write_texture` (`Rgba8UnormSrgb`, rows padded to 256 bytes when the width requires it).
+
+**CPU fallback.** The badge reads **CPU** when neither GPU context is current: a headless test, a glow context that did not come up, or a `wgpu` build with no adapter. That path still reuses a single egui texture instead of allocating one per frame. It goes through a `ColorImage` copy, which is the slower display path. Proxy cards (decode off, or every layer offline) do not upload.
+
 ### What matches, and what is still approximate
 
 Preview (`--features ffmpeg`) and Deliver call one compositor in `editor-media`. Higher video tracks paint later, so they sit on top. Muted video is skipped; solo hides the other video tracks.
@@ -249,6 +264,7 @@ Preview (`--features ffmpeg`) and Deliver call one compositor in `editor-media`.
 | Captions | Placement yes, glyphs mostly | Both burn the same 8×8 bitmap into the picture (about 32px at 1080p, 48px bottom margin). The proxy uses the UI font instead. Soft `mov_text` subtitles are still written. H.264 then quantizes the burn-in |
 | Titles | Yes | Generator clips on a video track. Text, size, colour, alignment, position, and plate are rasterized in `compose_layers` for the monitor and for Deliver. The proxy draws that same bitmap in track order |
 | Stacking | Yes | Simple alpha over only. No blend modes, no motion blur, no track mattes |
+| Program display | Preview only | The monitor uploads the CPU composite to one GPU texture (glow by default, wgpu with `--features wgpu`). **CPU** in the program header means that upload fell back to a reused egui texture. Deliver ignores the display texture |
 
 A source is stretched to fill the clip's quad. It is not letterboxed when its aspect differs from the sequence. The monitor fits the sequence inside 960×540 before compositing; export composites at sequence size, with a decoded edge capped at 1920px. On the Northline picture-in-picture frame, a 16×16 block average of the H.264 export sits within about 1.3 levels of the CPU composite. That is the same picture through a codec, not a bit-identical file. Keyframes are evaluated on every frame in both paths.
 

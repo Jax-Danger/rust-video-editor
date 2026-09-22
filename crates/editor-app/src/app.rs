@@ -16,6 +16,7 @@ use egui::{Event, Key, Modifiers, RichText, ViewportCommand};
 
 use crate::audio::{collect_bus_pieces, collect_pieces, topology_of, AudioEngine};
 use crate::dialogs;
+use crate::gpu_display::ProgramDisplay;
 use crate::preview::PreviewEngine;
 use crate::theme;
 use crate::ui::{self, format_tc};
@@ -251,6 +252,8 @@ pub struct MeridianApp {
     pub source_play_accum: f32,
     pub audio: AudioEngine,
     pub picture_cache: Option<crate::composite::PictureCache>,
+    /// GPU (or CPU fallback) texture for the composited program monitor.
+    pub program_display: ProgramDisplay,
     pub proxy_job: Option<crate::proxy_job::ProxyJob>,
     pub proxy_note: String,
     #[cfg(feature = "ffmpeg")]
@@ -314,6 +317,7 @@ impl MeridianApp {
             source_play_accum: 0.0,
             audio: AudioEngine::new(),
             picture_cache: None,
+            program_display: ProgramDisplay::default(),
             proxy_job: None,
             proxy_note: String::new(),
             #[cfg(feature = "ffmpeg")]
@@ -2675,7 +2679,7 @@ fn consume_key(ctx: &egui::Context, modifiers: Modifiers, key: Key, allow_repeat
 }
 
 impl eframe::App for MeridianApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, host: &mut eframe::Frame) {
         self.preview_scrub = false;
         self.pump_jobs(ctx);
         self.tick_playback(ctx);
@@ -2727,7 +2731,7 @@ impl eframe::App for MeridianApp {
                     .show(ctx, |ui| ui::inspector_panel(ui, self));
                 egui::CentralPanel::default()
                     .frame(theme::chrome_frame().fill(theme::THEME.stage))
-                    .show(ctx, |ui| ui::dual_monitor_panel(ui, self));
+                    .show(ctx, |ui| ui::dual_monitor_panel(ui, self, host));
             }
             Workspace::Colour => {
                 egui::SidePanel::left("colour_scopes")
@@ -2746,7 +2750,7 @@ impl eframe::App for MeridianApp {
                     .show(ctx, |ui| ui::inspector_panel(ui, self));
                 egui::CentralPanel::default()
                     .frame(theme::chrome_frame().fill(theme::THEME.stage))
-                    .show(ctx, |ui| ui::viewer_panel(ui, self));
+                    .show(ctx, |ui| ui::viewer_panel(ui, self, host));
             }
             Workspace::Audio => {
                 egui::CentralPanel::default()

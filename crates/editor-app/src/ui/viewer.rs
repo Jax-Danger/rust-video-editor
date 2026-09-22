@@ -9,6 +9,10 @@
 //! The Edit workspace shows a source monitor beside the program monitor. The
 //! source plays the selected pool clip with its own playhead and in/out marks;
 //! Overwrite / Insert place that marked range at the program playhead.
+//!
+//! The program picture is the CPU composite. When that buffer is ready it is
+//! uploaded to one GPU texture for display (see `gpu_display`). Export does
+//! not read the texture.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -26,6 +30,7 @@ use editor_media::{fit_preview_size, preview_file, PreviewBackend, PreviewSource
 use egui::{Align, Align2, Color32, FontId, Layout, Painter, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 
 use crate::app::{MeridianApp, MonitorFocus, ScrubSource};
+use crate::gpu_display::UploadedFrame;
 use crate::preview::{FrameKey, FrameView, PreviewImage, PreviewQuery};
 use crate::theme::THEME;
 use crate::ui::format_tc;
@@ -42,7 +47,7 @@ const WELL_TC_H: f32 = 30.0;
 const MONITOR_GAP: f32 = 6.0;
 
 /// Side-by-side source and program monitors for the Edit workspace.
-pub fn dual_monitor_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
+pub fn dual_monitor_panel(ui: &mut egui::Ui, app: &mut MeridianApp, host: &mut eframe::Frame) {
     let total = ui.available_width();
     let height = ui.available_height();
     let half = ((total - MONITOR_GAP) * 0.5).max(160.0);
@@ -61,7 +66,7 @@ pub fn dual_monitor_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
             Layout::top_down(Align::Min),
             |ui| {
                 ui.set_min_height(height);
-                viewer_panel(ui, app);
+                viewer_panel(ui, app, host);
             },
         );
     });
@@ -500,7 +505,7 @@ fn source_scrubber(
     }
 }
 
-pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
+pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp, host: &mut eframe::Frame) {
     let Some(sequence) = app.session.project().active().cloned() else {
         ui.label("No sequence.");
         return;
@@ -533,7 +538,7 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
     let backend = app.preview.backend().clone();
 
     let mut banner: Option<String> = None;
-    let mut picture: Option<PreviewImage> = None;
+    let mut have_picture = false;
     let mut paint_proxy = true;
     match &backend {
         PreviewBackend::Disabled => {
@@ -595,33 +600,13 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
                             Err(message) => banner = Some(message),
                         }
                     }
-                    if let Some(cache) = &app.picture_cache {
-                        picture = Some(PreviewImage {
-                            key: FrameKey {
-                                path: format!("composite-{signature}"),
-                                source_frame: playhead,
-                                width: cache.width,
-                                height: cache.height,
-                            },
-                            width: cache.width,
-                            height: cache.height,
-                            rgba: std::sync::Arc::from(cache.rgba.clone().into_boxed_slice()),
-                        });
+                    if app.picture_cache.is_some() {
+                        have_picture = true;
                         paint_proxy = false;
                     }
                 } else if banner.is_none() && waiting {
-                    if let Some(cache) = &app.picture_cache {
-                        picture = Some(PreviewImage {
-                            key: FrameKey {
-                                path: format!("composite-{}", cache.signature),
-                                source_frame: playhead,
-                                width: cache.width,
-                                height: cache.height,
-                            },
-                            width: cache.width,
-                            height: cache.height,
-                            rgba: std::sync::Arc::from(cache.rgba.clone().into_boxed_slice()),
-                        });
+                    if app.picture_cache.is_some() {
+                        have_picture = true;
                         paint_proxy = false;
                     } else {
                         banner = Some("Decoding preview…".into());
@@ -634,7 +619,12 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
             }
         }
     }
-    let mode = match (&backend, picture.is_some(), plan.problem.is_some()) {
+    let uploaded = if paint_proxy {
+        None
+    } else {
+        upload_program(ui.ctx(), host, app)
+    };
+    let mode = match (&backend, have_picture, plan.problem.is_some()) {
         (PreviewBackend::Disabled | PreviewBackend::Unavailable(_), _, _) => "Proxy",
         (_, _, true) => "Offline",
         (PreviewBackend::Cli, true, _) => "Preview",
@@ -666,6 +656,11 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
         );
         ui.add_space(6.0);
         widgets::readout(ui, mode, 78.0, mode == "Preview");
+        if uploaded.is_some() {
+            ui.add_space(4.0);
+            let badge = app.program_display.badge();
+            widgets::readout(ui, badge, 48.0, badge == "GPU");
+        }
         ui.add_space(4.0);
         let resolution = if plan.used_proxy {
             "Proxy"
@@ -681,12 +676,8 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
         audio_meters(ui, peaks, audio_badge, &audio_status);
     });
 
-    let texture = picture.as_ref().map(|image| {
-        let id = app.preview.texture(ui.ctx(), image);
-        (id, image.width, image.height)
-    });
     let opacity = 1.0;
-    let chip = (!plan.chip.is_empty() && picture.is_some()).then(|| plan.chip.clone());
+    let chip = (!plan.chip.is_empty() && have_picture).then(|| plan.chip.clone());
 
     let bank_h = if bank.is_some() { 44.0 } else { 0.0 };
     let monitor_h = (ui.available_height() - SCRUB_H - bank_h).max(48.0);
@@ -794,8 +785,15 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
                 }
             }
         }
-    } else if let Some((texture, width, height)) = texture {
-        paint_decoded(&painter, frame, texture, width, height, opacity);
+    } else if let Some(image) = uploaded {
+        paint_decoded(
+            &painter,
+            frame,
+            image.texture,
+            image.width,
+            image.height,
+            opacity,
+        );
     }
 
     if paint_proxy {
@@ -1555,6 +1553,26 @@ fn title_signature(layer: &PlanLayer) -> u64 {
     bits(layer.place.scale_x).hash(&mut hasher);
     bits(layer.place.scale_y).hash(&mut hasher);
     hasher.finish()
+}
+
+fn upload_program(
+    ctx: &egui::Context,
+    host: &mut eframe::Frame,
+    app: &mut MeridianApp,
+) -> Option<UploadedFrame> {
+    let mut display = std::mem::take(&mut app.program_display);
+    let uploaded = app.picture_cache.as_ref().and_then(|cache| {
+        display.upload(
+            ctx,
+            host,
+            cache.signature,
+            cache.width,
+            cache.height,
+            &cache.rgba,
+        )
+    });
+    app.program_display = display;
+    uploaded
 }
 
 fn paint_decoded(
