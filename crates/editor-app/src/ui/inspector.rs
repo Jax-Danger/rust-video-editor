@@ -2,9 +2,10 @@ use editor_core::{
     blur, clip_relative, color_grade, crop, set_clip_gain_at, set_clip_speed, set_clip_title,
     set_filter_at, set_grade_at, set_transform_at, sharpen, source_frame_at, toggle_filter_key,
     toggle_grade_key, toggle_transform_key, toggle_volume_key, transform, vignette, ClipId,
-    ClipSpeed, FilterParam, GradeParam, TextAlign, Title, TrackKind, TransformParam,
+    ClipSpeed, FilterParam, GradeParam, LabelColor, MarkerId, TextAlign, Title, TrackKind,
+    TransformParam,
 };
-use egui::RichText;
+use egui::{pos2, Align2, Rect, RichText, Sense, TextEdit, Vec2};
 
 use crate::app::MeridianApp;
 use crate::theme::THEME;
@@ -766,22 +767,60 @@ fn clip_snapshot(app: &MeridianApp, id: ClipId) -> Option<ClipSnap> {
     })
 }
 
-fn sequence_summary(ui: &mut egui::Ui, app: &MeridianApp) {
-    let Some(sequence) = app.session.project().active() else {
+fn sequence_summary(ui: &mut egui::Ui, app: &mut MeridianApp) {
+    let markers: Vec<_> = app
+        .session
+        .project()
+        .active()
+        .map(|sequence| {
+            sequence
+                .markers
+                .iter()
+                .map(|marker| {
+                    (
+                        marker.id,
+                        marker.name.clone(),
+                        marker.frame.0,
+                        marker.color,
+                        marker.comment.clone(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let sequence_name = app
+        .session
+        .project()
+        .active()
+        .map(|sequence| sequence.name.clone())
+        .unwrap_or_default();
+    let sequence_meta = app
+        .session
+        .project()
+        .active()
+        .map(|sequence| {
+            (
+                sequence.width,
+                sequence.height,
+                sequence.timebase,
+            )
+        });
+    if sequence_meta.is_none() {
         widgets::empty_note(ui, "No sequence is open.");
         return;
-    };
+    }
+    let (width, height, timebase) = sequence_meta.unwrap();
     ui.add_space(16.0);
     ui.horizontal(|ui| {
         ui.add_space(12.0);
         ui.vertical(|ui| {
-            ui.label(RichText::new(&sequence.name).size(15.0).strong());
+            ui.label(RichText::new(&sequence_name).size(15.0).strong());
             ui.label(
                 RichText::new(format!(
                     "{}×{}    {:.3} fps",
-                    sequence.width,
-                    sequence.height,
-                    sequence.timebase.fps_f64()
+                    width,
+                    height,
+                    timebase.fps_f64()
                 ))
                 .monospace()
                 .size(12.0)
@@ -795,6 +834,184 @@ fn sequence_summary(ui: &mut egui::Ui, app: &MeridianApp) {
             );
         });
     });
+    markers_panel(ui, app, &markers, timebase);
+}
+
+fn markers_panel(
+    ui: &mut egui::Ui,
+    app: &mut MeridianApp,
+    markers: &[(MarkerId, String, i64, LabelColor, String)],
+    timebase: editor_core::Timebase,
+) {
+    ui.add_space(12.0);
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        ui.label(RichText::new("Markers").size(13.0).strong());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if widgets::ghost_button(ui, "Add") {
+                app.add_marker();
+            }
+        });
+    });
+    if markers.is_empty() {
+        widgets::empty_note(ui, "Press M to add a marker at the playhead. [ and ] jump between markers.");
+        return;
+    }
+    egui::ScrollArea::vertical()
+        .id_salt("marker_list")
+        .max_height(220.0)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for (marker_id, name, frame, color, _comment) in markers {
+                marker_row(ui, app, *marker_id, name, *frame, *color, timebase);
+            }
+        });
+    if let Some(marker_id) = app.selected_marker {
+        marker_editor(ui, app, marker_id, timebase);
+    }
+}
+
+fn marker_row(
+    ui: &mut egui::Ui,
+    app: &mut MeridianApp,
+    marker_id: MarkerId,
+    name: &str,
+    frame: i64,
+    color: LabelColor,
+    timebase: editor_core::Timebase,
+) {
+    let selected = app.selected_marker == Some(marker_id);
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::click());
+    let painter = ui.painter();
+    if selected {
+        painter.rect_filled(rect, 0.0, THEME.accent_dim);
+    } else if response.hovered() {
+        painter.rect_filled(rect, 0.0, THEME.header);
+    }
+    let swatch = Rect::from_min_size(
+        pos2(rect.left() + 12.0, rect.center().y - 5.0),
+        egui::vec2(10.0, 10.0),
+    );
+    painter.rect_filled(swatch, 2.0, crate::theme::label_fill(color, TrackKind::Video));
+    painter.text(
+        pos2(rect.left() + 28.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        name,
+        THEME.font(12.0),
+        THEME.text,
+    );
+    painter.text(
+        pos2(rect.right() - 12.0, rect.center().y),
+        Align2::RIGHT_CENTER,
+        format_tc(frame, timebase),
+        THEME.font(11.0),
+        THEME.text_mute,
+    );
+    if response.clicked() {
+        app.jump_to_marker(marker_id);
+    }
+    response.context_menu(|ui| {
+        if ui.button("Delete").clicked() {
+            app.selected_marker = Some(marker_id);
+            app.delete_selected_marker();
+            ui.close_menu();
+        }
+    });
+}
+
+fn marker_editor(
+    ui: &mut egui::Ui,
+    app: &mut MeridianApp,
+    marker_id: MarkerId,
+    timebase: editor_core::Timebase,
+) {
+    let marker = app
+        .session
+        .project()
+        .active()
+        .and_then(|sequence| sequence.markers.iter().find(|marker| marker.id == marker_id))
+        .cloned();
+    let Some(marker) = marker else {
+        return;
+    };
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        ui.label(RichText::new("Selected marker").size(12.0).color(THEME.text_dim));
+    });
+    let mut name = marker.name.clone();
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        if ui
+            .add(TextEdit::singleline(&mut name).desired_width(ui.available_width() - 24.0))
+            .lost_focus()
+        {
+            app.update_marker_name(marker_id, name);
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new(format_tc(marker.frame.0, timebase))
+                .monospace()
+                .size(11.0)
+                .color(THEME.text_mute),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        for color in marker_colors() {
+            let fill = crate::theme::label_fill(color, TrackKind::Video);
+            let selected = marker.color == color;
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(18.0, 18.0), Sense::click());
+            ui.painter().rect_filled(rect.shrink(2.0), 3.0, fill);
+            if selected {
+                ui.painter().rect_stroke(
+                    rect,
+                    3.0,
+                    egui::Stroke::new(1.5_f32, THEME.accent_text),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            if response.clicked() {
+                app.update_marker_color(marker_id, color);
+            }
+        }
+    });
+    let mut comment = marker.comment.clone();
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        if ui
+            .add(
+                TextEdit::multiline(&mut comment)
+                    .desired_width(ui.available_width() - 24.0)
+                    .desired_rows(2),
+            )
+            .lost_focus()
+        {
+            app.update_marker_comment(marker_id, comment);
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        if widgets::ghost_button(ui, "Delete Marker") {
+            app.delete_selected_marker();
+        }
+    });
+}
+
+fn marker_colors() -> [LabelColor; 7] {
+    [
+        LabelColor::Rose,
+        LabelColor::Amber,
+        LabelColor::Green,
+        LabelColor::Teal,
+        LabelColor::Blue,
+        LabelColor::Violet,
+        LabelColor::Neutral,
+    ]
 }
 
 fn clip_gain(app: &MeridianApp, clip: ClipId, rel: i64) -> (f32, bool) {

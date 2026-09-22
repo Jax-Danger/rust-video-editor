@@ -5,8 +5,8 @@
 
 use crate::edit::{self, EditError, TrackFlag, TrimEdge};
 use crate::model::{
-    Clip, ClipId, CueId, MediaAsset, MediaId, Project, SequenceId, TrackId, TransitionAlign,
-    TransitionId, TransitionKind,
+    BinId, Clip, ClipId, CueId, LabelColor, MarkerId, MediaAsset, MediaId, Project, SequenceId,
+    TrackId, TransitionAlign, TransitionId, TransitionKind,
 };
 use crate::time::Frame;
 
@@ -352,12 +352,77 @@ impl Session {
     }
 
     pub fn add_marker(&mut self, frame: Frame, name: &str) -> Result<(), EditError> {
+        self.add_marker_with_color(frame, name, LabelColor::Amber)
+            .map(|_| ())
+    }
+
+    pub fn add_marker_with_color(
+        &mut self,
+        frame: Frame,
+        name: &str,
+        color: LabelColor,
+    ) -> Result<MarkerId, EditError> {
         let seq = self.active_id()?;
         let name = name.to_string();
+        let mut marker_id = MarkerId(0);
         self.edit("Add marker", |project| {
-            edit::add_marker(project, seq, frame, name)?;
+            marker_id = edit::add_marker_with_color(project, seq, frame, name, color)?;
             Ok(())
+        })?;
+        Ok(marker_id)
+    }
+
+    pub fn update_marker(
+        &mut self,
+        marker_id: MarkerId,
+        name: Option<String>,
+        color: Option<LabelColor>,
+        comment: Option<String>,
+        frame: Option<Frame>,
+    ) -> Result<(), EditError> {
+        let seq = self.active_id()?;
+        self.edit("Edit marker", |project| {
+            edit::update_marker(project, seq, marker_id, name, color, comment, frame)
         })
+    }
+
+    pub fn delete_marker(&mut self, marker_id: MarkerId) -> Result<(), EditError> {
+        let seq = self.active_id()?;
+        self.edit("Delete marker", |project| {
+            edit::delete_marker(project, seq, marker_id)
+        })
+    }
+
+    pub fn create_bin(
+        &mut self,
+        parent: Option<BinId>,
+        name: &str,
+    ) -> Result<BinId, EditError> {
+        let name = name.to_string();
+        let mut bin_id = BinId(0);
+        self.edit("Create bin", |project| {
+            bin_id = edit::create_bin(project, parent, name)?;
+            Ok(())
+        })?;
+        Ok(bin_id)
+    }
+
+    pub fn rename_bin(&mut self, bin_id: BinId, name: &str) -> Result<(), EditError> {
+        let name = name.to_string();
+        self.edit("Rename bin", |project| edit::rename_bin(project, bin_id, name))
+    }
+
+    pub fn delete_bin(&mut self, bin_id: BinId) -> Result<(), EditError> {
+        self.edit("Delete bin", |project| edit::delete_bin(project, bin_id))
+    }
+
+    pub fn move_media_to_bin(
+        &mut self,
+        media_ids: &[MediaId],
+        bin_id: BinId,
+    ) -> Result<(), EditError> {
+        let ids = media_ids.to_vec();
+        self.edit("Move media", |project| edit::move_media_to_bin(project, &ids, bin_id))
     }
 
     pub fn set_in_point(&mut self, frame: Option<Frame>) -> Result<(), EditError> {

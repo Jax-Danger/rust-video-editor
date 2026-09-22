@@ -54,11 +54,17 @@ The first launch loads an in-memory example: three picture tracks, a lower-third
 
 ## Import
 
-**File → Import** (Ctrl+I) opens a native file picker for video, audio, and stills. Dropping files onto the media pool does the same. The app probes each file (`ffprobe` when built with `--features ffmpeg`), stores the canonical path on the asset, and adds it to the first bin. Project `.json` files are rejected here; use **File → Open**. **File → Import from Path…** is the typed-path fallback.
+**File → Import** (Ctrl+I) opens a native file picker for video, audio, and stills. Dropping files onto the media pool does the same. The app probes each file (`ffprobe` when built with `--features ffmpeg`), stores the canonical path on the asset, and adds it to the selected bin (or the first bin when none is selected). Project `.json` files are rejected here; use **File → Open**. **File → Import from Path…** is the typed-path fallback.
 
 Drag a pool item onto the timeline to overwrite at the drop frame. Hold Shift while dropping to insert and ripple. Double-click opens the clip in the **source monitor**. Overwrite / Insert (or `,` / `.`) place the source in–out range at the program playhead. One import batch is a single undo step. Paths round-trip in the project JSON. An empty pool says to import. A missing file is marked offline in the pool and on the clip, and the tooltip shows the path.
 
 Stills shorter than five seconds are held for five seconds at 24 fps so they can be cut.
+
+## Media pool bins
+
+The pool is organised into bins (folders). Bins can nest: **New Bin** creates a root folder; right-click a bin for **New Sub-bin**, **Rename**, or **Delete Bin**. Click the triangle to expand or collapse a branch. Click a bin to select it — imports land there. Drag pool items onto a bin header (or use **Move to Bin** in the row menu) to move them. Deleting a bin moves its media to the parent bin and reparents child bins. The last bin cannot be deleted.
+
+Bins round-trip in project JSON (`bins` with optional `parent`). The Northline example uses `Master`, `Interviews`, `B-Roll`, and `Audio`.
 
 ## Editing
 
@@ -77,6 +83,14 @@ The toolbar exposes Select, Razor, Ripple, Roll, Slip, and Slide, plus Overwrite
 | Double-click pool item | Open in the source monitor |
 
 Linked selection is on by default so picture and sound move together. Inserting a linked pair is one ripple, not two.
+
+### Markers
+
+Press **M** to add a sequence marker at the program playhead. Markers store a name, colour, frame, and optional comment. They appear on the timeline ruler as coloured triangles (matching the marker colour) and snap like clip edges when snapping is on.
+
+**[** and **]** jump to the previous or next marker. Click a ruler marker to jump and select it. With a marker selected and no clip selection, **Delete** removes it. The inspector lists markers when nothing is selected: click a row to jump, edit the name and colour, or delete from there.
+
+Markers persist under each sequence in project JSON (`markers` with `id`, `frame`, `name`, `color`, and optional `comment`).
 
 The Edit workspace shows a **source monitor** and a **program monitor** side by side. Source plays the selected pool clip with its own playhead and in/out marks. Program stays on the active sequence. Click a monitor (or press `\`) to focus it; Space / JKL / I / O then apply to that monitor. Overwrite and Insert always edit the sequence at the program playhead using the source marks (full file when unmarked).
 
@@ -124,6 +138,7 @@ Shortcuts are global while you are not typing in a text field. The same list is 
 | I / O | Mark in / out on the focused monitor (source or program) |
 | \ | Toggle focus between source and program monitors |
 | M | Add marker |
+| [ / ] | Previous / next marker |
 | V | Select tool |
 | C or Ctrl+K | Razor at the playhead (also selects the razor tool) |
 | / | Razor at the playhead (keeps the active tool) |
@@ -422,7 +437,7 @@ A progress bar follows ffmpeg's `out_time`. **Cancel** sends `SIGTERM`. A failed
 
 ## Tests
 
-`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, deliver presets (apply, custom JSON, last-settings round-trip), the sample project round-trip, imported media paths in JSON, proxy attach and relink, timeline culling on an 800-clip sequence, ruler spacing across an hour, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, proxy argument planning and preview fallback, the disk frame cache, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, pan, fader, burned captions, deliver bitrate hints, audio-only WAV planning, retimed source frames, muted retimed audio), multicam sync offsets, razor angle switches, group-time cuts, JSON round-trip, and raster frames that follow the active angle, nested sequence create/frame mapping/JSON round-trip/export raster, the mix bus (pan law, mute, solo, keyframed gain, 3-band EQ, peak and RMS), clip speed (constant 25–400%, reverse, a linear ramp, JSON round-trip, and duration ripple), adjustment layers (JSON round-trip, track placement, composite stacking), and the shared composite (luma curve, lift/gamma/gain wheels, grade split, dissolve mix, wipe angle, push, dip, slide, blur dissolve, iris, clip filters, anchor, caption burn-in, adjustment grade-below). It does not spawn ffmpeg or whisper.
+`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, deliver presets (apply, custom JSON, last-settings round-trip), the sample project round-trip, imported media paths in JSON, media-pool bins (create, rename, move, delete, JSON round-trip), sequence markers (add, edit, delete, JSON round-trip), proxy attach and relink, timeline culling on an 800-clip sequence, ruler spacing across an hour, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, proxy argument planning and preview fallback, the disk frame cache, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, pan, fader, burned captions, deliver bitrate hints, audio-only WAV planning, retimed source frames, muted retimed audio), multicam sync offsets, razor angle switches, group-time cuts, JSON round-trip, and raster frames that follow the active angle, nested sequence create/frame mapping/JSON round-trip/export raster, the mix bus (pan law, mute, solo, keyframed gain, 3-band EQ, peak and RMS), clip speed (constant 25–400%, reverse, a linear ramp, JSON round-trip, and duration ripple), adjustment layers (JSON round-trip, track placement, composite stacking), and the shared composite (luma curve, lift/gamma/gain wheels, grade split, dissolve mix, wipe angle, push, dip, slide, blur dissolve, iris, clip filters, anchor, caption burn-in, adjustment grade-below). It does not spawn ffmpeg or whisper.
 
 `cargo test -p editor-media --features ffmpeg` also encodes a short H.264/AAC mp4 when `ffmpeg` is on `PATH`. `cargo test -p editor-app --features whisper` builds the local speech-to-text path; the binary and model are resolved at runtime, not at compile time.
 

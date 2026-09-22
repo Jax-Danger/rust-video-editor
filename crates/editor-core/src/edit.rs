@@ -16,9 +16,9 @@ use crate::effects::{
     TransformParam,
 };
 use crate::model::{
-    CaptionCue, Clip, ClipId, ClipSpeed, CueId, Marker, MarkerId, MediaAsset, MediaId, Project,
-    Sequence, SequenceId, Title, TrackId, TrackKind, Transition, TransitionAlign, TransitionId,
-    TransitionKind,
+    Bin, BinId, CaptionCue, Clip, ClipId, ClipSpeed, CueId, LabelColor, Marker, MarkerId,
+    MediaAsset, MediaId, Project, Sequence, SequenceId, Title, TrackId, TrackKind, Transition,
+    TransitionAlign, TransitionId, TransitionKind,
 };
 use crate::time::{convert_frames, mul_div_round, Frame, Timebase};
 
@@ -72,6 +72,12 @@ pub enum EditError {
     NotNestable,
     #[error("nested sequence would create a cycle")]
     NestedCycle,
+    #[error("bin not found")]
+    BinNotFound,
+    #[error("marker not found")]
+    MarkerNotFound,
+    #[error("cannot delete the only bin")]
+    LastBin,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1429,6 +1435,16 @@ pub fn add_marker(
     frame: Frame,
     name: impl Into<String>,
 ) -> Result<MarkerId, EditError> {
+    add_marker_with_color(project, sequence_id, frame, name, LabelColor::Amber)
+}
+
+pub fn add_marker_with_color(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    frame: Frame,
+    name: impl Into<String>,
+    color: LabelColor,
+) -> Result<MarkerId, EditError> {
     let mut id = MarkerId(0);
     let name = name.into();
     map_sequence(project, sequence_id, |sequence, alloc| {
@@ -1439,13 +1455,149 @@ pub fn add_marker(
             frame,
             duration: 0,
             name,
-            color: crate::model::LabelColor::Amber,
+            color,
             comment: String::new(),
         });
         sequence.markers.sort_by_key(|m| m.frame.0);
         Ok(())
     })?;
     Ok(id)
+}
+
+pub fn update_marker(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    marker_id: MarkerId,
+    name: Option<String>,
+    color: Option<LabelColor>,
+    comment: Option<String>,
+    frame: Option<Frame>,
+) -> Result<(), EditError> {
+    map_sequence(project, sequence_id, |sequence, _alloc| {
+        let marker = sequence
+            .markers
+            .iter_mut()
+            .find(|marker| marker.id == marker_id)
+            .ok_or(EditError::MarkerNotFound)?;
+        if let Some(name) = name {
+            marker.name = name;
+        }
+        if let Some(color) = color {
+            marker.color = color;
+        }
+        if let Some(comment) = comment {
+            marker.comment = comment;
+        }
+        if let Some(frame) = frame {
+            marker.frame = frame;
+        }
+        sequence.markers.sort_by_key(|marker| marker.frame.0);
+        Ok(())
+    })
+}
+
+pub fn delete_marker(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    marker_id: MarkerId,
+) -> Result<(), EditError> {
+    map_sequence(project, sequence_id, |sequence, _alloc| {
+        let index = sequence
+            .markers
+            .iter()
+            .position(|marker| marker.id == marker_id)
+            .ok_or(EditError::MarkerNotFound)?;
+        sequence.markers.remove(index);
+        Ok(())
+    })
+}
+
+pub fn create_bin(
+    project: &mut Project,
+    parent: Option<BinId>,
+    name: impl Into<String>,
+) -> Result<BinId, EditError> {
+    if let Some(parent_id) = parent {
+        if !project.bins.iter().any(|bin| bin.id == parent_id) {
+            return Err(EditError::BinNotFound);
+        }
+    }
+    let id = BinId(project.alloc());
+    project.bins.push(Bin {
+        id,
+        name: name.into(),
+        parent,
+    });
+    Ok(id)
+}
+
+pub fn rename_bin(
+    project: &mut Project,
+    bin_id: BinId,
+    name: impl Into<String>,
+) -> Result<(), EditError> {
+    let bin = project
+        .bins
+        .iter_mut()
+        .find(|bin| bin.id == bin_id)
+        .ok_or(EditError::BinNotFound)?;
+    bin.name = name.into();
+    Ok(())
+}
+
+pub fn delete_bin(project: &mut Project, bin_id: BinId) -> Result<(), EditError> {
+    if !project.bins.iter().any(|bin| bin.id == bin_id) {
+        return Err(EditError::BinNotFound);
+    }
+    if project.bins.len() <= 1 {
+        return Err(EditError::LastBin);
+    }
+    let parent = project
+        .bins
+        .iter()
+        .find(|bin| bin.id == bin_id)
+        .and_then(|bin| bin.parent);
+    let destination = parent.or_else(|| {
+        project
+            .bins
+            .iter()
+            .find(|bin| bin.id != bin_id)
+            .map(|bin| bin.id)
+    });
+    let Some(destination) = destination else {
+        return Err(EditError::LastBin);
+    };
+    for bin in &mut project.bins {
+        if bin.parent == Some(bin_id) {
+            bin.parent = parent;
+        }
+    }
+    for media in &mut project.media {
+        if media.bin_id == bin_id {
+            media.bin_id = destination;
+        }
+    }
+    project.bins.retain(|bin| bin.id != bin_id);
+    Ok(())
+}
+
+pub fn move_media_to_bin(
+    project: &mut Project,
+    media_ids: &[MediaId],
+    bin_id: BinId,
+) -> Result<(), EditError> {
+    if !project.bins.iter().any(|bin| bin.id == bin_id) {
+        return Err(EditError::BinNotFound);
+    }
+    for media_id in media_ids {
+        let media = project
+            .media
+            .iter_mut()
+            .find(|media| media.id == *media_id)
+            .ok_or(EditError::MediaNotFound)?;
+        media.bin_id = bin_id;
+    }
+    Ok(())
 }
 
 pub fn set_in_point(
@@ -3252,5 +3404,129 @@ mod tests {
     fn sequence_busy(project: &mut Project, track: TrackId) {
         let clip = Clip::basic(1, 0, 200);
         overwrite_clips(project, SequenceId(1), vec![(track, clip)]).unwrap();
+    }
+
+    #[test]
+    fn bins_and_markers_round_trip_in_project_json() {
+        use crate::model::{Bin, BinId, MediaAsset, MediaId, Sequence, SequenceId};
+
+        let mut project = Project::new("bins");
+        let master = BinId(project.alloc());
+        project.bins.push(Bin {
+            id: master,
+            name: "Master".into(),
+            parent: None,
+        });
+        let interviews = create_bin(&mut project, Some(master), "Interviews").unwrap();
+        let asset = MediaAsset {
+            id: MediaId(0),
+            bin_id: BinId(0),
+            name: "clip.mp4".into(),
+            path: "/tmp/clip.mp4".into(),
+            duration: Frame(120),
+            timebase: Timebase::fps_24(),
+            width: Some(1920),
+            height: Some(1080),
+            video_codec: None,
+            audio_codec: None,
+            audio_channels: None,
+            sample_rate: None,
+            has_video: true,
+            has_audio: true,
+            offline: false,
+            proxy_path: None,
+        };
+        let media_id = import_media(&mut project, asset);
+        move_media_to_bin(&mut project, &[media_id], interviews).unwrap();
+        rename_bin(&mut project, interviews, "Interview selects").unwrap();
+
+        let sequence = Sequence::new(SequenceId(1), "Main", 1920, 1080, Timebase::fps_24());
+        project.sequences.push(sequence);
+        project.active_sequence = Some(SequenceId(1));
+
+        let marker_id =
+            add_marker_with_color(&mut project, SequenceId(1), Frame(48), "Beat", LabelColor::Teal)
+                .unwrap();
+        update_marker(
+            &mut project,
+            SequenceId(1),
+            marker_id,
+            Some("Downbeat".into()),
+            Some(LabelColor::Rose),
+            Some("First hit.".into()),
+            None,
+        )
+        .unwrap();
+
+        let json = project.to_json_pretty().unwrap();
+        let mut loaded = Project::from_json(&json).unwrap();
+        assert_eq!(loaded.media(media_id).unwrap().bin_id, interviews);
+        assert_eq!(
+            loaded
+                .bins
+                .iter()
+                .find(|bin| bin.id == interviews)
+                .unwrap()
+                .name,
+            "Interview selects"
+        );
+        let marker = loaded
+            .active()
+            .unwrap()
+            .markers
+            .iter()
+            .find(|marker| marker.id == marker_id)
+            .unwrap();
+        assert_eq!(marker.name, "Downbeat");
+        assert_eq!(marker.color, LabelColor::Rose);
+        assert_eq!(marker.comment, "First hit.");
+
+        delete_marker(&mut loaded, SequenceId(1), marker_id).unwrap();
+        assert!(loaded.active().unwrap().markers.is_empty());
+        delete_bin(&mut loaded, interviews).unwrap();
+        assert_eq!(loaded.media(media_id).unwrap().bin_id, master);
+    }
+
+    #[test]
+    fn delete_bin_reparents_children_and_moves_media() {
+        let mut project = Project::new("tree");
+        let master = create_bin(&mut project, None, "Master").unwrap();
+        let child = create_bin(&mut project, Some(master), "Child").unwrap();
+        let grandchild = create_bin(&mut project, Some(child), "Grandchild").unwrap();
+        let asset = MediaAsset {
+            id: MediaId(0),
+            bin_id: BinId(0),
+            name: "a.mov".into(),
+            path: "/tmp/a.mov".into(),
+            duration: Frame(24),
+            timebase: Timebase::fps_24(),
+            width: None,
+            height: None,
+            video_codec: None,
+            audio_codec: None,
+            audio_channels: None,
+            sample_rate: None,
+            has_video: true,
+            has_audio: false,
+            offline: false,
+            proxy_path: None,
+        };
+        let media_id = import_media(&mut project, asset);
+        move_media_to_bin(&mut project, &[media_id], child).unwrap();
+
+        delete_bin(&mut project, child).unwrap();
+        assert!(project.bins.iter().any(|bin| bin.id == grandchild));
+        assert_eq!(
+            project
+                .bins
+                .iter()
+                .find(|bin| bin.id == grandchild)
+                .unwrap()
+                .parent,
+            Some(master)
+        );
+        assert_eq!(project.media(media_id).unwrap().bin_id, master);
+        delete_bin(&mut project, grandchild).unwrap();
+        assert_eq!(delete_bin(&mut project, master), Err(EditError::LastBin));
     }
 }

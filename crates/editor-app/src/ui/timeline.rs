@@ -8,7 +8,7 @@ use editor_core::{
     visible_clip_span, visible_span, ClipId, Frame, MediaId, TrackFlag, TrackKind, TrimEdge,
     MAX_PIXELS_PER_FRAME, MIN_PIXELS_PER_FRAME,
 };
-use egui::{pos2, Align2, Color32, CursorIcon, FontId, Rect, Sense, Shape, Stroke, Vec2};
+use egui::{pos2, Align2, Color32, CursorIcon, FontId, Id, Rect, Sense, Shape, Stroke, Vec2};
 
 use crate::app::{note_track_flag, Drag, DragKind, MeridianApp, ScrubSource, Tool};
 use crate::theme::{self, THEME};
@@ -491,15 +491,45 @@ fn ruler(
             continue;
         }
         let x = fx(marker.frame.0, origin, rect.min.x, ppf);
+        let color = theme::label_fill(marker.color, editor_core::TrackKind::Video);
+        let hit = Rect::from_center_size(
+            pos2(x, rect.bottom() - 5.0),
+            Vec2::new(10.0, 10.0),
+        );
+        let marker_response = ui.interact(hit, Id::new(("marker", marker.id.0)), Sense::click());
+        if marker_response.hovered() {
+            let tip = if marker.comment.is_empty() {
+                format!("{} — {}", marker.name, format_tc(marker.frame.0, sequence.timebase))
+            } else {
+                format!(
+                    "{} — {}\n{}",
+                    marker.name,
+                    format_tc(marker.frame.0, sequence.timebase),
+                    marker.comment
+                )
+            };
+            marker_response.clone().on_hover_text(tip);
+        }
+        if marker_response.clicked() {
+            app.jump_to_marker(marker.id);
+        }
+        let selected = app.selected_marker == Some(marker.id);
         painter.add(Shape::convex_polygon(
             vec![
                 pos2(x, rect.bottom() - 8.0),
                 pos2(x + 4.0, rect.bottom() - 2.0),
                 pos2(x - 4.0, rect.bottom() - 2.0),
             ],
-            THEME.amber,
+            color,
             Stroke::NONE,
         ));
+        if selected {
+            painter.circle_stroke(
+                pos2(x, rect.bottom() - 5.0),
+                6.0,
+                Stroke::new(1.5_f32, THEME.accent_text),
+            );
+        }
     }
     if response.is_pointer_button_down_on() {
         app.scrub = Some(ScrubSource::Ruler);
