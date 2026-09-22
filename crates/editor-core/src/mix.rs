@@ -1,14 +1,17 @@
 //! Stereo mix shared by playback and export.
 //!
 //! Clip gain (constant or keyframed) is multiplied by the track fader.
-//! Per-track EQ and compressor run pre-fader: clip gain → EQ → compressor →
-//! fader/pan → master sum → hard limiter. Pan is constant-power and unity at
-//! center. Mute and solo decide which tracks reach the bus.
+//! Per-track EQ and compressor run pre-fader, then sidechain ducking:
+//! clip gain → EQ → compressor → duck → fader/pan → master sum → hard limiter.
+//! Ducking reads another track's pre-fader peak and lowers this track by a
+//! fixed amount while that peak is above the threshold. Pan is constant-power
+//! and unity at center. Mute and solo decide which tracks reach the bus.
 
 use serde::{Deserialize, Serialize};
 
-use crate::effects::Interpolation;
 use crate::compressor::TrackCompressor;
+use crate::duck::{DuckMix, TrackDuck};
+use crate::effects::Interpolation;
 use crate::eq::TrackEq3;
 use crate::model::{Clip, Sequence, Track, TrackKind};
 
@@ -307,6 +310,7 @@ pub struct BusTrack {
     pub pan: f32,
     pub eq: TrackEq3,
     pub compressor: TrackCompressor,
+    pub duck: TrackDuck,
     pub audible: bool,
 }
 
@@ -339,6 +343,7 @@ impl BusState {
                 pan: clamp_pan(track.pan),
                 eq: track.eq,
                 compressor: track.compressor,
+                duck: track.duck,
                 audible: track_is_audible(track, solo),
             });
             for clip in &track.clips {
@@ -391,7 +396,8 @@ impl Default for MixFrame {
 
 /// Sum pre-fader track audio (clip gains already applied) through fader, pan, and master.
 ///
-/// `track_audio` entries are `(track_id, left, right)`.
+/// `track_audio` entries are `(track_id, left, right)`. Call [`apply_ducking`]
+/// first when the bus carries sidechain ducking.
 pub fn mix_frame(track_audio: &[(u64, f32, f32)], bus: &BusState) -> MixFrame {
     let mut out = MixFrame::default();
     let master = clamp_gain(bus.master);
@@ -419,6 +425,69 @@ pub fn mix_frame(track_audio: &[(u64, f32, f32)], bus: &BusState) -> MixFrame {
     out.left = limit_sample(summed_left);
     out.right = limit_sample(summed_right);
     out
+}
+
+/// Lower ducked tracks in place, then sum through fader, pan, and master.
+///
+/// `duck` keeps attack/release envelopes across samples. Detection uses the
+/// pre-duck peak of the source track, and only when that track is audible.
+pub fn mix_ducked_frame(
+    track_audio: &mut [(u64, f32, f32)],
+    bus: &BusState,
+    duck: &mut DuckMix,
+) -> MixFrame {
+    apply_ducking(track_audio, bus, duck);
+    mix_frame(track_audio, bus)
+}
+
+/// Multiply each active duck destination by its sidechain envelope.
+///
+/// Key levels are sampled before any destination is scaled, so two tracks
+/// that duck each other do not feed back inside one sample. A muted or
+/// non-solo source contributes silence and the envelope releases.
+pub fn apply_ducking(track_audio: &mut [(u64, f32, f32)], bus: &BusState, duck: &mut DuckMix) {
+    let mut gains = Vec::with_capacity(bus.tracks.len());
+    for track in &bus.tracks {
+        let source = track.duck.source;
+        let active = track.duck.is_active() && source != Some(track.id);
+        if !active {
+            duck.reset_track(track.id);
+            continue;
+        }
+        let source_id = source.unwrap_or(0);
+        let source_audible = bus
+            .tracks
+            .iter()
+            .find(|item| item.id == source_id)
+            .is_some_and(|item| item.audible);
+        let key = if source_audible {
+            peak_of(track_audio, source_id)
+        } else {
+            0.0
+        };
+        gains.push((track.id, duck.gain_for(track.id, &track.duck, key)));
+    }
+    for slot in track_audio.iter_mut() {
+        if let Some((_, gain)) = gains.iter().find(|(id, _)| *id == slot.0) {
+            slot.1 *= gain;
+            slot.2 *= gain;
+        }
+    }
+    let ids: Vec<u64> = bus.tracks.iter().map(|track| track.id).collect();
+    duck.retain_tracks(&ids);
+}
+
+fn peak_of(track_audio: &[(u64, f32, f32)], id: u64) -> f32 {
+    let mut peak = 0.0f32;
+    for (track_id, left, right) in track_audio {
+        if *track_id != id {
+            continue;
+        }
+        let left = if left.is_finite() { left.abs() } else { 0.0 };
+        let right = if right.is_finite() { right.abs() } else { 0.0 };
+        peak = peak.max(left.max(right));
+    }
+    peak
 }
 
 pub fn stereo_frame(left: f32, right: f32, fader: f32, pan: f32) -> (f32, f32) {
@@ -732,6 +801,7 @@ mod tests {
                     pan: 0.0,
                     eq: TrackEq3::default(),
                     compressor: TrackCompressor::default(),
+                    duck: TrackDuck::default(),
                     audible: true,
                 },
                 BusTrack {
@@ -740,6 +810,7 @@ mod tests {
                     pan: 0.0,
                     eq: TrackEq3::default(),
                     compressor: TrackCompressor::default(),
+                    duck: TrackDuck::default(),
                     audible: true,
                 },
             ],
@@ -752,6 +823,148 @@ mod tests {
         let quiet = mix_frame(&[(1, 0.25, 0.25), (2, 0.25, 0.25)], &bus);
         assert!(!quiet.overload);
         assert!((quiet.left - 0.5).abs() < 1.0e-5);
+    }
+
+    fn music_bus(duck: TrackDuck, source_audible: bool) -> BusState {
+        BusState {
+            master: 1.0,
+            tracks: vec![
+                BusTrack {
+                    id: 2,
+                    fader: 1.0,
+                    pan: 0.0,
+                    eq: TrackEq3::default(),
+                    compressor: TrackCompressor::default(),
+                    duck,
+                    audible: true,
+                },
+                BusTrack {
+                    id: 3,
+                    fader: 1.0,
+                    pan: 0.0,
+                    eq: TrackEq3::default(),
+                    compressor: TrackCompressor::default(),
+                    duck: TrackDuck::default(),
+                    audible: source_audible,
+                },
+            ],
+            clips: Vec::new(),
+        }
+    }
+
+    fn armed_duck() -> TrackDuck {
+        TrackDuck {
+            enabled: true,
+            source: Some(3),
+            threshold_db: -20.0,
+            amount_db: 12.0,
+            attack_ms: 5.0,
+            release_ms: 80.0,
+        }
+    }
+
+    #[test]
+    fn dialogue_above_threshold_ducks_music_in_the_mix() {
+        let bus = music_bus(armed_duck(), true);
+        let mut duck = DuckMix::default();
+        let mut settled = (0.0, 0.0);
+        for _ in 0..8_000 {
+            let mut audio = [(2, 0.5, 0.25), (3, 0.5, 0.5)];
+            let frame = mix_ducked_frame(&mut audio, &bus, &mut duck);
+            settled = (audio[0].1, audio[0].2);
+            let _ = frame;
+        }
+        let expected = db_to_linear(-12.0);
+        assert!(
+            (settled.0 - 0.5 * expected).abs() < 0.02,
+            "left {} vs {}",
+            settled.0,
+            0.5 * expected
+        );
+        assert!(
+            (settled.1 - 0.25 * expected).abs() < 0.02,
+            "right stayed proportional: {}",
+            settled.1
+        );
+        let mut audio = [(2, 0.5, 0.25), (3, 0.5, 0.5)];
+        let frame = mix_ducked_frame(&mut audio, &bus, &mut duck);
+        let music = frame.tracks.iter().find(|item| item.0 == 2).unwrap();
+        assert!(
+            (music.1 - 0.5 * expected).abs() < 0.03,
+            "meter hears the ducked music, {}",
+            music.1
+        );
+        assert!(
+            (frame.tracks.iter().find(|item| item.0 == 3).unwrap().1 - 0.5).abs() < 1.0e-3,
+            "dialogue is the key, not the destination"
+        );
+        assert!(
+            frame.left < 0.7 && !frame.overload,
+            "ducked sum stays under the unducked full-scale mix, {}",
+            frame.left
+        );
+    }
+
+    #[test]
+    fn quiet_or_inaudible_dialogue_does_not_duck() {
+        let bus = music_bus(armed_duck(), true);
+        let mut duck = DuckMix::default();
+        let mut level = 0.0;
+        for _ in 0..4_000 {
+            let mut audio = [(2, 0.5, 0.5), (3, 0.01, 0.01)];
+            apply_ducking(&mut audio, &bus, &mut duck);
+            level = audio[0].1;
+        }
+        assert!((level - 0.5).abs() < 0.01, "below threshold: {level}");
+
+        let silent = music_bus(armed_duck(), false);
+        let mut duck = DuckMix::default();
+        for _ in 0..4_000 {
+            let mut audio = [(2, 0.5, 0.5), (3, 0.9, 0.9)];
+            apply_ducking(&mut audio, &silent, &mut duck);
+            level = audio[0].1;
+        }
+        assert!((level - 0.5).abs() < 0.02, "muted source: {level}");
+
+        let mut self_duck = armed_duck();
+        self_duck.source = Some(2);
+        let bus = music_bus(self_duck, true);
+        let mut duck = DuckMix::default();
+        let mut audio = [(2, 0.8, 0.8)];
+        for _ in 0..2_000 {
+            audio = [(2, 0.8, 0.8)];
+            apply_ducking(&mut audio, &bus, &mut duck);
+        }
+        assert!((audio[0].1 - 0.8).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn attack_is_not_instant_and_release_comes_back() {
+        let mut params = armed_duck();
+        params.attack_ms = 80.0;
+        params.release_ms = 100.0;
+        let bus = music_bus(params, true);
+        let mut duck = DuckMix::default();
+        let mut audio = [(2, 0.5, 0.5), (3, 0.8, 0.8)];
+        apply_ducking(&mut audio, &bus, &mut duck);
+        assert!(
+            audio[0].1 > 0.45,
+            "one sample of attack should barely move, {}",
+            audio[0].1
+        );
+        for _ in 0..12_000 {
+            audio = [(2, 0.5, 0.5), (3, 0.8, 0.8)];
+            apply_ducking(&mut audio, &bus, &mut duck);
+        }
+        assert!(audio[0].1 < 0.2, "settled duck {}", audio[0].1);
+        audio = [(2, 0.5, 0.5), (3, 0.0, 0.0)];
+        apply_ducking(&mut audio, &bus, &mut duck);
+        assert!(audio[0].1 < 0.25, "release holds the duck, {}", audio[0].1);
+        for _ in 0..48_000 {
+            audio = [(2, 0.5, 0.5), (3, 0.0, 0.0)];
+            apply_ducking(&mut audio, &bus, &mut duck);
+        }
+        assert!(audio[0].1 > 0.45, "release restores music, {}", audio[0].1);
     }
 
     #[test]

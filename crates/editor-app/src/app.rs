@@ -1867,6 +1867,8 @@ impl MeridianApp {
                 pan: piece.pan,
                 eq: editor_core::TrackEq3::default(),
                 compressor: editor_core::TrackCompressor::default(),
+                track_id: 0,
+                duck: editor_core::TrackDuck::default(),
                 gain_keys: piece.gain_keys.clone(),
             })
             .collect();

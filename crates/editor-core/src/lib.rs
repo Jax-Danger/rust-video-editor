@@ -6,6 +6,7 @@
 pub mod caption;
 pub mod compressor;
 pub mod deliver;
+pub mod duck;
 pub mod deliver_preset;
 pub mod demo;
 pub mod edit;
@@ -46,11 +47,13 @@ pub use edit::{
     set_clip_volume, set_filter_at, set_grade_at, set_in_point, set_luma_curve_point,
     set_lut_look, clear_lut,
     set_master_fader, set_out_point, set_shape_mask_invert, set_shape_mask_shape,
-    set_track_compressor, set_track_eq, set_track_eq_low_cut,
+    set_track_compressor, set_track_duck, set_track_duck_enabled, set_track_duck_source,
+    set_track_eq, set_track_eq_low_cut,
     set_track_fader, set_track_flag, set_track_matte, set_track_pan,
     set_transform_at, set_wheel_offsets_at, slide, slip, snap_span, snap_to_targets, update_marker,
     source_frame_at, toggle_filter_key, toggle_grade_key, toggle_transform_key, toggle_volume_key,
-    trim, update_cue_text,     CompressorParam, EditError, EqBand, SnapHit, SnapKind, SnapPoint, TrackFlag, TrimEdge,
+    trim, update_cue_text, CompressorParam, DuckParam, EditError, EqBand, SnapHit, SnapKind,
+    SnapPoint, TrackFlag, TrimEdge,
 };
 pub use effects::{
     blur, blur_mut, chroma_key, chroma_key_mut, clip_relative, color_grade, color_grade_mut, crop,
@@ -69,6 +72,13 @@ pub use compressor::{
     DEFAULT_RELEASE_MS, MAKEUP_DB_MAX, MAKEUP_DB_MIN, RATIO_MAX, RATIO_MIN, RELEASE_MS_MAX,
     RELEASE_MS_MIN, THRESHOLD_DB_MAX, THRESHOLD_DB_MIN,
 };
+pub use duck::{
+    clamp_duck_amount, clamp_duck_attack, clamp_duck_release, clamp_duck_threshold,
+    ffmpeg_duck_filter, format_duck_amount, format_duck_threshold, DuckMix, TrackDuck,
+    AMOUNT_DB_MAX, AMOUNT_DB_MIN, DEFAULT_DUCK_AMOUNT_DB, DEFAULT_DUCK_ATTACK_MS,
+    DEFAULT_DUCK_RELEASE_MS, DEFAULT_DUCK_THRESHOLD_DB, DUCK_ATTACK_MS_MAX, DUCK_ATTACK_MS_MIN,
+    DUCK_RELEASE_MS_MAX, DUCK_RELEASE_MS_MIN, DUCK_THRESHOLD_DB_MAX, DUCK_THRESHOLD_DB_MIN,
+};
 pub use eq::{
     clamp_eq_db, ffmpeg_eq_filters, format_eq_db, process_interleaved, EqProcessor, TrackEq3,
     EQ_DB_MAX, EQ_DB_MIN, EQ_HIGH_HZ, EQ_LOW_CUT_HZ, EQ_LOW_HZ, EQ_MID_HZ,
@@ -77,7 +87,8 @@ pub use mix::{
     accumulate_stereo, audio_solo_active, audio_topology, channel_clips, clamp_gain, clamp_pan,
     clip_gain_curve, db_to_linear, fader_pos_to_linear, ffmpeg_pan_filter, ffmpeg_volume_arg,
     format_db, format_pan, linear_to_db, linear_to_fader_pos, measure_stereo, meter_amount,
-    mix_frame, mix_regions, pan_gains, scaled_curve, stereo_frame, track_is_audible, update_hold,
+    mix_ducked_frame, mix_frame, mix_regions, pan_gains, scaled_curve, stereo_frame,
+    track_is_audible, update_hold,
     BusClip, BusState, BusTrack, GainCurve, GainKey, Level, MixFrame, MixRegion, FADER_DB_MAX,
     FADER_DB_MIN, GAIN_MAX,
 };
