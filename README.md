@@ -129,7 +129,29 @@ The **Colour** workspace is Resolve-leaning without decorative chrome:
 
 Wheels, curve, and sliders all run through the shared `GradeSample` compositor, so preview and Deliver match.
 
-Transitions (cross dissolve, wipe, push) are centered on a cut and consume head and tail handles. Duration is in sequence frames.
+Transitions are centered on a cut and consume head and tail handles. Duration is in sequence frames. **Timeline → Add Transition** (or the cut menu) can place:
+
+| Transition | Behaviour |
+| --- | --- |
+| Cross dissolve | Linear opacity mix |
+| Wipe | Directional reveal (`angle_deg`: 0° L→R, 90° T→B, …) |
+| Push | Both clips slide together |
+| Dip to black | Outgoing fades out, then incoming fades in through black |
+| Dip to white | Same through a white plate |
+| Slide | Outgoing stays put; incoming slides over (left or right) |
+| Blur dissolve | Cross dissolve with a blur peak at the midpoint |
+| Iris | Circular reveal from the frame centre |
+
+The inspector **Effects** section (video clips) adds stackable filters that run in the shared compositor for preview and Deliver:
+
+| Effect | Parameter |
+| --- | --- |
+| Blur | Radius in sequence pixels (box blur) |
+| Vignette | Amount and softness |
+| Crop | Left / right / top / bottom insets (letterbox/pillarbox) |
+| Sharpen | Unsharp-mask strength |
+
+Filter parameters are `AnimatedF32` like grade and transform. Adjustment layers (a clip that grades everything below) are not implemented yet — use a higher track for now.
 
 ## Titles
 
@@ -161,6 +183,11 @@ Preview (`--features ffmpeg`) and Deliver call one compositor in `editor-media`.
 | Cross dissolve | Yes | Incoming blends over an opaque outgoing plate, which is a linear mix when that plate is opaque |
 | Wipe | Yes | `angle_deg` is the direction the reveal travels: 0° left to right, 90° top to bottom, 180° from the right, 270° from the bottom. Other angles use the same half-plane per pixel. The proxy only clips axis-aligned wipes; a diagonal wipe on the proxy is a stand-in |
 | Push | Yes | Direction is left, right, up, or down. Both sides slide; they are not a crossfade |
+| Dip to black / white | Yes | Two-stage opacity through empty (black) or a white plate |
+| Slide | Yes | Outgoing is stationary; incoming slides from off-screen |
+| Blur dissolve | Yes | Cross dissolve plus a shared blur radius that peaks at the cut |
+| Iris | Yes | Circular mask from the frame centre |
+| Blur, vignette, crop, sharpen | Yes | Per-clip filters applied before the layer is composited |
 | Captions | Placement yes, glyphs mostly | Both burn the same 8×8 bitmap into the picture (about 32px at 1080p, 48px bottom margin). The proxy uses the UI font instead. Soft `mov_text` subtitles are still written. H.264 then quantizes the burn-in |
 | Titles | Yes | Generator clips on a video track. Text, size, colour, alignment, position, and plate are rasterized in `compose_layers` for the monitor and for Deliver. The proxy draws that same bitmap in track order |
 | Stacking | Yes | Simple alpha over only. No blend modes, no motion blur, no track mattes |
@@ -323,13 +350,14 @@ A progress bar follows ffmpeg's `out_time`. **Cancel** sends `SIGTERM`. A failed
 
 ## Tests
 
-`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, the sample project round-trip, imported media paths in JSON, proxy attach and relink, timeline culling on an 800-clip sequence, ruler spacing across an hour, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, proxy argument planning and preview fallback, the disk frame cache, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, pan, fader, burned captions), the mix bus (pan law, mute, solo, keyframed gain, peak and RMS), and the shared composite (luma curve, lift/gamma/gain wheels, grade split, dissolve mix, wipe angle, push, anchor, caption burn-in). It does not spawn ffmpeg or whisper.
+`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, the sample project round-trip, imported media paths in JSON, proxy attach and relink, timeline culling on an 800-clip sequence, ruler spacing across an hour, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, proxy argument planning and preview fallback, the disk frame cache, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, pan, fader, burned captions), the mix bus (pan law, mute, solo, keyframed gain, peak and RMS), and the shared composite (luma curve, lift/gamma/gain wheels, grade split, dissolve mix, wipe angle, push, dip, slide, blur dissolve, iris, clip filters, anchor, caption burn-in). It does not spawn ffmpeg or whisper.
 
 `cargo test -p editor-media --features ffmpeg` also encodes a short H.264/AAC mp4 when `ffmpeg` is on `PATH`. `cargo test -p editor-app --features whisper` builds the local speech-to-text path; the binary and model are resolved at runtime, not at compile time.
 
 ## Roadmap
 
-- GPU viewer. The CPU composite already stacks tracks, grades, transforms, and the three transitions; it is not a full optical-flow or blend-mode engine
+- GPU viewer. The CPU composite already stacks tracks, grades, transforms, eight transitions, and four clip filters; it is not a full optical-flow or blend-mode engine
+- Adjustment layers (grade/effects everything below on a track)
 - Fairlight-class dynamics, EQ, and track sends. The mixer already has faders, pan, mute, solo, meters, and keyframed clip gain
 - OFX-style plugins for third-party effects
 - Scene-linear grading and a hinted caption font. Preview and export already share the display-space formula and the bitmap burn-in

@@ -11,7 +11,10 @@
 use thiserror::Error;
 
 use crate::caption::CaptionDraft;
-use crate::effects::{color_grade_mut, transform_mut, GradeParam, TransformParam};
+use crate::effects::{
+    blur_mut, color_grade_mut, crop_mut, sharpen_mut, transform_mut, vignette_mut, GradeParam,
+    TransformParam,
+};
 use crate::model::{
     CaptionCue, Clip, ClipId, CueId, Marker, MarkerId, MediaAsset, MediaId, Project, Sequence,
     SequenceId, Title, TrackId, TrackKind, Transition, TransitionAlign, TransitionId,
@@ -882,6 +885,88 @@ pub fn set_transform_at(
         transform
             .param_mut(param)
             .write_at(clip_relative_frame, value);
+        Ok(())
+    })
+}
+
+pub fn set_filter_at(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    clip_id: ClipId,
+    param: crate::effects::FilterParam,
+    clip_relative_frame: i64,
+    value: f32,
+) -> Result<(), EditError> {
+    map_sequence(project, sequence_id, |sequence, _alloc| {
+        let (ti, ci) = sequence
+            .locate_clip(clip_id)
+            .ok_or(EditError::ClipNotFound)?;
+        let effects = &mut sequence.tracks[ti].clips[ci].effects;
+        match param {
+            crate::effects::FilterParam::BlurRadius => {
+                blur_mut(effects).radius.write_at(clip_relative_frame, value.max(0.0));
+            }
+            crate::effects::FilterParam::VignetteAmount => {
+                vignette_mut(effects)
+                    .amount
+                    .write_at(clip_relative_frame, value.clamp(0.0, 1.0));
+            }
+            crate::effects::FilterParam::VignetteSoftness => {
+                vignette_mut(effects)
+                    .softness
+                    .write_at(clip_relative_frame, value.clamp(0.05, 1.0));
+            }
+            crate::effects::FilterParam::CropLeft
+            | crate::effects::FilterParam::CropRight
+            | crate::effects::FilterParam::CropTop
+            | crate::effects::FilterParam::CropBottom => {
+                let crop = crop_mut(effects);
+                let anim = match param {
+                    crate::effects::FilterParam::CropLeft => &mut crop.left,
+                    crate::effects::FilterParam::CropRight => &mut crop.right,
+                    crate::effects::FilterParam::CropTop => &mut crop.top,
+                    crate::effects::FilterParam::CropBottom => &mut crop.bottom,
+                    _ => unreachable!(),
+                };
+                anim.write_at(clip_relative_frame, value.clamp(0.0, 0.45));
+            }
+            crate::effects::FilterParam::SharpenAmount => {
+                sharpen_mut(effects)
+                    .amount
+                    .write_at(clip_relative_frame, value.clamp(0.0, 2.0));
+            }
+        }
+        Ok(())
+    })
+}
+
+pub fn toggle_filter_key(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    clip_id: ClipId,
+    param: crate::effects::FilterParam,
+    clip_relative_frame: i64,
+) -> Result<(), EditError> {
+    map_sequence(project, sequence_id, |sequence, _alloc| {
+        let (ti, ci) = sequence
+            .locate_clip(clip_id)
+            .ok_or(EditError::ClipNotFound)?;
+        let effects = &mut sequence.tracks[ti].clips[ci].effects;
+        let anim = match param {
+            crate::effects::FilterParam::BlurRadius => &mut blur_mut(effects).radius,
+            crate::effects::FilterParam::VignetteAmount => &mut vignette_mut(effects).amount,
+            crate::effects::FilterParam::VignetteSoftness => &mut vignette_mut(effects).softness,
+            crate::effects::FilterParam::CropLeft => &mut crop_mut(effects).left,
+            crate::effects::FilterParam::CropRight => &mut crop_mut(effects).right,
+            crate::effects::FilterParam::CropTop => &mut crop_mut(effects).top,
+            crate::effects::FilterParam::CropBottom => &mut crop_mut(effects).bottom,
+            crate::effects::FilterParam::SharpenAmount => &mut sharpen_mut(effects).amount,
+        };
+        if anim.has_key(clip_relative_frame) {
+            anim.remove_key(clip_relative_frame);
+        } else {
+            anim.set_key(clip_relative_frame, anim.value_at(clip_relative_frame));
+        }
         Ok(())
     })
 }

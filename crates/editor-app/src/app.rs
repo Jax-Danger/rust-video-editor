@@ -1930,6 +1930,34 @@ impl MeridianApp {
                             });
                             ui.close_menu();
                         }
+                        if ui.button("Dip to Black at Cut").clicked() {
+                            self.add_transition_at_selection(TransitionKind::DipToBlack);
+                            ui.close_menu();
+                        }
+                        if ui.button("Dip to White at Cut").clicked() {
+                            self.add_transition_at_selection(TransitionKind::DipToWhite);
+                            ui.close_menu();
+                        }
+                        if ui.button("Slide Left at Cut").clicked() {
+                            self.add_transition_at_selection(TransitionKind::Slide {
+                                direction: Direction::Left,
+                            });
+                            ui.close_menu();
+                        }
+                        if ui.button("Slide Right at Cut").clicked() {
+                            self.add_transition_at_selection(TransitionKind::Slide {
+                                direction: Direction::Right,
+                            });
+                            ui.close_menu();
+                        }
+                        if ui.button("Blur Dissolve at Cut").clicked() {
+                            self.add_transition_at_selection(TransitionKind::BlurDissolve);
+                            ui.close_menu();
+                        }
+                        if ui.button("Iris at Cut").clicked() {
+                            self.add_transition_at_selection(TransitionKind::Iris);
+                            ui.close_menu();
+                        }
                     });
                     ui.menu_button("Help", |ui| {
                         if ui.button("Keyboard Shortcuts").clicked() {

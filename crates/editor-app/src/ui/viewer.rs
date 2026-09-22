@@ -10,8 +10,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use crate::composite::{
-    active_captions, burn_captions, compose_layers, mask_window, transition_motion, GradeSample,
-    LayerSource, MaskWindow, PictureCache, Place, ProgramLayer,
+    active_captions, burn_captions, compose_layers, mask_window, transition_motion, FilterSample,
+    GradeSample, LayerSource, MaskWindow, PictureCache, Place, ProgramLayer,
 };
 use editor_core::{
     clip_relative, color_grade, transform, ColorGrade, Frame, MediaAsset, TrackKind, Transform,
@@ -547,11 +547,13 @@ struct DecodePlan {
 enum PlanPixels {
     Media(PreviewQuery),
     Title(editor_core::Title),
+    Solid([f32; 3]),
 }
 
 struct PlanLayer {
     pixels: PlanPixels,
     grade: GradeSample,
+    filters: FilterSample,
     place: Place,
     label: String,
     width: u32,
@@ -598,6 +600,12 @@ impl DecodePlan {
                     bits(title.y).hash(&mut hasher);
                     bits(title.plate).hash(&mut hasher);
                 }
+                PlanPixels::Solid(rgb) => {
+                    2u8.hash(&mut hasher);
+                    for channel in *rgb {
+                        bits(channel).hash(&mut hasher);
+                    }
+                }
             }
             bits(layer.grade.exposure).hash(&mut hasher);
             bits(layer.grade.contrast).hash(&mut hasher);
@@ -641,7 +649,13 @@ impl DecodePlan {
                     bits(edge).hash(&mut hasher);
                     keep_below.hash(&mut hasher);
                 }
+                crate::composite::CanvasMask::Iris { edge, keep_below } => {
+                    2u8.hash(&mut hasher);
+                    bits(edge).hash(&mut hasher);
+                    keep_below.hash(&mut hasher);
+                }
             }
+            bits(layer.place.blur_radius).hash(&mut hasher);
             layer.label.hash(&mut hasher);
         }
         for line in &self.captions {
@@ -719,10 +733,12 @@ fn decode_plan(
                     lead,
                 }),
                 LayerSource::Title(title) => PlanPixels::Title(title),
+                LayerSource::Solid { rgb } => PlanPixels::Solid(rgb),
             };
             PlanLayer {
                 pixels,
                 grade: layer.grade,
+                filters: layer.filters,
                 place: layer.place,
                 label: layer.label,
                 width: layer.width,
@@ -776,12 +792,14 @@ fn program_from_plan(layer: &PlanLayer) -> ProgramLayer {
             last_source_frame: query.last_source_frame,
         },
         PlanPixels::Title(title) => LayerSource::Title(title.clone()),
+        PlanPixels::Solid(rgb) => LayerSource::Solid { rgb: *rgb },
     };
     ProgramLayer {
         source,
         width: layer.width,
         height: layer.height,
         grade: layer.grade.clone(),
+        filters: layer.filters.clone(),
         place: layer.place,
         label: layer.label.clone(),
         using_proxy: false,

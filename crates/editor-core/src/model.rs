@@ -169,6 +169,16 @@ pub enum TransitionKind {
     CrossDissolve,
     Wipe { angle_deg: f32 },
     PushSlide { direction: Direction },
+    /// Outgoing fades to black, then incoming fades from black.
+    DipToBlack,
+    /// Outgoing fades to white, then incoming fades from white.
+    DipToWhite,
+    /// Outgoing stays put; incoming slides over it.
+    Slide { direction: Direction },
+    /// Cross dissolve with a blur peak at the midpoint.
+    BlurDissolve,
+    /// Circular iris open/close centred on the frame.
+    Iris,
 }
 
 impl TransitionKind {
@@ -177,6 +187,11 @@ impl TransitionKind {
             Self::CrossDissolve => "Cross dissolve",
             Self::Wipe { .. } => "Wipe",
             Self::PushSlide { .. } => "Push",
+            Self::DipToBlack => "Dip to black",
+            Self::DipToWhite => "Dip to white",
+            Self::Slide { .. } => "Slide",
+            Self::BlurDissolve => "Blur dissolve",
+            Self::Iris => "Iris",
         }
     }
 }
