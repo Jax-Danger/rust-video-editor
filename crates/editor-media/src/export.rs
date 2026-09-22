@@ -7,9 +7,7 @@
 //! the planned layers, runs [`composite`], burns captions, and pipes the
 //! pictures to ffmpeg for the codec.
 
-#[cfg(feature = "ffmpeg")]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use editor_core::{
     ffmpeg_compressor_filter, ffmpeg_eq_filters, ffmpeg_pan_filter, ffmpeg_volume_arg, mix_regions,
@@ -219,6 +217,183 @@ pub fn plan_encode_with(
             compose_groups: groups.to_vec(),
         },
     })
+}
+
+/// One program frame at full sequence resolution, ready for raster export.
+#[derive(Clone, Debug)]
+pub struct StillPlan {
+    pub width: u32,
+    pub height: u32,
+    pub seq_width: f32,
+    pub seq_height: f32,
+    pub playhead: i64,
+    pub frame: RasterFrame,
+    pub compose_sequences: Vec<Sequence>,
+    pub compose_media: Vec<MediaAsset>,
+    pub compose_groups: Vec<MulticamGroup>,
+}
+
+impl StillPlan {
+    fn raster_plan(&self) -> RasterPlan {
+        RasterPlan {
+            width: self.width,
+            height: self.height,
+            seq_width: self.seq_width,
+            seq_height: self.seq_height,
+            fps: String::new(),
+            frames: vec![self.frame.clone()],
+            compose_sequences: self.compose_sequences.clone(),
+            compose_media: self.compose_media.clone(),
+            compose_groups: self.compose_groups.clone(),
+        }
+    }
+}
+
+/// Plan one composited program frame for still export.
+pub fn plan_still_frame(
+    sequence: &Sequence,
+    media: &[MediaAsset],
+    groups: &[MulticamGroup],
+    sequences: &[Sequence],
+    playhead: i64,
+    burn_captions: bool,
+) -> Result<StillPlan, String> {
+    let end = sequence.end_frame().0.max(0);
+    let frame_index = playhead.clamp(0, end);
+    let width = even_dim(sequence.width);
+    let height = even_dim(sequence.height);
+    let stack = program_stack_with(
+        sequence,
+        media,
+        frame_index,
+        width,
+        height,
+        crate::PreviewSource::Full,
+        groups,
+        sequences,
+    );
+    if let Some(error) = stack.errors.first() {
+        return Err(error.clone());
+    }
+    let captions = if burn_captions {
+        active_captions(sequence, frame_index)
+    } else {
+        Vec::new()
+    };
+    Ok(StillPlan {
+        width,
+        height,
+        seq_width: sequence.width.max(1) as f32,
+        seq_height: sequence.height.max(1) as f32,
+        playhead: frame_index,
+        frame: RasterFrame {
+            playhead: frame_index,
+            layers: stack.layers,
+            captions,
+        },
+        compose_sequences: sequences.to_vec(),
+        compose_media: media.to_vec(),
+        compose_groups: groups.to_vec(),
+    })
+}
+
+/// Rasterize a [`StillPlan`] with the shared compositor (grade, LUT, titles, transitions).
+#[cfg(feature = "ffmpeg")]
+pub fn render_still_rgba(plan: &StillPlan) -> Result<Vec<u8>, String> {
+    if let Ok(mut runtime) = crate::stabilize::stabilize_runtime().lock() {
+        runtime.reset();
+    }
+    let raster = plan.raster_plan();
+    let mut cache = DecodeCache::default();
+    render_frame(
+        &plan.frame,
+        &raster,
+        &mut cache,
+        &plan.compose_sequences,
+        &plan.compose_media,
+        &plan.compose_groups,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StillFormat {
+    Png,
+    Jpeg,
+}
+
+pub fn still_format(path: &Path) -> StillFormat {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+    {
+        Some(ext) if ext == "jpg" || ext == "jpeg" => StillFormat::Jpeg,
+        _ => StillFormat::Png,
+    }
+}
+
+/// Write an RGBA buffer to PNG or JPEG based on the file extension.
+#[cfg(feature = "ffmpeg")]
+pub fn write_still_image(path: &Path, rgba: &[u8], width: u32, height: u32) -> Result<(), String> {
+    let expected = width as usize * height as usize * 4;
+    if rgba.len() != expected {
+        return Err(format!(
+            "rgba buffer size mismatch: got {} expected {}",
+            rgba.len(),
+            expected
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        }
+    }
+    let dir = std::env::temp_dir().join(format!("meridian-still-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    let raw = dir.join("frame.rgba");
+    std::fs::write(&raw, rgba).map_err(|err| err.to_string())?;
+    let mut command = std::process::Command::new("ffmpeg");
+    command
+        .arg("-y")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-nostdin")
+        .args([
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgba",
+            "-s",
+        ])
+        .arg(format!("{}x{}", width, height))
+        .arg("-i")
+        .arg(&raw)
+        .args(["-frames:v", "1"]);
+    match still_format(path) {
+        StillFormat::Png => {
+            command.args(["-c:v", "png"]);
+        }
+        StillFormat::Jpeg => {
+            command.args(["-c:v", "mjpeg", "-q:v", "2"]);
+        }
+    }
+    let status = command.arg(path).status().map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            "ffmpeg was not found on PATH".to_string()
+        } else {
+            err.to_string()
+        }
+    })?;
+    let _ = std::fs::remove_dir_all(&dir);
+    if !status.success() {
+        return Err(format!("ffmpeg could not write still image ({status})"));
+    }
+    if !path.is_file() {
+        return Err("still image was not written".into());
+    }
+    Ok(())
 }
 
 pub fn cues_to_srt(cues: &[(f64, f64, String)]) -> String {
@@ -1393,6 +1568,125 @@ mod tests {
     }
 
     #[test]
+    fn still_plan_matches_single_frame_export() {
+        let dir = std::env::temp_dir().join(format!("meridian-still-plan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let picture = touch(&dir, "picture.mp4");
+        let pip = touch(&dir, "pip.mp4");
+        let voice = touch(&dir, "voice.wav");
+        let mut sequence = Sequence::new(SequenceId(1), "Cut", 320, 180, Timebase::fps_24());
+        sequence.add_track(TrackId(2), TrackKind::Video, "V1");
+        sequence.add_track(TrackId(3), TrackKind::Video, "V2");
+        sequence.add_track(TrackId(4), TrackKind::Audio, "A1");
+        sequence.add_track(TrackId(5), TrackKind::Caption, "C1");
+        let mut left = Clip::basic(10, 0, 48);
+        left.media_id = Some(MediaId(1));
+        let mut grade = ColorGrade::neutral();
+        grade.exposure.base = 0.5;
+        left.effects.push(Effect::Color(grade));
+        let mut right = Clip::basic(11, 48, 96);
+        right.media_id = Some(MediaId(1));
+        let mut inset = Clip::basic(12, 12, 36);
+        inset.media_id = Some(MediaId(2));
+        let mut xform = Transform::identity();
+        xform.scale_x.base = 0.4;
+        xform.scale_y.base = 0.4;
+        xform.position_x.base = 40.0;
+        xform.position_y.base = -20.0;
+        inset.effects.push(Effect::Transform(xform));
+        sequence.tracks[0].clips = vec![left, right];
+        sequence.tracks[0].transitions.push(Transition {
+            id: TransitionId(7),
+            kind: TransitionKind::CrossDissolve,
+            left_clip: ClipId(10),
+            right_clip: ClipId(11),
+            duration: 8,
+            alignment: TransitionAlign::Center,
+        });
+        sequence.tracks[1].clips = vec![inset];
+        sequence.tracks[3].cues.push(editor_core::CaptionCue {
+            id: CueId(30),
+            timeline_in: Frame(0),
+            timeline_out: Frame(24),
+            text: "Hello, ridge".into(),
+            speaker: None,
+        });
+        let media = vec![
+            asset(1, &picture, true, true),
+            asset(2, &pip, true, false),
+            asset(3, &voice, false, true),
+        ];
+        let still = plan_still_frame(&sequence, &media, &[], &[sequence.clone()], 20, true).unwrap();
+        let script = plan_encode(
+            &sequence,
+            &media,
+            ExportRange::WholeSequence,
+            "H.264",
+            "mp4",
+            true,
+            EncodeHints::default(),
+        )
+        .unwrap();
+        let export = script
+            .raster
+            .frames
+            .iter()
+            .find(|frame| frame.playhead == 20)
+            .expect("export frame 20");
+        assert_eq!(still.width, script.raster.width);
+        assert_eq!(still.height, script.raster.height);
+        assert_eq!(still.frame.layers.len(), export.layers.len());
+        assert_eq!(still.frame.captions, export.captions);
+        assert!(
+            still
+                .frame
+                .layers
+                .iter()
+                .any(|layer| (layer.grade.exposure - 0.5).abs() < 1.0e-4)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn still_format_reads_extension() {
+        assert_eq!(
+            still_format(Path::new("frame.png")),
+            StillFormat::Png
+        );
+        assert_eq!(
+            still_format(Path::new("frame.JPG")),
+            StillFormat::Jpeg
+        );
+        assert_eq!(
+            still_format(Path::new("frame")),
+            StillFormat::Png
+        );
+    }
+
+    #[cfg(feature = "ffmpeg")]
+    #[test]
+    fn write_still_image_writes_png_and_jpeg() {
+        if crate::preview_backend() != crate::PreviewBackend::Cli {
+            return;
+        }
+        let rgba = vec![
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ];
+        let dir = std::env::temp_dir().join(format!("meridian-still-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("test.png");
+        write_still_image(&png, &rgba, 2, 2).unwrap();
+        assert!(png.is_file());
+        assert_eq!(still_format(&png), StillFormat::Png);
+        let jpeg = dir.join("test.jpg");
+        write_still_image(&jpeg, &rgba, 2, 2).unwrap();
+        assert!(jpeg.is_file());
+        assert_eq!(still_format(&jpeg), StillFormat::Jpeg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn retimed_picture_samples_source_frames_and_mutes_audio() {
         let dir = std::env::temp_dir().join(format!("meridian-plan-speed-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2009,6 +2303,7 @@ mod tests {
                     "H.264",
                     "mp4",
                     true,
+                    EncodeHints::default(),
                 )
                 .unwrap();
                 let mut cache = DecodeCache::default();

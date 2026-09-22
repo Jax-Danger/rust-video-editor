@@ -949,6 +949,8 @@ impl MeridianApp {
             if self.session.undo() {
                 self.status = "Undo.".into();
             }
+        } else if pressed_cmd_shift(Key::S) {
+            self.export_still_at_playhead();
         } else if pressed_cmd(Key::S) {
             self.save_or_prompt();
         } else if pressed_cmd(Key::O) {
@@ -2742,6 +2744,110 @@ impl MeridianApp {
             Err(err) => self.deliver.report = err.to_string(),
         }
     }
+
+    pub(crate) fn export_still_at_playhead(&mut self) {
+        let Some(sequence) = self.session.project().active().cloned() else {
+            self.status = "No sequence.".into();
+            return;
+        };
+        let suggested = crate::dialogs::still_file_name(&sequence.name, self.playhead, None);
+        let Some(path) = crate::dialogs::save_still_file(&suggested) else {
+            return;
+        };
+        self.export_still_to_path(path, self.playhead, None);
+    }
+
+    pub(crate) fn export_stills_at_markers(&mut self) {
+        let Some(sequence) = self.session.project().active().cloned() else {
+            self.status = "No sequence.".into();
+            return;
+        };
+        if sequence.markers.is_empty() {
+            self.status = "No markers on this sequence.".into();
+            return;
+        }
+        let Some(folder) = crate::dialogs::pick_stills_folder() else {
+            return;
+        };
+        let markers = sequence.markers.clone();
+        let mut ok = 0usize;
+        let mut errors = Vec::new();
+        for marker in &markers {
+            let suggested = crate::dialogs::still_file_name(
+                &sequence.name,
+                marker.frame.0,
+                Some(&marker.name),
+            );
+            let path = folder.join(suggested);
+            match self.export_still_to_path(path, marker.frame.0, Some(&marker.name)) {
+                Ok(()) => ok += 1,
+                Err(err) => errors.push(err),
+            }
+        }
+        if errors.is_empty() {
+            self.status = format!("Exported {ok} still(s) to {}.", folder.display());
+            self.deliver.report = self.status.clone();
+        } else if ok > 0 {
+            self.status = format!(
+                "Exported {ok} still(s); {} failed: {}",
+                errors.len(),
+                errors.first().unwrap_or(&String::new())
+            );
+            self.deliver.report = self.status.clone();
+        } else {
+            self.status = errors
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "Still export failed.".into());
+            self.deliver.report = self.status.clone();
+        }
+    }
+
+    fn export_still_to_path(
+        &mut self,
+        path: std::path::PathBuf,
+        playhead: i64,
+        marker_name: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(sequence) = self.session.project().active().cloned() else {
+            return Err("No sequence.".into());
+        };
+        let media = self.session.project().media.clone();
+        let groups = self.session.project().multicam_groups.clone();
+        let sequences = self.session.project().sequences.clone();
+        let burn = self.deliver.burn_captions;
+        let plan = editor_media::plan_still_frame(
+            &sequence,
+            &media,
+            &groups,
+            &sequences,
+            playhead,
+            burn,
+        )?;
+        #[cfg(feature = "ffmpeg")]
+        {
+            let rgba = editor_media::render_still_rgba(&plan)?;
+            editor_media::write_still_image(&path, &rgba, plan.width, plan.height)?;
+            let label = marker_name
+                .filter(|name| !name.trim().is_empty())
+                .map(|name| format!(" ({name})"))
+                .unwrap_or_default();
+            let message = format!(
+                "Exported still at frame {} to {}{}.",
+                plan.playhead,
+                path.display(),
+                label
+            );
+            self.status = message.clone();
+            self.deliver.report = message;
+            Ok(())
+        }
+        #[cfg(not(feature = "ffmpeg"))]
+        {
+            let _ = (path, playhead, marker_name, plan);
+            Err("Still export needs the ffmpeg feature. Rebuild with --features ffmpeg.".into())
+        }
+    }
 }
 
 fn place_media(
@@ -3127,6 +3233,15 @@ impl MeridianApp {
                         };
                         if ui.button(proxy_label).clicked() {
                             self.toggle_proxies();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Export Still…    Ctrl+Shift+S").clicked() {
+                            self.export_still_at_playhead();
+                            ui.close_menu();
+                        }
+                        if ui.button("Export Stills at Markers…").clicked() {
+                            self.export_stills_at_markers();
                             ui.close_menu();
                         }
                         ui.separator();
@@ -3794,6 +3909,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+Z", "Undo"),
     ("Ctrl+Shift+Z  /  Ctrl+Y", "Redo"),
     ("Ctrl+S", "Save"),
+    ("Ctrl+Shift+S", "Export still at the program playhead"),
     ("Ctrl+O", "Open project"),
     ("Ctrl+N", "New project"),
     ("Ctrl+I", "Import media"),

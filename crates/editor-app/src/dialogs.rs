@@ -85,3 +85,58 @@ pub fn pick_lut_file() -> Option<PathBuf> {
         .add_filter("All files", &["*"])
         .pick_file()
 }
+
+pub fn save_still_file(suggested_name: &str) -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Export Still")
+        .set_file_name(suggested_name)
+        .add_filter("PNG", &["png"])
+        .add_filter("JPEG", &["jpg", "jpeg"])
+        .save_file()
+        .map(ensure_still_extension)
+}
+
+pub fn pick_stills_folder() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Export Stills at Markers")
+        .pick_folder()
+}
+
+pub fn still_file_name(sequence_name: &str, playhead: i64, marker_name: Option<&str>) -> String {
+    let sequence = slug(sequence_name);
+    let frame = format!("f{:04}", playhead.max(0));
+    match marker_name {
+        Some(name) if !name.trim().is_empty() => format!("{}_{}_{}.png", sequence, slug(name), frame),
+        _ => format!("{}_{}.png", sequence, frame),
+    }
+}
+
+fn slug(value: &str) -> String {
+    let slug: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let slug = slug.trim_matches('_');
+    if slug.is_empty() {
+        "still".into()
+    } else {
+        slug.to_string()
+    }
+}
+
+fn ensure_still_extension(path: PathBuf) -> PathBuf {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("png") | Some("jpg") | Some("jpeg") => path,
+        _ => {
+            let mut name = path.into_os_string();
+            name.push(".png");
+            PathBuf::from(name)
+        }
+    }
+}
