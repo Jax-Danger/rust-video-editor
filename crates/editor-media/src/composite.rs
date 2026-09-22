@@ -16,8 +16,8 @@
 
 use editor_core::{
     blur, clip_relative, color_grade, crop, picture_at, sharpen, source_frame_at, transform,
-    vignette, Clip, ColorGrade, Direction, Frame, MediaAsset, MulticamGroup, Sequence, Title,
-    ToneCurve, Track, TrackKind, Transform, TransitionKind,
+    vignette, Clip, ColorGrade, Direction, Frame, MediaAsset, MulticamGroup, Sequence,
+    SequenceId, Title, ToneCurve, Track, TrackKind, Transform, TransitionKind, MAX_NEST_DEPTH,
 };
 use font8x8::UnicodeFonts;
 
@@ -649,6 +649,21 @@ pub enum LayerSource {
     },
     /// Grade and filters apply to the composite accumulated so far.
     Adjustment,
+    /// Child sequence rasterized at `child_frame` during compose.
+    Nested {
+        sequence_id: editor_core::SequenceId,
+        child_frame: i64,
+    },
+}
+
+/// Shared context for recursively compositing nested sequences.
+#[derive(Clone, Copy, Debug)]
+pub struct ComposeEnv<'a> {
+    pub sequences: &'a [Sequence],
+    pub media: &'a [MediaAsset],
+    pub groups: &'a [MulticamGroup],
+    pub preview_source: crate::PreviewSource,
+    pub depth: u32,
 }
 
 /// One layer, bottom to top. Higher timeline tracks are later.
@@ -699,6 +714,7 @@ pub fn program_stack(
         canvas_h,
         crate::PreviewSource::Full,
         &[],
+        &[sequence.clone()],
     )
 }
 
@@ -712,6 +728,7 @@ pub fn program_stack_with(
     canvas_h: u32,
     source: crate::PreviewSource,
     groups: &[MulticamGroup],
+    sequences: &[Sequence],
 ) -> ProgramStack {
     let mut layers = Vec::new();
     let mut errors = Vec::new();
@@ -728,7 +745,16 @@ pub fn program_stack_with(
             let mut dip_plate: Option<([f32; 3], f32)> = None;
             for (clip, outgoing) in [(hit.left, true), (hit.right, false)] {
                 match layer_from_clip(
-                    sequence, track, clip, media, groups, playhead, canvas_w, canvas_h, source,
+                    sequence,
+                    track,
+                    clip,
+                    media,
+                    groups,
+                    sequences,
+                    playhead,
+                    canvas_w,
+                    canvas_h,
+                    source,
                 ) {
                     Ok(Some(mut layer)) => {
                         let (place, motion) = apply_transition(
@@ -781,7 +807,16 @@ pub fn program_stack_with(
             .find(|clip| clip.enabled && clip.covers(Frame(playhead)))
         {
             match layer_from_clip(
-                sequence, track, clip, media, groups, playhead, canvas_w, canvas_h, source,
+                sequence,
+                track,
+                clip,
+                media,
+                groups,
+                sequences,
+                playhead,
+                canvas_w,
+                canvas_h,
+                source,
             ) {
                 Ok(Some(layer)) => layers.push(layer),
                 Ok(None) => {}
@@ -848,6 +883,7 @@ fn layer_from_clip(
     clip: &Clip,
     media: &[MediaAsset],
     groups: &[MulticamGroup],
+    sequences: &[Sequence],
     playhead: i64,
     canvas_w: u32,
     canvas_h: u32,
@@ -883,6 +919,26 @@ fn layer_from_clip(
             source: LayerSource::Title(title),
             width,
             height,
+            grade: GradeSample::from_effects(&clip.effects, rel),
+            filters: FilterSample::from_effects(&clip.effects, rel),
+            place,
+            label: layer_label(track, clip),
+            using_proxy: false,
+            clip_id: clip.id.0,
+        }));
+    }
+    if let Some(binding) = &clip.nested {
+        if !sequences.iter().any(|item| item.id == binding.sequence) {
+            return Err(format!("Nested sequence missing for {}", clip.name));
+        }
+        let child_frame = source_frame_at(clip, Frame(playhead), sequence.timebase).0;
+        return Ok(Some(ProgramLayer {
+            source: LayerSource::Nested {
+                sequence_id: binding.sequence,
+                child_frame,
+            },
+            width: canvas_w,
+            height: canvas_h,
             grade: GradeSample::from_effects(&clip.effects, rel),
             filters: FilterSample::from_effects(&clip.effects, rel),
             place,
@@ -1198,6 +1254,93 @@ fn apply_vignette(rgba: &mut [u8], width: u32, height: u32, amount: f32, softnes
     }
 }
 
+/// Every media layer that must be decoded to rasterize `layers`, including
+/// inside nested sequences.
+pub fn media_layers_in_stack(layers: &[ProgramLayer], env: ComposeEnv<'_>) -> Vec<ProgramLayer> {
+    let mut out = Vec::new();
+    for layer in layers {
+        match &layer.source {
+            LayerSource::Media { .. } => out.push(layer.clone()),
+            LayerSource::Nested {
+                sequence_id,
+                child_frame,
+            } => {
+                if env.depth >= MAX_NEST_DEPTH {
+                    continue;
+                }
+                let Some(child) = env.sequences.iter().find(|item| item.id == *sequence_id)
+                else {
+                    continue;
+                };
+                let stack = program_stack_with(
+                    child,
+                    env.media,
+                    *child_frame,
+                    layer.width,
+                    layer.height,
+                    env.preview_source,
+                    env.groups,
+                    env.sequences,
+                );
+                let child_env = ComposeEnv {
+                    depth: env.depth + 1,
+                    ..env
+                };
+                out.extend(media_layers_in_stack(&stack.layers, child_env));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn rasterize_nested(
+    env: ComposeEnv<'_>,
+    sequence_id: SequenceId,
+    child_frame: i64,
+    width: u32,
+    height: u32,
+    media_rgba: &mut dyn FnMut(&ProgramLayer) -> Result<Vec<u8>, String>,
+) -> Result<Vec<u8>, String> {
+    if env.depth >= MAX_NEST_DEPTH {
+        return Err("nested sequence depth limit reached".into());
+    }
+    let child = env
+        .sequences
+        .iter()
+        .find(|item| item.id == sequence_id)
+        .ok_or_else(|| format!("nested sequence {} missing", sequence_id.0))?;
+    let stack = program_stack_with(
+        child,
+        env.media,
+        child_frame,
+        width,
+        height,
+        env.preview_source,
+        env.groups,
+        env.sequences,
+    );
+    if let Some(error) = stack.errors.first() {
+        return Err(error.clone());
+    }
+    let child_env = ComposeEnv {
+        sequences: env.sequences,
+        media: env.media,
+        groups: env.groups,
+        preview_source: env.preview_source,
+        depth: env.depth + 1,
+    };
+    compose_layers_env(
+        width,
+        height,
+        child.width.max(1) as f32,
+        child.height.max(1) as f32,
+        &stack.layers,
+        Some(child_env),
+        media_rgba,
+    )
+}
+
 /// Rasterize title generators and composite every layer. `media_rgba` is only
 /// called for decoded picture; titles never go through it. Adjustment layers
 /// grade and filter the composite accumulated so far.
@@ -1207,6 +1350,27 @@ pub fn compose_layers(
     seq_w: f32,
     seq_h: f32,
     layers: &[ProgramLayer],
+    media_rgba: impl FnMut(&ProgramLayer) -> Result<Vec<u8>, String>,
+) -> Result<Vec<u8>, String> {
+    compose_layers_env(
+        dst_w,
+        dst_h,
+        seq_w,
+        seq_h,
+        layers,
+        None,
+        media_rgba,
+    )
+}
+
+/// Like [`compose_layers`], but resolves [`LayerSource::Nested`] recursively.
+pub fn compose_layers_env(
+    dst_w: u32,
+    dst_h: u32,
+    seq_w: f32,
+    seq_h: f32,
+    layers: &[ProgramLayer],
+    env: Option<ComposeEnv<'_>>,
     mut media_rgba: impl FnMut(&ProgramLayer) -> Result<Vec<u8>, String>,
 ) -> Result<Vec<u8>, String> {
     let len = (dst_w as usize)
@@ -1229,6 +1393,22 @@ pub fn compose_layers(
             LayerSource::Title(title) => render_title(title, layer.width, layer.height),
             LayerSource::Media { .. } => media_rgba(layer)?,
             LayerSource::Solid { rgb } => solid_rgba(layer.width, layer.height, *rgb),
+            LayerSource::Nested {
+                sequence_id,
+                child_frame,
+            } => {
+                let Some(env) = env else {
+                    return Err(format!("{} needs a nested compose context", layer.label));
+                };
+                rasterize_nested(
+                    env,
+                    *sequence_id,
+                    *child_frame,
+                    layer.width,
+                    layer.height,
+                    &mut media_rgba,
+                )?
+            }
             LayerSource::Adjustment => unreachable!(),
         };
         if rgba.len() < 4 {
@@ -2374,6 +2554,7 @@ mod tests {
             36,
             crate::PreviewSource::Proxy,
             &[],
+            &[sequence.clone()],
         );
         assert!(preview.layers[0].using_proxy);
         assert!(media_path(&preview.layers[0]).ends_with("proxy.mp4"));
@@ -2571,7 +2752,10 @@ mod tests {
     fn media_path(layer: &ProgramLayer) -> &str {
         match &layer.source {
             LayerSource::Media { path, .. } => path,
-            LayerSource::Title(_) | LayerSource::Solid { .. } | LayerSource::Adjustment => "",
+            LayerSource::Title(_)
+            | LayerSource::Solid { .. }
+            | LayerSource::Adjustment
+            | LayerSource::Nested { .. } => "",
         }
     }
 

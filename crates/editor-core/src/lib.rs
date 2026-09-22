@@ -12,6 +12,7 @@ pub mod effects;
 pub mod mix;
 pub mod model;
 pub mod multicam;
+pub mod nest;
 pub mod scale;
 pub mod session;
 mod speed;
@@ -63,6 +64,10 @@ pub use multicam::{
     active_angle, angle_audio_media, angle_marks, angle_source_frame, create_multicam,
     multicam_audio_spans, multicam_target, opening_angle_name, picture_at, set_angle_sync,
     switch_angle, AnglePicture, AudibleSpan,
+};
+pub use nest::{
+    create_nested_sequence, nested_audio_spans, nested_frame_at, nested_sequence,
+    nested_sequence_id, would_cycle, MAX_NEST_DEPTH,
 };
 pub use scale::{
     align_frame, clamp_timeline_zoom, clip_index_at, frame_at_x, ruler_mark_count, ruler_step,

@@ -442,6 +442,7 @@ fn multicam_clip(
         adjustment: false,
         speed: crate::model::ClipSpeed::normal(),
         multicam: Some(binding),
+        nested: None,
     }
 }
 

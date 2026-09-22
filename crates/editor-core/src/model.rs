@@ -324,6 +324,16 @@ pub struct MulticamBinding {
     pub cuts: Vec<AngleCut>,
 }
 
+/// Link from a parent-timeline clip to a child [`Sequence`].
+///
+/// The clip's `source_in` / `source_out` are frames inside the child sequence.
+/// Preview and export composite the child at that frame and paint the result
+/// as one layer on the parent.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NestedBinding {
+    pub sequence: SequenceId,
+}
+
 /// Generator text drawn into the frame by the shared compositor.
 ///
 /// `x` and `y` are normalized anchors (0…1, y down). `font_size` is the glyph
@@ -524,6 +534,10 @@ pub struct Clip {
     /// instead of [`Self::media_id`] alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multicam: Option<MulticamBinding>,
+    /// When set, preview and export rasterize this child sequence instead of
+    /// decoding [`Self::media_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nested: Option<NestedBinding>,
 }
 
 impl Clip {
@@ -574,6 +588,7 @@ impl Clip {
             adjustment: false,
             speed: ClipSpeed::normal(),
             multicam: None,
+            nested: None,
         }
     }
 
@@ -603,6 +618,7 @@ impl Clip {
             adjustment: false,
             speed: ClipSpeed::normal(),
             multicam: None,
+            nested: None,
         }
     }
 
@@ -637,6 +653,7 @@ impl Clip {
             adjustment: true,
             speed: ClipSpeed::normal(),
             multicam: None,
+            nested: None,
         }
     }
 
@@ -646,6 +663,10 @@ impl Clip {
 
     pub fn is_adjustment(&self) -> bool {
         self.adjustment
+    }
+
+    pub fn is_nested(&self) -> bool {
+        self.nested.is_some()
     }
 
     /// Give the clip unused media before (`head`) and after (`tail`) the current source.

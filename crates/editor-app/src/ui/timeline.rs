@@ -623,7 +623,9 @@ fn lane(
             }
         }
         if crect.width() >= 18.0 {
-            let clip_label = if clip.is_title() {
+            let clip_label = if clip.is_nested() {
+                format!("N  {}", clip.name)
+            } else if clip.is_title() {
                 format!("T  {}", clip.name)
             } else if clip.is_adjustment() {
                 format!("A  {}", clip.name)
@@ -739,7 +741,14 @@ fn lane(
 
     if response.double_clicked() && track.kind != TrackKind::Caption {
         if let Some(pos) = response.interact_pointer_pos() {
-            if hit_test(track, rect, pos, origin, ppf).is_none() {
+            if let Some(hit) = hit_test(track, rect, pos, origin, ppf) {
+                if sequence
+                    .clip(hit.clip_id)
+                    .is_some_and(|clip| clip.is_nested())
+                {
+                    app.open_nested_sequence(hit.clip_id);
+                }
+            } else {
                 app.toggle_play();
             }
         }

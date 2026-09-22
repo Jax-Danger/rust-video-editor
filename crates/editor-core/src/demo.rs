@@ -340,6 +340,7 @@ fn placed(
         adjustment: false,
         speed: crate::model::ClipSpeed::normal(),
         multicam: None,
+        nested: None,
     }
 }
 

@@ -4,10 +4,11 @@ use std::collections::HashSet;
 
 use editor_core::{
     add_adjustment_layer, add_title, add_transition, builtin_templates, clip_from_media,
-    create_multicam, expand_linked, link_clips, multicam_target, plan_export, replace_captions,
-    set_angle_sync, switch_angle, Bin, BinId, BusState, CaptionTranscriber, ClipId, CueId,
-    Direction, EditError, ExportRange, Frame, MediaAsset, MediaId, MulticamId, Project, Session,
-    Timebase, Track, TrackFlag, TrackId, TrackKind, TransitionKind, TrimEdge,
+    create_multicam, create_nested_sequence, expand_linked, link_clips, multicam_target,
+    nested_sequence_id, plan_export, replace_captions, set_angle_sync, switch_angle, Bin, BinId,
+    BusState, CaptionTranscriber, ClipId, CueId, Direction, EditError, ExportRange, Frame,
+    MediaAsset, MediaId, MulticamId, Project, SequenceId, Session, Timebase, Track, TrackFlag,
+    TrackId, TrackKind, TransitionKind, TrimEdge,
 };
 use editor_media::{duration_frames, probe, resolve_media_path};
 use egui::{Event, Key, Modifiers, RichText, ViewportCommand};
@@ -235,6 +236,8 @@ pub struct MeridianApp {
     pub caption_job: Option<crate::caption_job::CaptionJob>,
     /// Video and audio tracks armed for overwrite, insert, and ripple trims.
     pub targeted_tracks: HashSet<TrackId>,
+    /// Parent sequences when editing inside a nested compound clip.
+    pub sequence_nav_stack: Vec<SequenceId>,
 }
 
 impl MeridianApp {
@@ -284,6 +287,7 @@ impl MeridianApp {
             #[cfg(all(feature = "ffmpeg", feature = "whisper"))]
             caption_job: None,
             targeted_tracks: HashSet::new(),
+            sequence_nav_stack: Vec::new(),
         };
         app.reset_track_targets();
         app.sync_title(&cc.egui_ctx);
@@ -981,6 +985,76 @@ impl MeridianApp {
             }
             Err(err) => err.to_string(),
         };
+    }
+
+    pub fn nest_selection(&mut self) {
+        let ids = self.selected_with_links();
+        if ids.is_empty() {
+            self.status = "Select clips to nest.".into();
+            return;
+        }
+        let mut created = None;
+        self.halt_transport();
+        let result = self.session.edit("Nest selection", |project| {
+            let sequence = project.active_sequence.ok_or(EditError::NoActiveSequence)?;
+            created = Some(create_nested_sequence(project, sequence, &ids)?);
+            Ok(())
+        });
+        self.status = match result {
+            Ok(()) => {
+                if let Some(id) = created {
+                    if let Some(sequence) = self.session.project().active() {
+                        self.selected = if self.linked_selection {
+                            expand_linked(sequence, &[id])
+                        } else {
+                            vec![id]
+                        };
+                    }
+                }
+                "Nested selection into a compound clip.".into()
+            }
+            Err(err) => err.to_string(),
+        };
+    }
+
+    pub fn open_nested_sequence(&mut self, clip_id: ClipId) {
+        let prepared = {
+            let project = self.session.project();
+            let Some(sequence) = project.active() else {
+                return;
+            };
+            let Some(clip) = sequence.clip(clip_id) else {
+                return;
+            };
+            let Some(child) = nested_sequence_id(clip) else {
+                return;
+            };
+            (sequence.id, child, clip.name.clone())
+        };
+        let (parent, child, name) = prepared;
+        self.halt_transport();
+        self.session.edit("Open nested sequence", |project| {
+            project.active_sequence = Some(child);
+            Ok(())
+        });
+        self.sequence_nav_stack.push(parent);
+        self.selected.clear();
+        self.status = format!("Editing nested sequence “{name}”.");
+    }
+
+    pub fn close_nested_sequence(&mut self) {
+        let Some(parent) = self.sequence_nav_stack.pop() else {
+            return;
+        };
+        self.halt_transport();
+        self.session.edit("Close nested sequence", |project| {
+            project.active_sequence = Some(parent);
+            Ok(())
+        });
+        self.selected.clear();
+        if let Some(sequence) = self.session.project().active() {
+            self.status = format!("Back to “{}”.", sequence.name);
+        }
     }
 
     pub fn switch_multicam_angle(&mut self, angle: u32) {
@@ -1790,10 +1864,12 @@ impl MeridianApp {
         let _ = editor_core::save_last_deliver_settings(&self.deliver.to_settings());
         #[cfg(feature = "ffmpeg")]
         {
+            let sequences = self.session.project().sequences.clone();
             match editor_media::plan_encode_with(
                 &sequence,
                 &media,
                 &groups,
+                &sequences,
                 range,
                 &self.deliver.codec,
                 &self.deliver.container,
@@ -2315,8 +2391,31 @@ impl MeridianApp {
                             self.create_multicam_from_pool();
                             ui.close_menu();
                         }
+                        if ui.button("Nest Selection").clicked() {
+                            self.nest_selection();
+                            ui.close_menu();
+                        }
                     });
                     ui.menu_button("Sequence", |ui| {
+                        if ui
+                            .add_enabled(
+                                !self.sequence_nav_stack.is_empty(),
+                                egui::Button::new("Close Nested Sequence"),
+                            )
+                            .clicked()
+                        {
+                            self.close_nested_sequence();
+                            ui.close_menu();
+                        }
+                        if ui.button("Open Nested Sequence").clicked() {
+                            if let Some(id) = self.selected.first().copied() {
+                                self.open_nested_sequence(id);
+                            } else {
+                                self.status = "Select a nested clip to open.".into();
+                            }
+                            ui.close_menu();
+                        }
+                        ui.separator();
                         if ui.button("Dense Sequence (400 clips)").clicked() {
                             self.open_dense();
                             ui.close_menu();
