@@ -12,8 +12,8 @@ use thiserror::Error;
 
 use crate::caption::CaptionDraft;
 use crate::effects::{
-    blur_mut, chroma_key_mut, color_grade_mut, crop_mut, sharpen_mut, transform_mut, vignette_mut,
-    GradeParam, TransformParam,
+    blur_mut, chroma_key_mut, color_grade_mut, crop_mut, sharpen_mut, stabilize_mut,
+    transform_mut, vignette_mut, GradeParam, TransformParam,
 };
 use crate::model::{
     Bin, BinId, CaptionCue, Clip, ClipId, ClipSpeed, CueId, LabelColor, Marker, MarkerId,
@@ -1120,6 +1120,16 @@ pub fn set_filter_at(
                     .spill_suppression
                     .write_at(clip_relative_frame, value.clamp(0.0, 1.0));
             }
+            crate::effects::FilterParam::StabilizeStrength => {
+                stabilize_mut(effects)
+                    .strength
+                    .write_at(clip_relative_frame, value.clamp(0.0, 1.0));
+            }
+            crate::effects::FilterParam::StabilizeSmoothing => {
+                stabilize_mut(effects)
+                    .smoothing
+                    .write_at(clip_relative_frame, value.clamp(0.05, 1.0));
+            }
         }
         Ok(())
     })
@@ -1153,6 +1163,10 @@ pub fn toggle_filter_key(
             crate::effects::FilterParam::ChromaKeySoftness => &mut chroma_key_mut(effects).softness,
             crate::effects::FilterParam::ChromaKeySpillSuppression => {
                 &mut chroma_key_mut(effects).spill_suppression
+            }
+            crate::effects::FilterParam::StabilizeStrength => &mut stabilize_mut(effects).strength,
+            crate::effects::FilterParam::StabilizeSmoothing => {
+                &mut stabilize_mut(effects).smoothing
             }
         };
         if anim.has_key(clip_relative_frame) {

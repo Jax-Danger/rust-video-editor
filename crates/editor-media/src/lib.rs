@@ -18,6 +18,7 @@ mod export;
 mod frame_cache;
 mod probe;
 mod proxy;
+mod stabilize;
 #[cfg(feature = "whisper")]
 mod transcribe;
 
@@ -27,7 +28,7 @@ pub use composite::{
     place_from_transform, program_stack, program_stack_with, render_title, transition_motion,
     video_track_visible, BlitLayer,
     CanvasMask, CaptionStyle, ComposeEnv, FilterSample, GradeSample, LayerSource, MaskWindow,
-    Place, ProgramLayer, ProgramStack, TransitionMotion,
+    Place, ProgramLayer, ProgramStack, StabilizeSample, TransitionMotion,
 };
 pub use decode::{
     clamp_preview_time, decode_audio, decode_frames, ensure_time_in_range, fit_preview_size,
@@ -48,6 +49,11 @@ pub use proxy::{
     cache_root, frame_cache_dir, generate_proxy, preview_file, project_proxy_dir,
     proxy_ffmpeg_args, proxy_output_path, unsaved_proxy_dir, PreviewSource, ProxyError,
     ProxyRequest, PROXY_MAX_WIDTH,
+};
+pub use stabilize::{
+    analyze_motion_path, baked_correction, block_match_offset, feature_centroid, load_sidecar,
+    save_sidecar, sidecar_path, smooth_motion, stabilize_runtime, MotionSample, StabilizeRuntime,
+    StabilizeSidecar,
 };
 #[cfg(feature = "whisper")]
 pub use transcribe::{transcribe_wav, whisper_availability, WhisperPaths};

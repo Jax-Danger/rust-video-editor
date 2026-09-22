@@ -20,7 +20,7 @@ use std::hash::{Hash, Hasher};
 use crate::composite::{
     active_captions, burn_captions, compose_layers, compose_layers_env, mask_window,
     media_layers_in_stack, transition_motion, ComposeEnv, FilterSample, GradeSample, LayerSource,
-    MaskWindow, PictureCache, Place, ProgramLayer,
+    MaskWindow, PictureCache, Place, ProgramLayer, StabilizeSample,
 };
 use editor_core::{
     active_angle, clip_relative, color_grade, multicam_target, source_frame_at, transform,
@@ -1159,6 +1159,8 @@ struct PlanLayer {
     pixels: PlanPixels,
     grade: GradeSample,
     filters: FilterSample,
+    stabilize: StabilizeSample,
+    stabilize_keyframes: Vec<editor_media::MotionSample>,
     place: Place,
     label: String,
     width: u32,
@@ -1415,6 +1417,8 @@ fn decode_plan(
                 pixels,
                 grade: layer.grade,
                 filters: layer.filters,
+                stabilize: layer.stabilize,
+                stabilize_keyframes: layer.stabilize_keyframes.clone(),
                 place: layer.place,
                 label: layer.label,
                 width: layer.width,
@@ -1501,6 +1505,8 @@ fn program_from_plan(layer: &PlanLayer) -> ProgramLayer {
         height: layer.height,
         grade: layer.grade.clone(),
         filters: layer.filters.clone(),
+        stabilize: layer.stabilize,
+        stabilize_keyframes: layer.stabilize_keyframes.clone(),
         place: layer.place,
         label: layer.label.clone(),
         using_proxy: false,
