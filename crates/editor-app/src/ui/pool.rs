@@ -17,6 +17,9 @@ pub fn media_pool(ui: &mut egui::Ui, app: &mut MeridianApp) {
         if widgets::ghost_button(ui, "New Title") {
             app.add_title();
         }
+        if widgets::ghost_button(ui, "New Adjustment Layer") {
+            app.add_adjustment_layer();
+        }
     });
     proxy_bar(ui, app);
 

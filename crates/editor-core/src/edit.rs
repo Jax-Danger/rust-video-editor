@@ -1512,6 +1512,7 @@ pub fn clip_from_media(
         },
         volume: crate::effects::AnimatedF32::constant(1.0),
         title: None,
+        adjustment: false,
         speed: ClipSpeed::normal(),
     })
 }
@@ -1547,6 +1548,41 @@ pub fn add_title(
     let track_id = ensure_title_track(project, sequence_id, at.0, end)?;
     let id = ClipId(project.alloc());
     let clip = Clip::generator(id.0, at.0, end, timebase, Title::new(text));
+    overwrite_clips(project, sequence_id, vec![(track_id, clip)])?;
+    Ok(id)
+}
+
+/// Place a five-second adjustment layer at `at` on the highest video track that
+/// has room. If every video track is busy, a new video track is added on top.
+pub fn add_adjustment_layer(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    at: Frame,
+    name: &str,
+) -> Result<ClipId, EditError> {
+    if at.0 < 0 {
+        return Err(EditError::OutOfRange);
+    }
+    let name = {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            "Adjustment"
+        } else {
+            trimmed
+        }
+    };
+    let timebase = project
+        .sequence(sequence_id)
+        .ok_or(EditError::SequenceNotFound)?
+        .timebase;
+    let mut duration = (timebase.fps_f64() * 5.0).round() as i64;
+    if duration < 1 {
+        duration = 1;
+    }
+    let end = at.0.saturating_add(duration);
+    let track_id = ensure_title_track(project, sequence_id, at.0, end)?;
+    let id = ClipId(project.alloc());
+    let clip = Clip::adjustment_layer(id.0, at.0, end, timebase, name);
     overwrite_clips(project, sequence_id, vec![(track_id, clip)])?;
     Ok(id)
 }
@@ -2897,6 +2933,45 @@ mod tests {
             relink_media(&mut loaded, MediaId(99), &replacement),
             Err(EditError::MediaNotFound)
         );
+    }
+
+    #[test]
+    fn adjustment_round_trips_and_old_clips_stay_unadjusted() {
+        let clip = Clip::basic(1, 0, 24);
+        let json = serde_json::to_string(&clip).unwrap();
+        assert!(!json.contains("adjustment"));
+        let loaded: Clip = serde_json::from_str(&json).unwrap();
+        assert!(!loaded.adjustment);
+
+        let adjusted = Clip::adjustment_layer(7, 0, 48, Timebase::fps_24(), "Warm wash");
+        let json = serde_json::to_string(&adjusted).unwrap();
+        assert!(json.contains("\"adjustment\":true"));
+        let loaded: Clip = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded, adjusted);
+        assert!(loaded.is_adjustment());
+        assert_eq!(loaded.name, "Warm wash");
+    }
+
+    #[test]
+    fn add_adjustment_layer_uses_a_free_video_track() {
+        let (sequence, track) = video_sequence();
+        let mut project = project_with(sequence);
+        sequence_busy(&mut project, track);
+        let id =
+            add_adjustment_layer(&mut project, SequenceId(1), Frame(0), "  Grade  ").unwrap();
+        let clip = project.active().unwrap().clip(id).unwrap();
+        assert!(clip.is_adjustment());
+        assert_eq!(clip.name, "Grade");
+        assert_eq!(clip.timeline_in, Frame(0));
+        assert!(clip.duration() >= 24);
+        assert_ne!(
+            project.active().unwrap().locate_clip(id).unwrap().0,
+            0,
+            "a busy V1 should not be overwritten"
+        );
+        let json = project.to_json_pretty().unwrap();
+        let loaded = Project::from_json(&json).unwrap();
+        assert!(loaded.active().unwrap().clip(id).unwrap().is_adjustment());
     }
 
     #[test]

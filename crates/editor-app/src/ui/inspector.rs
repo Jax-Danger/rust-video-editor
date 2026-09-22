@@ -64,6 +64,13 @@ fn inspector_body(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId, sna
                         .monospace()
                         .color(THEME.text_mute),
                 );
+            } else if snapshot.is_adjustment {
+                ui.label(
+                    RichText::new("Adjustment layer")
+                        .size(11.0)
+                        .monospace()
+                        .color(THEME.text_mute),
+                );
             } else {
                 ui.label(
                     RichText::new(format!(
@@ -83,7 +90,7 @@ fn inspector_body(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId, sna
 
     if snapshot.is_title {
         title_controls(ui, app, clip_id);
-    } else {
+    } else if !snapshot.is_adjustment {
         speed_controls(ui, app, clip_id);
     }
 
@@ -298,6 +305,7 @@ struct ClipSnap {
     track_name: String,
     kind: TrackKind,
     is_title: bool,
+    is_adjustment: bool,
     timeline_in: i64,
     timeline_out: i64,
     source_in: i64,
@@ -633,6 +641,7 @@ fn clip_snapshot(app: &MeridianApp, id: ClipId) -> Option<ClipSnap> {
         track_name: sequence.tracks[ti].name.clone(),
         kind: sequence.tracks[ti].kind,
         is_title: clip.is_title(),
+        is_adjustment: clip.is_adjustment(),
         timeline_in: clip.timeline_in.0,
         timeline_out: clip.timeline_out.0,
         source_in: clip.source_in.0,

@@ -160,7 +160,13 @@ The inspector **Effects** section (video clips) adds stackable filters that run 
 | Crop | Left / right / top / bottom insets (letterbox/pillarbox) |
 | Sharpen | Unsharp-mask strength |
 
-Filter parameters are `AnimatedF32` like grade and transform. Adjustment layers (a clip that grades everything below) are not implemented yet — use a higher track for now.
+Filter parameters are `AnimatedF32` like grade and transform.
+
+## Adjustment layers
+
+**File → New Adjustment Layer**, or **New Adjustment Layer** in the media pool, drops a five-second adjustment clip on the highest video track that has room at the playhead. If every video track is busy, Meridian adds a track and places the layer there. The clip is selected so the inspector can edit grade, transform, and effects.
+
+An adjustment layer has no media file and no pixels of its own. For its duration it grades and filters everything visually below it on the timeline — lower video tracks and any clips on the same track that composite before it — then higher tracks paint on top unchanged. Preview and Deliver both run through the shared `compose_layers` path. The timeline labels the clip `A` plus its name. The `adjustment` flag round-trips in project JSON; older projects load with adjustment clips off.
 
 ## Titles
 
@@ -388,7 +394,7 @@ A progress bar follows ffmpeg's `out_time`. **Cancel** sends `SIGTERM`. A failed
 
 ## Tests
 
-`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, deliver presets (apply, custom JSON, last-settings round-trip), the sample project round-trip, imported media paths in JSON, proxy attach and relink, timeline culling on an 800-clip sequence, ruler spacing across an hour, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, proxy argument planning and preview fallback, the disk frame cache, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, pan, fader, burned captions, deliver bitrate hints, audio-only WAV planning, retimed source frames, muted retimed audio), the mix bus (pan law, mute, solo, keyframed gain, peak and RMS), clip speed (constant 25–400%, reverse, a linear ramp, JSON round-trip, and duration ripple), and the shared composite (luma curve, lift/gamma/gain wheels, grade split, dissolve mix, wipe angle, push, dip, slide, blur dissolve, iris, clip filters, anchor, caption burn-in). It does not spawn ffmpeg or whisper.
+`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, deliver presets (apply, custom JSON, last-settings round-trip), the sample project round-trip, imported media paths in JSON, proxy attach and relink, timeline culling on an 800-clip sequence, ruler spacing across an hour, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, proxy argument planning and preview fallback, the disk frame cache, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, pan, fader, burned captions, deliver bitrate hints, audio-only WAV planning, retimed source frames, muted retimed audio), the mix bus (pan law, mute, solo, keyframed gain, peak and RMS), clip speed (constant 25–400%, reverse, a linear ramp, JSON round-trip, and duration ripple), adjustment layers (JSON round-trip, track placement, composite stacking), and the shared composite (luma curve, lift/gamma/gain wheels, grade split, dissolve mix, wipe angle, push, dip, slide, blur dissolve, iris, clip filters, anchor, caption burn-in, adjustment grade-below). It does not spawn ffmpeg or whisper.
 
 `cargo test -p editor-media --features ffmpeg` also encodes a short H.264/AAC mp4 when `ffmpeg` is on `PATH`. `cargo test -p editor-app --features whisper` builds the local speech-to-text path; the binary and model are resolved at runtime, not at compile time.
 
@@ -396,7 +402,6 @@ A progress bar follows ffmpeg's `out_time`. **Cancel** sends `SIGTERM`. A failed
 
 - Pitch-preserving audio resample for retimed clips. Picture speed is sampled in preview and export; retimed audio is muted so it does not drift
 - GPU viewer. The CPU composite already stacks tracks, grades, transforms, eight transitions, and four clip filters; it is not a full optical-flow or blend-mode engine
-- Adjustment layers (grade/effects everything below on a track)
 - Fairlight-class dynamics, EQ, and track sends. The mixer already has faders, pan, mute, solo, meters, and keyframed clip gain
 - OFX-style plugins for third-party effects
 - Scene-linear grading and a hinted caption font. Preview and export already share the display-space formula and the bitmap burn-in
