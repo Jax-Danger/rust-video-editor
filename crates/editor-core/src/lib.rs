@@ -4,6 +4,7 @@
 //! seconds are a display and pacing convenience, never the stored edit.
 
 pub mod caption;
+pub mod compressor;
 pub mod deliver;
 pub mod deliver_preset;
 pub mod demo;
@@ -41,11 +42,11 @@ pub use edit::{
     ripple_delete, ripple_trim, ripple_trim_next_to_playhead, ripple_trim_prev_to_playhead,
     roll_cut, set_clip_gain_at, set_clip_speed, set_clip_title,
     set_clip_volume, set_filter_at, set_grade_at, set_in_point, set_luma_curve_point,
-    set_master_fader, set_out_point, set_track_eq, set_track_eq_low_cut, set_track_fader,
-    set_track_flag, set_track_pan,
+    set_master_fader, set_out_point, set_track_compressor, set_track_eq, set_track_eq_low_cut,
+    set_track_fader, set_track_flag, set_track_pan,
     set_transform_at, set_wheel_offsets_at, slide, slip, snap_span, snap_to_targets, update_marker,
     source_frame_at, toggle_filter_key, toggle_grade_key, toggle_transform_key, toggle_volume_key,
-    trim, update_cue_text, EditError, EqBand, SnapHit, SnapKind, SnapPoint, TrackFlag, TrimEdge,
+    trim, update_cue_text,     CompressorParam, EditError, EqBand, SnapHit, SnapKind, SnapPoint, TrackFlag, TrimEdge,
 };
 pub use effects::{
     blur, blur_mut, chroma_key, chroma_key_mut, clip_relative, color_grade, color_grade_mut, crop,
@@ -54,6 +55,13 @@ pub use effects::{
     CropFilter, Effect, FilterKind, FilterParam, GradeParam, Interpolation, KeyframeF32, RgbWheel,
     SharpenFilter, StabilizeFilter, StabilizeKeyframe, ToneCurve, Transform, TransformParam,
     VignetteFilter, WheelChannel, WheelKind,
+};
+pub use compressor::{
+    clamp_attack_ms, clamp_makeup_db, clamp_ratio, clamp_release_ms, clamp_threshold_db,
+    ffmpeg_compressor_filter, format_makeup_db, format_ratio, format_threshold_db, format_time_ms,
+    CompressorProcessor, TrackCompressor, ATTACK_MS_MAX, ATTACK_MS_MIN, DEFAULT_ATTACK_MS,
+    DEFAULT_RELEASE_MS, MAKEUP_DB_MAX, MAKEUP_DB_MIN, RATIO_MAX, RATIO_MIN, RELEASE_MS_MAX,
+    RELEASE_MS_MIN, THRESHOLD_DB_MAX, THRESHOLD_DB_MIN,
 };
 pub use eq::{
     clamp_eq_db, ffmpeg_eq_filters, format_eq_db, process_interleaved, EqProcessor, TrackEq3,
