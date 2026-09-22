@@ -5,8 +5,8 @@ use crate::theme::{self, THEME};
 use crate::ui::format_tc;
 use crate::ui::widgets;
 
-const CODECS: &[&str] = &["H.264", "H.265", "ProRes 422", "ProRes 4444", "DNxHR HQ"];
-const CONTAINERS: &[&str] = &["mp4", "mov", "mxf"];
+const CODECS: &[&str] = &["H.264", "H.265", "ProRes 422", "ProRes 4444", "DNxHR HQ", "PCM"];
+const CONTAINERS: &[&str] = &["mp4", "mov", "mxf", "wav"];
 
 pub fn deliver_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
     let running = app.export_running();
@@ -86,12 +86,60 @@ fn deliver_card(
     }
     ui.add_space(8.0);
     ui.label(
-                RichText::new(
-                    "Export runs the same composite as the program monitor — stacked tracks, grade, transform, dissolves, wipes, pushes, and burned captions — then ffmpeg encodes it. H.264 / AAC in an mp4 is the tested path.",
-                )
-                .size(12.5)
-                .color(THEME.text_dim),
-            );
+        RichText::new(
+            "Export runs the same composite as the program monitor — stacked tracks, grade, transform, dissolves, wipes, pushes, and burned captions — then ffmpeg encodes it. H.264 / AAC in an mp4 is the tested path.",
+        )
+        .size(12.5)
+        .color(THEME.text_dim),
+    );
+
+    ui.add_space(16.0);
+    widgets::section_label(ui, "Preset");
+    ui.add_space(8.0);
+    let presets = app.deliver_presets();
+    let selected_name = presets
+        .iter()
+        .find(|preset| preset.id == app.deliver.preset_id)
+        .map(|preset| preset.name.as_str())
+        .unwrap_or("Custom");
+    let mut preset_changed = None;
+    egui::ComboBox::from_id_salt("deliver_preset")
+        .width(320.0)
+        .selected_text(selected_name)
+        .show_ui(ui, |ui| {
+            for preset in &presets {
+                if ui
+                    .selectable_value(
+                        &mut app.deliver.preset_id,
+                        preset.id.clone(),
+                        &preset.name,
+                    )
+                    .clicked()
+                {
+                    preset_changed = Some(preset.id.clone());
+                }
+            }
+            if ui
+                .selectable_value(&mut app.deliver.preset_id, "custom".into(), "Custom")
+                .clicked()
+            {
+                preset_changed = Some("custom".into());
+            }
+        });
+    if let Some(preset_id) = preset_changed {
+        if preset_id != "custom" {
+            app.apply_deliver_preset(&preset_id);
+        } else {
+            app.deliver.report = "Custom settings — tweak codec and path below.".into();
+        }
+    }
+    if let Some(preset) = presets.iter().find(|p| p.id == app.deliver.preset_id) {
+        ui.label(
+            RichText::new(&preset.description)
+                .size(12.0)
+                .color(THEME.text_mute),
+        );
+    }
 
     ui.add_space(16.0);
     widgets::section_label(ui, "Format");
@@ -122,14 +170,54 @@ fn deliver_card(
             });
     });
     ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.checkbox(
+            &mut app.deliver.use_in_out,
+            "Limit to the marked in and out",
+        );
+        ui.add_space(12.0);
+        ui.checkbox(
+            &mut app.deliver.burn_captions,
+            "Burn captions into the picture",
+        );
+    });
     ui.checkbox(
-        &mut app.deliver.use_in_out,
-        "Limit to the marked in and out",
+        &mut app.deliver.audio_only,
+        "Audio only (skip picture encode)",
     );
-    ui.checkbox(
-        &mut app.deliver.burn_captions,
-        "Burn captions into the picture",
-    );
+    if app.deliver.audio_only {
+        ui.label(
+            RichText::new("Audio-only exports mix the timeline bus to WAV via ffmpeg.")
+                .size(12.0)
+                .color(THEME.text_mute),
+        );
+    } else if matches!(
+        app.deliver.codec.to_ascii_lowercase().as_str(),
+        "prores 422" | "prores 4444" | "dnxhr hq"
+    ) {
+        ui.label(
+            RichText::new(format!(
+                "{} needs a ffmpeg build with that encoder — otherwise Export reports the ffmpeg error.",
+                app.deliver.codec
+            ))
+            .size(12.0)
+            .color(THEME.text_mute),
+        );
+    }
+    if let Some(video_kbps) = app.deliver.video_bitrate_kbps {
+        ui.label(
+            RichText::new(format!("Video bitrate hint: {video_kbps} kbps"))
+                .size(12.0)
+                .color(THEME.text_mute),
+        );
+    }
+    if let Some(audio_kbps) = app.deliver.audio_bitrate_kbps {
+        ui.label(
+            RichText::new(format!("Audio bitrate hint: {audio_kbps} kbps"))
+                .size(12.0)
+                .color(THEME.text_mute),
+        );
+    }
 
     ui.add_space(12.0);
     widgets::section_label(ui, "Output");
@@ -157,6 +245,37 @@ fn deliver_card(
                 .color(THEME.text_dim),
         );
     }
+
+    ui.add_space(16.0);
+    widgets::section_label(ui, "Save preset");
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Name").size(11.0).color(THEME.text_mute));
+        ui.add(
+            TextEdit::singleline(&mut app.deliver.save_preset_name)
+                .hint_text("My web export")
+                .desired_width(180.0),
+        );
+        ui.add_space(8.0);
+        if widgets::ghost_button(ui, "Save JSON") {
+            if let Err(err) = app.save_custom_deliver_preset() {
+                app.deliver.report = err;
+            }
+        }
+    });
+    ui.add(
+        TextEdit::singleline(&mut app.deliver.save_preset_note)
+            .hint_text("Optional description")
+            .desired_width(520.0),
+    );
+    ui.label(
+        RichText::new(format!(
+            "Custom presets are stored under {}.",
+            editor_core::custom_deliver_preset_dir().display()
+        ))
+        .size(11.5)
+        .color(THEME.text_mute),
+    );
 
     ui.add_space(18.0);
     widgets::section_label(ui, "Sequence");

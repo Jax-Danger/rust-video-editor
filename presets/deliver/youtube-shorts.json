@@ -1,0 +1,11 @@
+{
+  "id": "youtube-shorts",
+  "name": "YouTube Shorts",
+  "description": "Vertical-friendly H.264/AAC mp4 for Shorts and Reels-style delivery.",
+  "codec": "H.264",
+  "container": "mp4",
+  "filename_suffix": "_shorts",
+  "burn_captions": true,
+  "use_in_out": false,
+  "audio_bitrate_kbps": 192
+}

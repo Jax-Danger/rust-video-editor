@@ -20,6 +20,14 @@ use crate::composite::{active_captions, program_stack, ProgramLayer};
 #[cfg(feature = "ffmpeg")]
 use crate::composite::{compose_layers, LayerSource};
 
+/// Optional encoder overrides from a deliver preset or the panel.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EncodeHints {
+    pub video_bitrate_kbps: Option<u32>,
+    pub audio_bitrate_kbps: Option<u32>,
+    pub audio_only: bool,
+}
+
 /// One audible region. Times are sequence frames; `source_at_in` is seconds
 /// into the media at `timeline_in`.
 #[derive(Clone, Debug)]
@@ -49,6 +57,7 @@ pub struct FfmpegScript {
     pub container: String,
     pub warnings: Vec<String>,
     pub burn_captions: bool,
+    pub audio_only: bool,
     /// Picture is rasterized with the shared compositor, then encoded.
     pub raster: RasterPlan,
 }
@@ -86,9 +95,17 @@ pub fn plan_encode(
     codec: &str,
     container: &str,
     burn_captions: bool,
+    hints: EncodeHints,
 ) -> Result<FfmpegScript, String> {
     let (range_in, range_out) = export_bounds(sequence, range)?;
     let mut warnings = Vec::new();
+    let audio_only = hints.audio_only || is_audio_only_codec(codec, container);
+    if audio_only && burn_captions {
+        warnings.push(
+            "Captions are not burned into an audio-only export; use a video preset instead."
+                .into(),
+        );
+    }
     let width = even_dim(sequence.width);
     let height = even_dim(sequence.height);
     let fps = fps_token(sequence.timebase);
@@ -105,24 +122,29 @@ pub fn plan_encode(
         sequence.master_fader,
     );
 
+    let burn = burn_captions && !audio_only;
     let mut frames = Vec::with_capacity((range_out - range_in) as usize);
-    for frame in range_in..range_out {
-        let stack = program_stack(sequence, media, frame, width, height);
-        if let Some(error) = stack.errors.first() {
-            return Err(error.clone());
+    if !audio_only {
+        for frame in range_in..range_out {
+            let stack = program_stack(sequence, media, frame, width, height);
+            if let Some(error) = stack.errors.first() {
+                return Err(error.clone());
+            }
+            let captions = if burn {
+                active_captions(sequence, frame)
+            } else {
+                Vec::new()
+            };
+            frames.push(RasterFrame {
+                layers: stack.layers,
+                captions,
+            });
         }
-        let captions = if burn_captions {
-            active_captions(sequence, frame)
-        } else {
-            Vec::new()
-        };
-        frames.push(RasterFrame {
-            layers: stack.layers,
-            captions,
-        });
-    }
-    if frames.is_empty() {
-        return Err("nothing to export".into());
+        if frames.is_empty() {
+            return Err("nothing to export".into());
+        }
+    } else if pieces.is_empty() {
+        return Err("no audible audio in the export range".into());
     }
 
     let cues = caption_cues(sequence, range_in, range_out);
@@ -135,10 +157,11 @@ pub fn plan_encode(
         audio_label: audio,
         srt,
         duration_secs: dur,
-        codec_args: codec_args(codec),
+        codec_args: codec_args(codec, container, &hints),
         container: container_name(container).to_string(),
         warnings,
-        burn_captions,
+        burn_captions: burn,
+        audio_only,
         raster: RasterPlan {
             width,
             height,
@@ -307,6 +330,9 @@ fn encode_blocking(
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     shared: &std::sync::Arc<std::sync::Mutex<ExportSnapshot>>,
 ) -> Result<(), String> {
+    if script.audio_only {
+        return encode_audio_only_blocking(script, output, cancel, shared);
+    }
     let temp = std::env::temp_dir().join(format!(
         "meridian-export-{}-{}",
         std::process::id(),
@@ -451,6 +477,111 @@ fn encode_blocking(
     if let Err(err) = write_result {
         return Err(err);
     }
+    if !status.success() {
+        let detail = stderr_tail(&stderr_text);
+        return Err(if detail.is_empty() {
+            format!("ffmpeg exited with {status}")
+        } else {
+            format!("ffmpeg failed: {detail}")
+        });
+    }
+    if !output.is_file() {
+        return Err("ffmpeg exited cleanly but wrote no file".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "ffmpeg")]
+fn encode_audio_only_blocking(
+    script: &FfmpegScript,
+    output: &Path,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    shared: &std::sync::Arc<std::sync::Mutex<ExportSnapshot>>,
+) -> Result<(), String> {
+    let mut command = std::process::Command::new("ffmpeg");
+    command
+        .arg("-y")
+        .arg("-hide_banner")
+        .arg("-nostats")
+        .arg("-stats_period")
+        .arg("0.25")
+        .arg("-progress")
+        .arg("pipe:1");
+    for input in &script.inputs {
+        command.arg("-i").arg(input);
+    }
+    if script.filter.is_empty() {
+        return Err("no audio graph to export".into());
+    }
+    command
+        .arg("-filter_complex")
+        .arg(&script.filter)
+        .arg("-map")
+        .arg(format!("[{}]", script.audio_label))
+        .args(&script.codec_args)
+        .arg("-f")
+        .arg(&script.container)
+        .arg(output);
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            "ffmpeg was not found on PATH".to_string()
+        } else {
+            err.to_string()
+        }
+    })?;
+    let stderr = child.stderr.take();
+    let stderr_handle = std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(mut pipe) = stderr {
+            use std::io::Read;
+            let _ = pipe.read_to_string(&mut text);
+        }
+        text
+    });
+    let cancel_flag = cancel.clone();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_flag = stop.clone();
+    let pid = child.id();
+    let killer = std::thread::spawn(move || {
+        while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = std::process::Command::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(80));
+        }
+    });
+    if let Some(stdout) = child.stdout.take() {
+        use std::io::{BufRead, BufReader};
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = child.kill();
+                break;
+            }
+            if let Some(secs) = progress_seconds(&line) {
+                let fraction = if script.duration_secs > 0.0 {
+                    (secs / script.duration_secs).clamp(0.0, 0.99) as f32
+                } else {
+                    0.0
+                };
+                if let Ok(mut slot) = shared.lock() {
+                    slot.fraction = fraction;
+                    slot.message = format!("Encoding audio {:.0}%", fraction * 100.0);
+                }
+            }
+        }
+    }
+    let status = child.wait().map_err(|err| err.to_string())?;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = killer.join();
+    let stderr_text = stderr_handle.join().unwrap_or_default();
     if !status.success() {
         let detail = stderr_tail(&stderr_text);
         return Err(if detail.is_empty() {
@@ -834,22 +965,54 @@ fn srt_time(secs: f64) -> String {
     format!("{hours:02}:{mins:02}:{whole:02},{millis:03}")
 }
 
-fn codec_args(codec: &str) -> Vec<String> {
-    match codec.trim().to_ascii_lowercase().as_str() {
-        "h.265" | "h265" | "hevc" => split_args(
-            "-c:v libx265 -tag:v hvc1 -preset veryfast -crf 20 -pix_fmt yuv420p -c:a aac -b:a 192k",
-        ),
-        "prores 422" => split_args("-c:v prores_ks -profile:v 2 -pix_fmt yuv422p10le -c:a aac -b:a 192k"),
-        "prores 4444" => {
-            split_args("-c:v prores_ks -profile:v 4 -pix_fmt yuva444p10le -c:a aac -b:a 192k")
-        }
-        "dnxhr hq" | "dnxhr" => {
-            split_args("-c:v dnxhd -profile:v dnxhr_hq -pix_fmt yuv422p -c:a aac -b:a 192k")
-        }
-        _ => split_args(
-            "-c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart",
-        ),
+fn codec_args(codec: &str, container: &str, hints: &EncodeHints) -> Vec<String> {
+    if hints.audio_only || is_audio_only_codec(codec, container) {
+        return split_args("-c:a pcm_s16le -ar 48000");
     }
+    let audio_kbps = hints.audio_bitrate_kbps.unwrap_or(192);
+    let audio = format!("-b:a {audio_kbps}k");
+    match codec.trim().to_ascii_lowercase().as_str() {
+        "h.265" | "h265" | "hevc" => {
+            if let Some(video_kbps) = hints.video_bitrate_kbps {
+                split_args(&format!(
+                    "-c:v libx265 -tag:v hvc1 -preset veryfast -b:v {video_kbps}k -maxrate {video_kbps}k -bufsize {}k -pix_fmt yuv420p -c:a aac {audio}",
+                    video_kbps * 2
+                ))
+            } else {
+                split_args(&format!(
+                    "-c:v libx265 -tag:v hvc1 -preset veryfast -crf 20 -pix_fmt yuv420p -c:a aac {audio}"
+                ))
+            }
+        }
+        "prores 422" => split_args(&format!(
+            "-c:v prores_ks -profile:v 2 -pix_fmt yuv422p10le -c:a aac {audio}"
+        )),
+        "prores 4444" => split_args(&format!(
+            "-c:v prores_ks -profile:v 4 -pix_fmt yuva444p10le -c:a aac {audio}"
+        )),
+        "dnxhr hq" | "dnxhr" => split_args(&format!(
+            "-c:v dnxhd -profile:v dnxhr_hq -pix_fmt yuv422p -c:a aac {audio}"
+        )),
+        _ => {
+            if let Some(video_kbps) = hints.video_bitrate_kbps {
+                split_args(&format!(
+                    "-c:v libx264 -preset veryfast -b:v {video_kbps}k -maxrate {video_kbps}k -bufsize {}k -pix_fmt yuv420p -c:a aac {audio} -movflags +faststart",
+                    video_kbps * 2
+                ))
+            } else {
+                split_args(&format!(
+                    "-c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -c:a aac {audio} -movflags +faststart"
+                ))
+            }
+        }
+    }
+}
+
+fn is_audio_only_codec(codec: &str, container: &str) -> bool {
+    matches!(
+        codec.trim().to_ascii_lowercase().as_str(),
+        "pcm" | "wav" | "audio only" | "audio-only"
+    ) || matches!(container.trim().to_ascii_lowercase().as_str(), "wav")
 }
 
 fn split_args(text: &str) -> Vec<String> {
@@ -893,6 +1056,7 @@ fn container_name(container: &str) -> &'static str {
     match container.trim().to_ascii_lowercase().as_str() {
         "mov" => "mov",
         "mxf" => "mxf",
+        "wav" => "wav",
         _ => "mp4",
     }
 }
@@ -991,7 +1155,16 @@ mod tests {
             asset(3, &voice, false, true),
         ];
         let script =
-            plan_encode(&sequence, &media, ExportRange::InOut, "H.264", "mp4", true).unwrap();
+            plan_encode(
+                &sequence,
+                &media,
+                ExportRange::InOut,
+                "H.264",
+                "mp4",
+                true,
+                EncodeHints::default(),
+            )
+            .unwrap();
         let pip_frame = &script.raster.frames[8];
         assert!(
             pip_frame
@@ -1062,6 +1235,7 @@ mod tests {
             "H.264",
             "mp4",
             false,
+            EncodeHints::default(),
         )
         .unwrap();
         assert!(script
@@ -1081,6 +1255,55 @@ mod tests {
         assert!(script.inputs.iter().any(|path| path.ends_with("keep.wav")));
         assert!(!script.inputs.iter().any(|path| path.ends_with("drop.wav")));
         assert!(script.srt.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deliver_preset_hints_shape_codec_args() {
+        let dir = std::env::temp_dir().join(format!("meridian-plan-hints-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let voice = touch(&dir, "voice.wav");
+        let mut sequence = Sequence::new(SequenceId(1), "Hints", 320, 180, Timebase::fps_24());
+        sequence.add_track(TrackId(2), TrackKind::Audio, "A1");
+        let mut audio = Clip::basic(10, 0, 24);
+        audio.media_id = Some(MediaId(1));
+        sequence.tracks[0].clips = vec![audio];
+        let media = vec![asset(1, &voice, false, true)];
+        let hints = EncodeHints {
+            audio_bitrate_kbps: Some(256),
+            video_bitrate_kbps: Some(8000),
+            audio_only: false,
+        };
+        let script = plan_encode(
+            &sequence,
+            &media,
+            ExportRange::WholeSequence,
+            "H.264",
+            "mp4",
+            false,
+            hints,
+        )
+        .unwrap();
+        let joined = script.codec_args.join(" ");
+        assert!(joined.contains("-b:v 8000k"));
+        assert!(joined.contains("-b:a 256k"));
+
+        let audio_only = plan_encode(
+            &sequence,
+            &media,
+            ExportRange::WholeSequence,
+            "PCM",
+            "wav",
+            false,
+            EncodeHints {
+                audio_only: true,
+                ..EncodeHints::default()
+            },
+        )
+        .unwrap();
+        assert!(audio_only.audio_only);
+        assert!(audio_only.raster.frames.is_empty());
+        assert!(audio_only.codec_args.iter().any(|arg| arg == "pcm_s16le"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1112,6 +1335,7 @@ mod tests {
             "H.264",
             "mp4",
             false,
+            EncodeHints::default(),
         )
         .unwrap();
         assert!(
@@ -1210,6 +1434,7 @@ mod tests {
             "H.264",
             "mp4",
             true,
+            EncodeHints::default(),
         )
         .unwrap();
         let output = dir.join("out.mp4");
@@ -1260,6 +1485,7 @@ mod tests {
             "H.264",
             "mp4",
             true,
+            EncodeHints::default(),
         )
         .unwrap();
         let dir = std::env::temp_dir().join(format!("meridian-demo-export-{}", std::process::id()));
@@ -1317,6 +1543,7 @@ mod tests {
             "H.264",
             "mp4",
             true,
+            EncodeHints::default(),
         )
         .unwrap();
         assert_eq!(script.raster.frames.len(), 1);
@@ -1548,6 +1775,7 @@ mod tests {
             "H.264",
             "mp4",
             true,
+            EncodeHints::default(),
         )
         .unwrap();
         assert!(script

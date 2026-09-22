@@ -118,6 +118,7 @@ struct CaptionRequest {
 }
 
 pub struct DeliverState {
+    pub preset_id: String,
     pub codec: String,
     pub container: String,
     pub use_in_out: bool,
@@ -125,19 +126,59 @@ pub struct DeliverState {
     pub report: String,
     pub burn_captions: bool,
     pub progress: f32,
+    pub video_bitrate_kbps: Option<u32>,
+    pub audio_bitrate_kbps: Option<u32>,
+    pub audio_only: bool,
+    pub save_preset_name: String,
+    pub save_preset_note: String,
+}
+
+impl DeliverState {
+    pub fn from_settings(settings: editor_core::DeliverSettings) -> Self {
+        Self {
+            preset_id: settings.preset_id,
+            codec: settings.codec,
+            container: settings.container,
+            use_in_out: settings.use_in_out,
+            output_path: settings.output_path,
+            report: String::new(),
+            burn_captions: settings.burn_captions,
+            progress: 0.0,
+            video_bitrate_kbps: settings.video_bitrate_kbps,
+            audio_bitrate_kbps: settings.audio_bitrate_kbps,
+            audio_only: settings.audio_only,
+            save_preset_name: String::new(),
+            save_preset_note: String::new(),
+        }
+    }
+
+    pub fn to_settings(&self) -> editor_core::DeliverSettings {
+        editor_core::DeliverSettings {
+            preset_id: self.preset_id.clone(),
+            codec: self.codec.clone(),
+            container: self.container.clone(),
+            use_in_out: self.use_in_out,
+            burn_captions: self.burn_captions,
+            output_path: self.output_path.clone(),
+            video_bitrate_kbps: self.video_bitrate_kbps,
+            audio_bitrate_kbps: self.audio_bitrate_kbps,
+            audio_only: self.audio_only,
+        }
+    }
+
+    #[cfg_attr(not(feature = "ffmpeg"), allow(dead_code))]
+    pub fn encode_hints(&self) -> editor_media::EncodeHints {
+        editor_media::EncodeHints {
+            video_bitrate_kbps: self.video_bitrate_kbps,
+            audio_bitrate_kbps: self.audio_bitrate_kbps,
+            audio_only: self.audio_only,
+        }
+    }
 }
 
 impl Default for DeliverState {
     fn default() -> Self {
-        Self {
-            codec: "H.264".into(),
-            container: "mp4".into(),
-            use_in_out: false,
-            output_path: "/tmp/meridian-export.mp4".into(),
-            report: String::new(),
-            burn_captions: true,
-            progress: 0.0,
-        }
+        Self::from_settings(editor_core::load_last_deliver_settings().unwrap_or_default())
     }
 }
 
@@ -1365,6 +1406,82 @@ impl MeridianApp {
         self.status = "Opened example project — Northline — Opening.".into();
     }
 
+    pub(crate) fn deliver_presets(&self) -> Vec<editor_core::DeliverPreset> {
+        editor_core::all_deliver_presets(Some(&editor_core::custom_deliver_preset_dir()))
+    }
+
+    pub(crate) fn apply_deliver_preset(&mut self, preset_id: &str) {
+        let Some(preset) = self
+            .deliver_presets()
+            .into_iter()
+            .find(|preset| preset.id == preset_id)
+        else {
+            self.deliver.report = format!("Unknown deliver preset “{preset_id}”.");
+            return;
+        };
+        let sequence_name = self
+            .session
+            .project()
+            .active()
+            .map(|seq| seq.name.clone())
+            .unwrap_or_else(|| "export".into());
+        let settings = editor_core::DeliverSettings::from_preset(
+            &preset,
+            &sequence_name,
+            &self.deliver.output_path,
+        );
+        self.deliver = DeliverState::from_settings(settings);
+        self.deliver.report = format!("Applied preset “{}”.", preset.name);
+    }
+
+    pub(crate) fn save_custom_deliver_preset(&mut self) -> Result<(), String> {
+        let name = self.deliver.save_preset_name.trim();
+        if name.is_empty() {
+            return Err("Enter a name for the custom preset.".into());
+        }
+        let id = name
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() {
+                    ch.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string();
+        if id.is_empty() {
+            return Err("Preset name must contain letters or numbers.".into());
+        }
+        let preset = editor_core::DeliverPreset {
+            id: id.clone(),
+            name: name.into(),
+            description: if self.deliver.save_preset_note.trim().is_empty() {
+                format!(
+                    "Custom preset saved from {} / {}",
+                    self.deliver.codec, self.deliver.container
+                )
+            } else {
+                self.deliver.save_preset_note.trim().into()
+            },
+            codec: self.deliver.codec.clone(),
+            container: self.deliver.container.clone(),
+            filename_suffix: format!("_{id}"),
+            burn_captions: self.deliver.burn_captions,
+            use_in_out: self.deliver.use_in_out,
+            video_bitrate_kbps: self.deliver.video_bitrate_kbps,
+            audio_bitrate_kbps: self.deliver.audio_bitrate_kbps,
+            audio_only: self.deliver.audio_only,
+        };
+        let path = editor_core::custom_deliver_preset_dir().join(format!("{id}.json"));
+        editor_core::save_deliver_preset(&path, &preset)
+            .map_err(|err| err.to_string())?;
+        self.deliver.preset_id = id;
+        self.deliver.report = format!("Saved custom preset to {}.", path.display());
+        Ok(())
+    }
+
     pub(crate) fn start_export(&mut self) {
         #[cfg(feature = "ffmpeg")]
         if self
@@ -1386,6 +1503,7 @@ impl MeridianApp {
             ExportRange::WholeSequence
         };
         let output = self.deliver.output_path.clone();
+        let _ = editor_core::save_last_deliver_settings(&self.deliver.to_settings());
         #[cfg(feature = "ffmpeg")]
         {
             match editor_media::plan_encode(
@@ -1395,6 +1513,7 @@ impl MeridianApp {
                 &self.deliver.codec,
                 &self.deliver.container,
                 self.deliver.burn_captions,
+                self.deliver.encode_hints(),
             ) {
                 Ok(script) => {
                     let duration = script.duration_secs;

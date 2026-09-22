@@ -1,0 +1,11 @@
+{
+  "id": "youtube-1080p",
+  "name": "YouTube 1080p",
+  "description": "H.264/AAC mp4 tuned for YouTube upload at sequence resolution.",
+  "codec": "H.264",
+  "container": "mp4",
+  "filename_suffix": "_youtube",
+  "burn_captions": true,
+  "use_in_out": false,
+  "audio_bitrate_kbps": 192
+}

@@ -1,0 +1,11 @@
+{
+  "id": "master-prores",
+  "name": "Master (ProRes 422)",
+  "description": "ProRes 422 in a QuickTime mov for archive and finishing handoff.",
+  "codec": "ProRes 422",
+  "container": "mov",
+  "filename_suffix": "_master",
+  "burn_captions": false,
+  "use_in_out": false,
+  "audio_bitrate_kbps": 256
+}

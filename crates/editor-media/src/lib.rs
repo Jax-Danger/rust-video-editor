@@ -34,7 +34,7 @@ pub use decode::{
     PreviewBackend, AUDIO_CHANNELS, AUDIO_RATE, MAX_AUDIO_SECONDS, MAX_BURST,
     MAX_PREVIEW_DIMENSION,
 };
-pub use export::{caption_font, cues_to_srt, plan_encode, FfmpegScript, WavPiece};
+pub use export::{caption_font, cues_to_srt, plan_encode, EncodeHints, FfmpegScript, WavPiece};
 #[cfg(feature = "ffmpeg")]
 pub use export::{spawn_export, write_timeline_wav, ExportJob, ExportSnapshot};
 pub use frame_cache::{
