@@ -29,7 +29,10 @@ const PREVIEW_MAX_W: u32 = 960;
 const PREVIEW_MAX_H: u32 = 540;
 const PLAY_BURST: u32 = 12;
 const SCRUB_BURST: u32 = 8;
-const SCRUB_H: f32 = 32.0;
+const SCRUB_H: f32 = 28.0;
+const SCRUB_INSET_X: f32 = 16.0;
+const WELL_PAD: f32 = 12.0;
+const WELL_TC_H: f32 = 30.0;
 
 pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
     let Some(sequence) = app.session.project().active().cloned() else {
@@ -190,11 +193,30 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
         ui.allocate_exact_size(Vec2::new(ui.available_width(), monitor_h), Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, THEME.stage);
-    let frame = letterbox(
-        rect.shrink(18.0),
-        sequence.width as f32,
-        sequence.height as f32,
+    let well = rect.shrink(WELL_PAD);
+    painter.rect_filled(well, THEME.radius as f32, THEME.inset);
+    painter.rect_stroke(
+        well,
+        THEME.radius as f32,
+        Stroke::new(1.0_f32, THEME.border),
+        egui::StrokeKind::Inside,
     );
+    let tc_h = WELL_TC_H.min((well.height() * 0.16).max(22.0));
+    let tc_bar = Rect::from_min_max(
+        Pos2::new(well.left(), well.bottom() - tc_h),
+        well.right_bottom(),
+    );
+    painter.hline(
+        tc_bar.x_range(),
+        tc_bar.top(),
+        Stroke::new(1.0_f32, THEME.hairline),
+    );
+    let glass = Rect::from_min_max(
+        well.min + Vec2::new(8.0, 8.0),
+        Pos2::new(well.right() - 8.0, tc_bar.top() - 8.0),
+    );
+    let frame = letterbox(glass, sequence.width as f32, sequence.height as f32);
+    painter.rect_filled(frame.expand(1.0), 0.0, Color32::BLACK);
     painter.rect_stroke(
         frame.expand(1.0),
         0.0,
@@ -238,18 +260,36 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
         paint_caption_burn(&painter, frame, &active_captions(&sequence, app.playhead));
     }
 
+    monitor_corners(&painter, frame);
     let tc = format_tc(app.playhead, sequence.timebase);
-    let pill = Rect::from_min_size(
-        frame.left_top() + Vec2::new(8.0, 8.0),
-        Vec2::new(108.0, 20.0),
-    );
-    painter.rect_filled(pill, 3.0, Color32::from_rgba_unmultiplied(0, 0, 0, 160));
+    let dur = format_tc(sequence.end_frame().0, sequence.timebase);
     painter.text(
-        pill.center(),
-        egui::Align2::CENTER_CENTER,
-        tc,
-        FontId::monospace(12.0),
-        Color32::from_rgb(255, 214, 160),
+        Pos2::new(tc_bar.left() + 12.0, tc_bar.center().y),
+        egui::Align2::LEFT_CENTER,
+        "TC",
+        THEME.font(9.0),
+        THEME.text_mute,
+    );
+    painter.text(
+        Pos2::new(tc_bar.left() + 32.0, tc_bar.center().y),
+        egui::Align2::LEFT_CENTER,
+        &tc,
+        THEME.mono(15.0),
+        THEME.accent,
+    );
+    painter.text(
+        Pos2::new(tc_bar.right() - 12.0, tc_bar.center().y),
+        egui::Align2::RIGHT_CENTER,
+        &dur,
+        THEME.mono(12.0),
+        THEME.text_dim,
+    );
+    painter.text(
+        Pos2::new(tc_bar.right() - 12.0 - 108.0, tc_bar.center().y),
+        egui::Align2::RIGHT_CENTER,
+        "DUR",
+        THEME.font(9.0),
+        THEME.text_mute,
     );
     if let Some(label) = chip {
         let chip_rect = Rect::from_min_size(
@@ -303,9 +343,9 @@ fn follow_viewer_scrub(ui: &egui::Ui, app: &mut MeridianApp) {
     let (Some(pos), Some(bar)) = (pos, app.viewer_bar) else {
         return;
     };
-    // The painted track starts after the "Scrub" label. Match program_scrubber.
-    let track_left = bar.left() + 58.0;
-    let track_right = bar.right() - 16.0;
+    let track = scrub_track(bar);
+    let track_left = track.left();
+    let track_right = track.right();
     let span = (track_right - track_left).max(1.0);
     let t = ((pos.x - track_left) / span).clamp(0.0, 1.0);
     let end = app.viewer_bar_end.max(0);
@@ -318,15 +358,42 @@ fn follow_viewer_scrub(ui: &egui::Ui, app: &mut MeridianApp) {
     app.halt_transport();
 }
 
+fn scrub_track(rect: Rect) -> Rect {
+    Rect::from_min_max(
+        Pos2::new(rect.left() + SCRUB_INSET_X, rect.center().y - 5.0),
+        Pos2::new(rect.right() - SCRUB_INSET_X, rect.center().y + 5.0),
+    )
+}
+
+fn monitor_corners(painter: &Painter, frame: Rect) {
+    let len = 9.0;
+    let stroke = Stroke::new(1.0_f32, THEME.text_mute);
+    let marks = [
+        (frame.left_top(), Vec2::new(len, 0.0), Vec2::new(0.0, len)),
+        (frame.right_top(), Vec2::new(-len, 0.0), Vec2::new(0.0, len)),
+        (
+            frame.left_bottom(),
+            Vec2::new(len, 0.0),
+            Vec2::new(0.0, -len),
+        ),
+        (
+            frame.right_bottom(),
+            Vec2::new(-len, 0.0),
+            Vec2::new(0.0, -len),
+        ),
+    ];
+    for (origin, horizontal, vertical) in marks {
+        painter.line_segment([origin, origin + horizontal], stroke);
+        painter.line_segment([origin, origin + vertical], stroke);
+    }
+}
+
 fn program_scrubber(ui: &mut egui::Ui, app: &mut MeridianApp, end: i64) {
     let (rect, response) = ui.allocate_exact_size(
         Vec2::new(ui.available_width(), SCRUB_H),
         Sense::click_and_drag(),
     );
-    let bar = Rect::from_min_max(
-        Pos2::new(rect.left() + 58.0, rect.center().y - 6.0),
-        Pos2::new(rect.right() - 16.0, rect.center().y + 6.0),
-    );
+    let bar = scrub_track(rect);
     app.viewer_bar = Some(rect);
     app.viewer_bar_end = end.max(0);
     let painter = ui.painter();
@@ -336,14 +403,7 @@ fn program_scrubber(ui: &mut egui::Ui, app: &mut MeridianApp, end: i64) {
         rect.top(),
         Stroke::new(1.0_f32, THEME.hairline),
     );
-    painter.text(
-        Pos2::new(rect.left() + 10.0, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        "Scrub",
-        FontId::proportional(11.0),
-        THEME.text_mute,
-    );
-    painter.rect_filled(bar, 3.0, THEME.inset);
+    painter.rect_filled(bar, 2.0, THEME.inset);
     if let Some(sequence) = app.session.project().active() {
         if let (Some(inn), Some(out)) = (sequence.in_point, sequence.out_point) {
             if end > 0 {

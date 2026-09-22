@@ -163,7 +163,7 @@ fn media_row(
 ) {
     let selected = app.selected_media == Some(id);
     let (rect, response) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width(), 40.0),
+        Vec2::new(ui.available_width(), 36.0),
         Sense::click_and_drag(),
     );
     let painter = ui.painter();
@@ -179,8 +179,8 @@ fn media_row(
     }
 
     let thumb = Rect::from_min_size(
-        pos2(rect.left() + 10.0, rect.top() + 8.0),
-        Vec2::new(36.0, 24.0),
+        pos2(rect.left() + 8.0, rect.top() + 6.0),
+        Vec2::new(32.0, 24.0),
     );
     let thumb_color = if has_video {
         THEME.video
@@ -216,10 +216,10 @@ fn media_row(
     }
 
     painter.text(
-        pos2(thumb.right() + 8.0, rect.top() + 8.0),
+        pos2(thumb.right() + 8.0, rect.top() + 4.0),
         Align2::LEFT_TOP,
         name,
-        FontId::new(12.5, egui::FontFamily::Proportional),
+        THEME.font(12.0),
         THEME.text,
     );
     let path = app
@@ -240,10 +240,10 @@ fn media_row(
         }
     };
     painter.text(
-        pos2(thumb.right() + 8.0, rect.top() + 23.0),
+        pos2(thumb.right() + 8.0, rect.top() + 19.0),
         Align2::LEFT_TOP,
         meta,
-        FontId::new(10.5, egui::FontFamily::Proportional),
+        THEME.font(10.0),
         THEME.text_mute,
     );
     if missing {

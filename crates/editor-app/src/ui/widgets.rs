@@ -5,24 +5,25 @@ use egui::{
     Stroke, Ui, Vec2,
 };
 
-use crate::theme::THEME;
+use crate::theme::{self, THEME};
 
 pub fn panel_header(ui: &mut Ui, title: &str, extras: impl FnOnce(&mut Ui)) {
     let width = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, theme::HEADER_H), Sense::hover());
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, THEME.header);
-    painter.hline(
-        rect.x_range(),
-        rect.bottom(),
-        Stroke::new(1.0_f32, THEME.hairline),
-    );
+    painter.hline(rect.x_range(), rect.bottom(), theme::hairline_stroke());
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(rect.shrink2(Vec2::new(10.0, 0.0)))
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
-    child.label(RichText::new(title).size(12.0).strong().color(THEME.text));
+    child.label(
+        RichText::new(title)
+            .font(THEME.font(11.0))
+            .strong()
+            .color(THEME.text),
+    );
     child.with_layout(egui::Layout::right_to_left(egui::Align::Center), extras);
 }
 
@@ -50,11 +51,44 @@ pub fn section_label(ui: &mut Ui, title: &str) {
 
 pub fn hairline(ui: &mut Ui) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
-    ui.painter().hline(
+    ui.painter()
+        .hline(rect.x_range(), rect.center().y, theme::hairline_stroke());
+}
+
+pub fn v_hairline(ui: &mut Ui, height: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(9.0, height), Sense::hover());
+    ui.painter().vline(
+        rect.center().x,
+        rect.y_range().shrink(6.0),
+        theme::hairline_stroke(),
+    );
+}
+
+/// Horizontal splitter between two stacked regions. Returns the drag delta in
+/// points (positive moves the split downward).
+pub fn h_split(ui: &mut Ui) -> f32 {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 6.0), Sense::drag());
+    let hot = response.hovered() || response.dragged();
+    let painter = ui.painter();
+    if hot {
+        painter.rect_filled(rect, 0.0, THEME.header);
+    }
+    painter.hline(
         rect.x_range(),
         rect.center().y,
-        Stroke::new(1.0_f32, THEME.hairline),
+        Stroke::new(1.0_f32, if hot { THEME.accent } else { THEME.border }),
     );
+    if hot {
+        response
+            .clone()
+            .on_hover_cursor(egui::CursorIcon::ResizeVertical);
+    }
+    if response.dragged() {
+        response.drag_delta().y
+    } else {
+        0.0
+    }
 }
 
 pub fn empty_note(ui: &mut Ui, text: &str) {
@@ -71,7 +105,7 @@ pub fn tool_cell(
     tip: &str,
     icon: impl FnOnce(&Painter, Rect),
 ) -> bool {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(52.0, 40.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(44.0, 36.0), Sense::click());
     let painter = ui.painter();
     let fill = if active {
         THEME.accent_dim
@@ -80,25 +114,29 @@ pub fn tool_cell(
     } else {
         Color32::TRANSPARENT
     };
-    painter.rect_filled(rect, 3.0, fill);
+    painter.rect_filled(rect, THEME.radius as f32, fill);
     if active {
         painter.hline(
-            rect.x_range().shrink(8.0),
+            rect.x_range().shrink(6.0),
             rect.bottom() - 1.0,
             Stroke::new(2.0_f32, THEME.accent),
         );
     }
     let icon_rect = Rect::from_center_size(
-        pos2(rect.center().x, rect.top() + 14.0),
+        pos2(rect.center().x, rect.top() + 13.0),
         Vec2::new(16.0, 16.0),
     );
     icon(painter, icon_rect);
     painter.text(
-        pos2(rect.center().x, rect.bottom() - 8.0),
+        pos2(rect.center().x, rect.bottom() - 7.0),
         Align2::CENTER_CENTER,
         caption,
-        FontId::new(9.0, egui::FontFamily::Proportional),
-        if active { THEME.accent } else { THEME.text_dim },
+        THEME.mono(9.0),
+        if active {
+            THEME.accent
+        } else {
+            THEME.text_mute
+        },
     );
     let _ = id;
     response.on_hover_text(tip).clicked()
@@ -345,48 +383,79 @@ fn paint_diamond(painter: &Painter, rect: Rect, filled: bool) {
 
 pub fn workspace_modes(ui: &mut Ui, selected: usize, labels: &[&str]) -> Option<usize> {
     let mut clicked = None;
-    let pad = 3.0;
-    let tab_w = 78.0;
-    let tab_h = 22.0;
-    let width = labels.len() as f32 * tab_w + pad * 2.0;
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, tab_h + pad * 2.0), Sense::hover());
+    let tab_w = 76.0;
+    let tab_h = 26.0;
+    let width = labels.len() as f32 * tab_w;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, tab_h), Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, 4.0, THEME.inset);
-    painter.rect_stroke(
-        rect,
-        4.0,
-        Stroke::new(1.0_f32, THEME.hairline),
-        egui::StrokeKind::Inside,
-    );
+    painter.hline(rect.x_range(), rect.bottom(), theme::hairline_stroke());
     for (index, label) in labels.iter().enumerate() {
         let tab = Rect::from_min_size(
-            pos2(rect.left() + pad + index as f32 * tab_w, rect.top() + pad),
-            Vec2::new(tab_w - 1.0, tab_h),
+            pos2(rect.left() + index as f32 * tab_w, rect.top()),
+            Vec2::new(tab_w, tab_h),
         );
         let response = ui.interact(tab, Id::new(("workspace", label)), Sense::click());
         let on = index == selected;
         if on {
-            painter.rect_filled(tab, 3.0, THEME.control);
+            painter.rect_filled(tab, 0.0, THEME.panel);
             painter.hline(
-                (tab.left() + 10.0)..=(tab.right() - 10.0),
+                tab.x_range(),
                 tab.bottom() - 1.0,
                 Stroke::new(2.0_f32, THEME.accent),
             );
         } else if response.hovered() {
-            painter.rect_filled(tab, 3.0, THEME.header);
+            painter.rect_filled(tab, 0.0, THEME.header);
+        }
+        if index > 0 {
+            painter.vline(
+                tab.left(),
+                tab.y_range().shrink(6.0),
+                theme::hairline_stroke(),
+            );
         }
         painter.text(
             tab.center() - Vec2::new(0.0, 1.0),
             Align2::CENTER_CENTER,
             *label,
-            FontId::new(12.0, egui::FontFamily::Proportional),
+            THEME.font(12.0),
             if on { THEME.text } else { THEME.text_dim },
         );
         if response.clicked() {
             clicked = Some(index);
         }
+        let _ = response.on_hover_text(format!("{label} workspace"));
     }
     clicked
+}
+
+pub fn timecode_well(ui: &mut Ui, caption: &str, value: &str, primary: bool) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(124.0, 32.0), Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, THEME.radius as f32, THEME.inset);
+    painter.rect_stroke(
+        rect,
+        THEME.radius as f32,
+        theme::hairline_stroke(),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        pos2(rect.left() + 6.0, rect.top() + 3.0),
+        Align2::LEFT_TOP,
+        caption,
+        THEME.font(8.5),
+        THEME.text_mute,
+    );
+    painter.text(
+        pos2(rect.center().x, rect.bottom() - 10.0),
+        Align2::CENTER_CENTER,
+        value,
+        THEME.mono(13.0),
+        if primary {
+            THEME.accent
+        } else {
+            THEME.text_dim
+        },
+    );
 }
 
 pub fn mini_slider(ui: &mut Ui, value: f32, range: std::ops::RangeInclusive<f32>) -> Option<f32> {
@@ -417,21 +486,25 @@ pub fn mini_slider(ui: &mut Ui, value: f32, range: std::ops::RangeInclusive<f32>
 }
 
 pub fn readout(ui: &mut Ui, text: &str, width: f32, emphasis: bool) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 26.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 20.0), Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, 3.0, THEME.inset);
+    painter.rect_filled(rect, THEME.radius as f32, THEME.inset);
     painter.rect_stroke(
         rect,
-        3.0,
-        Stroke::new(1.0_f32, THEME.hairline),
+        THEME.radius as f32,
+        theme::hairline_stroke(),
         egui::StrokeKind::Inside,
     );
     painter.text(
         rect.center(),
         Align2::CENTER_CENTER,
         text,
-        FontId::new(13.0, egui::FontFamily::Monospace),
-        if emphasis { THEME.text } else { THEME.text_dim },
+        THEME.mono(11.0),
+        if emphasis {
+            THEME.accent
+        } else {
+            THEME.text_dim
+        },
     );
 }
 
@@ -455,7 +528,7 @@ pub fn transport_glyph(ui: &mut Ui, tip: &str, draw: impl FnOnce(&Painter, Rect)
 }
 
 pub fn play_button(ui: &mut Ui, playing: bool) -> bool {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(34.0, 26.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(36.0, 28.0), Sense::click());
     let painter = ui.painter();
     let fill = if response.hovered() {
         Color32::from_rgb(84, 224, 198)

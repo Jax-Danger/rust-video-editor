@@ -1,5 +1,6 @@
 //! Immediate-mode panels for the Meridian shell.
 
+mod audio_slot;
 mod captions;
 mod deliver;
 mod inspector;
@@ -10,6 +11,7 @@ pub mod widgets;
 
 use editor_core::{Frame, Timebase};
 
+pub use audio_slot::audio_workspace;
 pub use captions::captions_panel;
 pub use deliver::deliver_panel;
 pub use inspector::inspector_panel;

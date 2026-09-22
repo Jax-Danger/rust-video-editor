@@ -59,6 +59,7 @@ impl Tool {
 pub enum Workspace {
     Edit,
     Colour,
+    Audio,
     Deliver,
 }
 
@@ -150,6 +151,8 @@ pub struct MeridianApp {
     pub linked_selection: bool,
     pub snap_enabled: bool,
     pub workspace: Workspace,
+    /// Fraction of the library column given to the media pool. The rest is captions.
+    pub pool_split: f32,
     pub pixels_per_frame: f32,
     pub timeline_width: f32,
     pub playing: bool,
@@ -193,6 +196,7 @@ impl MeridianApp {
             linked_selection: true,
             snap_enabled: true,
             workspace: Workspace::Edit,
+            pool_split: 0.62,
             pixels_per_frame: 4.0,
             timeline_width: 900.0,
             playing: false,
@@ -1403,12 +1407,14 @@ impl eframe::App for MeridianApp {
         self.toolbar(ctx);
         self.status_bar(ctx);
 
+        let (timeline_h, pool_w, inspector_w) = shell_sizes(ctx);
+        let max_timeline = (ctx.screen_rect().height() * 0.68).max(360.0);
         egui::TopBottomPanel::bottom("timeline")
             .resizable(true)
-            .default_height(360.0)
-            .min_height(220.0)
+            .default_height(timeline_h)
+            .height_range(220.0..=max_timeline)
             .frame(theme::panel_frame())
-            .show_separator_line(false)
+            .show_separator_line(true)
             .show(ctx, |ui| {
                 ui::timeline_panel(ui, self);
             });
@@ -1417,24 +1423,17 @@ impl eframe::App for MeridianApp {
             Workspace::Edit => {
                 egui::SidePanel::left("library")
                     .resizable(true)
-                    .default_width(300.0)
-                    .width_range(240.0..=460.0)
+                    .default_width(pool_w)
+                    .width_range(220.0..=440.0)
                     .frame(theme::panel_frame())
-                    .show_separator_line(false)
-                    .show(ctx, |ui| {
-                        let height = ui.available_height();
-                        ui.allocate_ui(egui::vec2(ui.available_width(), height * 0.56), |ui| {
-                            ui::media_pool(ui, self);
-                        });
-                        ui::widgets::hairline(ui);
-                        ui::captions_panel(ui, self);
-                    });
+                    .show_separator_line(true)
+                    .show(ctx, |ui| library_column(ui, self));
                 egui::SidePanel::right("inspector")
                     .resizable(true)
-                    .default_width(332.0)
-                    .width_range(280.0..=480.0)
+                    .default_width(inspector_w)
+                    .width_range(260.0..=480.0)
                     .frame(theme::panel_frame())
-                    .show_separator_line(false)
+                    .show_separator_line(true)
                     .show(ctx, |ui| ui::inspector_panel(ui, self));
                 egui::CentralPanel::default()
                     .frame(theme::chrome_frame().fill(theme::THEME.stage))
@@ -1443,14 +1442,19 @@ impl eframe::App for MeridianApp {
             Workspace::Colour => {
                 egui::SidePanel::right("colour_inspector")
                     .resizable(true)
-                    .default_width(380.0)
-                    .width_range(300.0..=520.0)
+                    .default_width((inspector_w + 56.0).min(460.0))
+                    .width_range(300.0..=540.0)
                     .frame(theme::panel_frame())
-                    .show_separator_line(false)
+                    .show_separator_line(true)
                     .show(ctx, |ui| ui::inspector_panel(ui, self));
                 egui::CentralPanel::default()
                     .frame(theme::chrome_frame().fill(theme::THEME.stage))
                     .show(ctx, |ui| ui::viewer_panel(ui, self));
+            }
+            Workspace::Audio => {
+                egui::CentralPanel::default()
+                    .frame(theme::panel_frame())
+                    .show(ctx, |ui| ui::audio_workspace(ui, self));
             }
             Workspace::Deliver => {
                 egui::CentralPanel::default()
@@ -1470,9 +1474,12 @@ impl MeridianApp {
     fn menu_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("menu")
             .frame(theme::chrome_frame())
-            .exact_height(36.0)
+            .exact_height(theme::MENU_H)
             .show_separator_line(false)
             .show(ctx, |ui| {
+                let bar = ui.max_rect();
+                ui.painter()
+                    .hline(bar.x_range(), bar.bottom(), theme::hairline_stroke());
                 egui::menu::bar(ui, |ui| {
                     brand_mark(ui);
                     ui.add_space(4.0);
@@ -1636,92 +1643,91 @@ impl MeridianApp {
     fn toolbar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("toolbar")
             .frame(theme::chrome_frame().fill(theme::THEME.panel))
-            .exact_height(52.0)
-            .show_separator_line(false)
+            .exact_height(theme::TOOLBAR_H)
+            .show_separator_line(true)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    ui.add_space(6.0);
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.add_space(theme::SPACE_SM);
                     let tool = self.tool;
-                    if ui::widgets::tool_cell(
-                        ui,
-                        "select",
-                        "Select",
-                        tool == Tool::Select,
-                        Tool::Select.hint(),
-                        ui::widgets::paint_select,
-                    ) {
-                        self.tool = Tool::Select;
+                    for (id, shortcut, active, hint, icon) in [
+                        (
+                            "select",
+                            "V",
+                            tool == Tool::Select,
+                            Tool::Select.hint(),
+                            ui::widgets::paint_select as fn(&egui::Painter, egui::Rect),
+                        ),
+                        (
+                            "razor",
+                            "C",
+                            tool == Tool::Razor,
+                            Tool::Razor.hint(),
+                            ui::widgets::paint_razor,
+                        ),
+                        (
+                            "ripple",
+                            "B",
+                            tool == Tool::Ripple,
+                            Tool::Ripple.hint(),
+                            ui::widgets::paint_ripple,
+                        ),
+                        (
+                            "roll",
+                            "N",
+                            tool == Tool::Roll,
+                            Tool::Roll.hint(),
+                            ui::widgets::paint_roll,
+                        ),
+                        (
+                            "slip",
+                            "Y",
+                            tool == Tool::Slip,
+                            Tool::Slip.hint(),
+                            ui::widgets::paint_slip,
+                        ),
+                        (
+                            "slide",
+                            "U",
+                            tool == Tool::Slide,
+                            Tool::Slide.hint(),
+                            ui::widgets::paint_slide,
+                        ),
+                    ] {
+                        if ui::widgets::tool_cell(ui, id, shortcut, active, hint, icon) {
+                            self.tool = match shortcut {
+                                "C" => Tool::Razor,
+                                "B" => Tool::Ripple,
+                                "N" => Tool::Roll,
+                                "Y" => Tool::Slip,
+                                "U" => Tool::Slide,
+                                _ => Tool::Select,
+                            };
+                        }
                     }
-                    if ui::widgets::tool_cell(
-                        ui,
-                        "razor",
-                        "Razor",
-                        tool == Tool::Razor,
-                        Tool::Razor.hint(),
-                        ui::widgets::paint_razor,
-                    ) {
-                        self.tool = Tool::Razor;
-                    }
-                    if ui::widgets::tool_cell(
-                        ui,
-                        "ripple",
-                        "Ripple",
-                        tool == Tool::Ripple,
-                        Tool::Ripple.hint(),
-                        ui::widgets::paint_ripple,
-                    ) {
-                        self.tool = Tool::Ripple;
-                    }
-                    if ui::widgets::tool_cell(
-                        ui,
-                        "roll",
-                        "Roll",
-                        tool == Tool::Roll,
-                        Tool::Roll.hint(),
-                        ui::widgets::paint_roll,
-                    ) {
-                        self.tool = Tool::Roll;
-                    }
-                    if ui::widgets::tool_cell(
-                        ui,
-                        "slip",
-                        "Slip",
-                        tool == Tool::Slip,
-                        Tool::Slip.hint(),
-                        ui::widgets::paint_slip,
-                    ) {
-                        self.tool = Tool::Slip;
-                    }
-                    if ui::widgets::tool_cell(
-                        ui,
-                        "slide",
-                        "Slide",
-                        tool == Tool::Slide,
-                        Tool::Slide.hint(),
-                        ui::widgets::paint_slide,
-                    ) {
-                        self.tool = Tool::Slide;
-                    }
-                    ui.add_space(8.0);
+                    ui::widgets::v_hairline(ui, theme::TOOLBAR_H);
+                    ui.add_space(theme::SPACE_SM);
                     if ui::widgets::chip(ui, "Snap", self.snap_enabled) {
                         self.snap_enabled = !self.snap_enabled;
                     }
+                    ui.add_space(theme::SPACE_XS);
                     if ui::widgets::chip(ui, "Linked", self.linked_selection) {
                         self.linked_selection = !self.linked_selection;
                     }
-                    ui.add_space(8.0);
+                    ui::widgets::v_hairline(ui, theme::TOOLBAR_H);
+                    ui.add_space(theme::SPACE_SM);
                     if ui::widgets::action_button(ui, "Overwrite", true) {
                         self.place_selected_media(false);
                     }
+                    ui.add_space(theme::SPACE_XS);
                     if ui::widgets::action_button(ui, "Insert", false) {
                         self.place_selected_media(true);
                     }
-                    ui.add_space(8.0);
+                    ui.add_space(theme::SPACE_MD);
                     ui.label(
-                        RichText::new("Nudge")
-                            .size(11.0)
+                        RichText::new("NUDGE")
+                            .font(theme::THEME.font(9.0))
                             .color(theme::THEME.text_mute),
                     );
                     for step in [-5_i64, -1, 1, 5] {
@@ -1731,10 +1737,10 @@ impl MeridianApp {
                         }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_space(10.0);
+                        ui.add_space(theme::SPACE_MD);
                         ui.label(
                             RichText::new(self.tool.hint())
-                                .size(11.0)
+                                .font(theme::THEME.font(11.0))
                                 .color(theme::THEME.text_mute),
                         );
                     });
@@ -1744,12 +1750,15 @@ impl MeridianApp {
 
     fn status_bar(&self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("status")
-            .exact_height(26.0)
+            .exact_height(theme::STATUS_H)
             .frame(theme::chrome_frame())
             .show_separator_line(false)
             .show(ctx, |ui| {
+                let bar = ui.max_rect();
+                ui.painter()
+                    .hline(bar.x_range(), bar.top(), theme::hairline_stroke());
                 ui.horizontal(|ui| {
-                    ui.add_space(8.0);
+                    ui.add_space(theme::SPACE_MD);
                     let sequence = self.session.project().active();
                     let res = sequence
                         .map(|s| format!("{}×{}", s.width, s.height))
@@ -1757,9 +1766,20 @@ impl MeridianApp {
                     let fps = sequence
                         .map(|s| format!("{:.3} fps", s.timebase.fps_f64()))
                         .unwrap_or_default();
+                    let page = match self.workspace {
+                        Workspace::Edit => "Edit",
+                        Workspace::Colour => "Colour",
+                        Workspace::Audio => "Audio",
+                        Workspace::Deliver => "Deliver",
+                    };
+                    ui.label(
+                        RichText::new(page)
+                            .font(theme::THEME.font(11.0))
+                            .color(theme::THEME.text_dim),
+                    );
                     ui.label(
                         RichText::new(self.tool.label())
-                            .size(11.0)
+                            .font(theme::THEME.font(11.0))
                             .color(theme::THEME.accent),
                     );
                     ui.label(
@@ -2046,17 +2066,48 @@ fn brand_mark(ui: &mut egui::Ui) {
     );
 }
 
+fn shell_sizes(ctx: &egui::Context) -> (f32, f32, f32) {
+    let rect = ctx.screen_rect();
+    let timeline = (rect.height() * 0.42).clamp(300.0, 520.0);
+    let pool = (rect.width() * 0.20).clamp(260.0, 360.0);
+    let inspector = (rect.width() * 0.22).clamp(280.0, 400.0);
+    (timeline, pool, inspector)
+}
+
+fn library_column(ui: &mut egui::Ui, app: &mut MeridianApp) {
+    let total = ui.available_height();
+    let handle = 6.0;
+    let usable = (total - handle).max(1.0);
+    let min_pool = 120.0;
+    let min_cap = 108.0;
+    let pool_h = if usable <= min_pool + min_cap {
+        usable * app.pool_split.clamp(0.35, 0.75)
+    } else {
+        (usable * app.pool_split).clamp(min_pool, usable - min_cap)
+    };
+    ui.allocate_ui(egui::vec2(ui.available_width(), pool_h), |ui| {
+        ui::media_pool(ui, app);
+    });
+    let delta = ui::widgets::h_split(ui);
+    if delta.abs() > 0.0 {
+        app.pool_split = ((pool_h + delta) / usable).clamp(0.28, 0.78);
+    }
+    ui::captions_panel(ui, app);
+}
+
 fn workspace_switch(ui: &mut egui::Ui, workspace: &mut Workspace) {
-    let labels = ["Edit", "Colour", "Deliver"];
+    let labels = ["Edit", "Colour", "Audio", "Deliver"];
     let selected = match *workspace {
         Workspace::Edit => 0,
         Workspace::Colour => 1,
-        Workspace::Deliver => 2,
+        Workspace::Audio => 2,
+        Workspace::Deliver => 3,
     };
     if let Some(index) = ui::widgets::workspace_modes(ui, selected, &labels) {
         *workspace = match index {
             0 => Workspace::Edit,
             1 => Workspace::Colour,
+            2 => Workspace::Audio,
             _ => Workspace::Deliver,
         };
     }
