@@ -179,4 +179,20 @@ mod tests {
         assert_eq!(sequence.tracks[0].name, "V1");
         assert!(sequence.tracks.iter().any(|t| t.name == "C1"));
     }
+
+    #[test]
+    fn template_project_has_no_media() {
+        for template in builtin_templates() {
+            let project = project_from_template(&template, "Empty").unwrap();
+            assert!(
+                project.media.is_empty(),
+                "{} should not ship demo media",
+                template.id
+            );
+            assert!(project
+                .sequences
+                .iter()
+                .all(|sequence| { sequence.tracks.iter().all(|track| track.clips.is_empty()) }));
+        }
+    }
 }

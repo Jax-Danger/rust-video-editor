@@ -16,6 +16,7 @@ pub mod mix;
 pub mod model;
 pub mod multicam;
 pub mod nest;
+pub mod recent;
 pub mod recovery;
 pub mod scale;
 pub mod session;
@@ -101,6 +102,11 @@ pub use multicam::{
 pub use nest::{
     create_nested_sequence, nested_audio_spans, nested_frame_at, nested_sequence,
     nested_sequence_id, would_cycle, MAX_NEST_DEPTH,
+};
+pub use recent::{
+    load_recent_projects, parse_recent_projects, recent_project_missing, recent_projects_path,
+    recent_projects_path_in, remember_recent, remove_recent, save_recent_projects, RecentError,
+    RecentProject, RECENT_PROJECT_LIMIT,
 };
 pub use recovery::{
     autosave_delay, autosave_due, forget_recovery, is_sidecar_recovery_path, launch_recovery_offer,
