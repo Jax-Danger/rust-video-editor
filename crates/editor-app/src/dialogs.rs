@@ -27,7 +27,7 @@ pub fn import_media_files() -> Option<Vec<PathBuf>> {
 pub fn open_project_file() -> Option<PathBuf> {
     rfd::FileDialog::new()
         .set_title("Open Project")
-        .add_filter("Meridian project", &["json"])
+        .add_filter("Meridian project", &["meridian", "mproj", "json"])
         .add_filter("All files", &["*"])
         .pick_file()
 }
@@ -36,11 +36,11 @@ pub fn save_project_file(suggested_name: &str, directory: Option<&Path>) -> Opti
     let mut dialog = rfd::FileDialog::new()
         .set_title("Save Project")
         .set_file_name(suggested_name)
-        .add_filter("Meridian project", &["json"]);
+        .add_filter("Meridian project", &["meridian"]);
     if let Some(directory) = directory {
         dialog = dialog.set_directory(directory);
     }
-    dialog.save_file().map(ensure_json_extension)
+    dialog.save_file().map(ensure_meridian_extension)
 }
 
 pub fn project_file_name(name: &str) -> String {
@@ -56,26 +56,29 @@ pub fn project_file_name(name: &str) -> String {
         .collect();
     let slug = slug.trim_matches('-');
     let slug = if slug.is_empty() { "untitled" } else { slug };
-    format!("{slug}.json")
+    format!("{slug}.meridian")
 }
 
-fn ensure_json_extension(path: PathBuf) -> PathBuf {
+fn ensure_meridian_extension(path: PathBuf) -> PathBuf {
     match path.extension().and_then(|ext| ext.to_str()) {
-        Some("json") => path,
+        Some("meridian") => path,
         _ => {
             let mut name = path.into_os_string();
-            name.push(".json");
+            name.push(".meridian");
             PathBuf::from(name)
         }
     }
 }
 
 pub fn is_project_file(path: &Path) -> bool {
-    path.extension().and_then(|ext| ext.to_str()) == Some("json")
-        && path
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("meridian") | Some("mproj") => true,
+        Some("json") => path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| !name.ends_with(".probe.json"))
+            .is_some_and(|name| !name.ends_with(".probe.json")),
+        _ => false,
+    }
 }
 
 pub fn pick_lut_file() -> Option<PathBuf> {
@@ -138,5 +141,46 @@ fn ensure_still_extension(path: PathBuf) -> PathBuf {
             name.push(".png");
             PathBuf::from(name)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suggested_name_uses_the_meridian_extension() {
+        assert_eq!(
+            project_file_name("Northline Opening"),
+            "Northline-Opening.meridian"
+        );
+        assert_eq!(project_file_name("My_Film-2"), "My_Film-2.meridian");
+        assert_eq!(project_file_name("  ---  "), "untitled.meridian");
+    }
+
+    #[test]
+    fn ensure_meridian_extension_appends_when_missing() {
+        assert_eq!(
+            ensure_meridian_extension(PathBuf::from("/films/Northline")),
+            PathBuf::from("/films/Northline.meridian")
+        );
+        assert_eq!(
+            ensure_meridian_extension(PathBuf::from("/films/Northline.meridian")),
+            PathBuf::from("/films/Northline.meridian")
+        );
+        assert_eq!(
+            ensure_meridian_extension(PathBuf::from("Northline.json")),
+            PathBuf::from("Northline.json.meridian")
+        );
+    }
+
+    #[test]
+    fn import_rejects_project_files_and_keeps_probe_sidecars() {
+        assert!(is_project_file(Path::new("Northline-Opening.meridian")));
+        assert!(is_project_file(Path::new("Northline-Opening.mproj")));
+        assert!(is_project_file(Path::new("samples/northline-opening.json")));
+        assert!(!is_project_file(Path::new("interview.mp4")));
+        assert!(!is_project_file(Path::new("interview.probe.json")));
+        assert!(!is_project_file(Path::new("look.cube")));
     }
 }

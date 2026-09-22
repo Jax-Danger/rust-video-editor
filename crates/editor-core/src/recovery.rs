@@ -61,8 +61,12 @@ pub enum RecoveryError {
     RefusedToDelete(PathBuf),
 }
 
-/// `<dir>/<stem>.meridian/recovery.json` beside a saved project.
-pub fn recovery_path_for_project(project_file: &Path) -> PathBuf {
+/// Directory beside a saved project for recovery, proxies, and similar sidecars.
+///
+/// `film.json` stays `film.meridian/` so older projects keep their sidecars.
+/// A `film.meridian` project file already occupies that name, so its support
+/// directory is `film.meridian.meridian/`.
+pub fn project_support_dir(project_file: &Path) -> PathBuf {
     let parent = project_file
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -72,12 +76,20 @@ pub fn recovery_path_for_project(project_file: &Path) -> PathBuf {
         .and_then(|stem| stem.to_str())
         .filter(|stem| !stem.is_empty())
         .unwrap_or("project");
-    let sidecar = PathBuf::from(format!("{stem}.meridian")).join("recovery.json");
-    if parent == Path::new(".") {
-        sidecar
-    } else {
-        parent.join(sidecar)
+    let mut dir_name = format!("{stem}.meridian");
+    if project_file.file_name().and_then(|name| name.to_str()) == Some(dir_name.as_str()) {
+        dir_name.push_str(".meridian");
     }
+    if parent == Path::new(".") {
+        PathBuf::from(dir_name)
+    } else {
+        parent.join(dir_name)
+    }
+}
+
+/// `<support>/recovery.json` beside a saved project. See [`project_support_dir`].
+pub fn recovery_path_for_project(project_file: &Path) -> PathBuf {
+    project_support_dir(project_file).join("recovery.json")
 }
 
 /// Never-saved sessions land here, not next to a project the user did not choose.
@@ -398,6 +410,50 @@ mod tests {
         let recovery = recovery_path_for_project(Path::new("notes.json"));
         assert_eq!(recovery, PathBuf::from("notes.meridian/recovery.json"));
         assert_ne!(recovery, Path::new("notes.json"));
+    }
+
+    #[test]
+    fn meridian_project_sidecar_does_not_use_the_project_filename() {
+        let project = Path::new("/films/film.meridian");
+        let recovery = recovery_path_for_project(project);
+        assert_eq!(
+            recovery,
+            PathBuf::from("/films/film.meridian.meridian/recovery.json")
+        );
+        assert_ne!(recovery.parent(), Some(project));
+        assert!(is_sidecar_recovery_path(&recovery));
+        assert_eq!(
+            project_support_dir(Path::new("film.meridian")),
+            PathBuf::from("film.meridian.meridian")
+        );
+        assert_eq!(
+            recovery_path_for_project(Path::new("/films/film.mproj")),
+            PathBuf::from("/films/film.meridian/recovery.json")
+        );
+    }
+
+    #[test]
+    fn publish_meridian_project_writes_beside_the_file() {
+        let dir = scratch("meridian-ext");
+        let project_path = dir.join("film.meridian");
+        std::fs::write(&project_path, b"ORIGINAL").unwrap();
+        let recovery = recovery_path_for_project(&project_path);
+        let index = dir.join("recovery-index.json");
+        publish_recovery_to(
+            &recovery,
+            &index,
+            Some(&project_path),
+            &sample_project("Northline"),
+        )
+        .unwrap();
+        assert!(project_path.is_file());
+        assert_eq!(std::fs::read(&project_path).unwrap(), b"ORIGINAL");
+        assert!(recovery.is_file());
+        assert!(recovery.ends_with("film.meridian.meridian/recovery.json"));
+        forget_recovery(&recovery, &index).unwrap();
+        assert!(!recovery.exists());
+        assert!(project_path.is_file());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

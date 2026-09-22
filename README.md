@@ -50,7 +50,7 @@ sudo apt install gcc g++ cmake pkg-config libgtk-3-dev libasound2-dev ffmpeg \
 cargo run -p editor-app --features ffmpeg
 ```
 
-The first launch loads an in-memory example: three picture tracks, a lower-third title, linked interview audio, a cross dissolve, a wipe, keyframed picture-in-picture, captions, and markers. **File → Open Example** returns to it. **File → Save** and **File → Save As** write pretty JSON through a native dialog. A copy of that example lives at [`samples/northline-opening.json`](samples/northline-opening.json). **File → Open** (Ctrl+O) reloads a project file. Unsaved edits are also copied to a recovery sidecar; see [Autosave and recovery](#autosave-and-recovery).
+The first launch loads an in-memory example: three picture tracks, a lower-third title, linked interview audio, a cross dissolve, a wipe, keyframed picture-in-picture, captions, and markers. **File → Open Example** returns to it. **File → Save** and **File → Save As** write a `.meridian` project through a native dialog. The file is still pretty JSON; only the extension changed. A copy of that example lives at [`samples/northline-opening.json`](samples/northline-opening.json) and stays `.json` so tests can load it from that path. **File → Open** (Ctrl+O) reloads a `.meridian` project, and still opens older `.json` projects (`.mproj` is accepted as the same document). Unsaved edits are also copied to a recovery sidecar; see [Autosave and recovery](#autosave-and-recovery).
 
 ## Autosave and recovery
 
@@ -60,8 +60,11 @@ A dirty session is written after 3 seconds without another edit, and every 60 se
 
 | Session | Recovery file |
 | --- | --- |
-| Saved project `film.json` | `film.meridian/recovery.json` beside the project |
+| Saved project `film.meridian` | `film.meridian.meridian/recovery.json` beside the project |
+| Older saved project `film.json` | `film.meridian/recovery.json` beside the project |
 | Never saved | `~/.config/meridian/recovery/unsaved.json` |
+
+The support directory is `{stem}.meridian`. A project file named `film.meridian` already uses that name, so its directory gains one more `.meridian` and does not replace the file. Proxies for that project live in the same directory (`film.meridian.meridian/proxies/`).
 
 `MERIDIAN_CONFIG` overrides that config directory, the same way Deliver's last-used settings do. The sidecar is not a project file. Opening it from **File → Open** is refused.
 
@@ -71,7 +74,7 @@ Opening a project whose sidecar is newer than the file shows the same choice. Sa
 
 ## Import
 
-**File → Import** (Ctrl+I) opens a native file picker for video, audio, and stills. Dropping files onto the media pool does the same. The app probes each file (`ffprobe` when built with `--features ffmpeg`), stores the canonical path on the asset, and adds it to the selected bin (or the first bin when none is selected). Project `.json` files are rejected here; use **File → Open**. **File → Import from Path…** is the typed-path fallback.
+**File → Import** (Ctrl+I) opens a native file picker for video, audio, and stills. Dropping files onto the media pool does the same. The app probes each file (`ffprobe` when built with `--features ffmpeg`), stores the canonical path on the asset, and adds it to the selected bin (or the first bin when none is selected). Project `.meridian` files, the `.mproj` alias, and older project `.json` files are rejected here (a `.probe.json` media sidecar is not a project); use **File → Open**. **File → Import from Path…** is the typed-path fallback.
 
 Drag a pool item onto the timeline to overwrite at the drop frame. Hold Shift while dropping to insert and ripple. Double-click opens the clip in the **source monitor**. Overwrite / Insert (or `,` / `.`) place the source in–out range at the program playhead. One import batch is a single undo step. Paths round-trip in the project JSON. An empty pool says to import. A missing file is marked offline in the pool and on the clip, and the tooltip shows the path.
 
@@ -451,7 +454,7 @@ A proxy is a H.264 file at most **960 pixels wide** (shorter sources stay at the
 
 | | |
 | --- | --- |
-| Saved project | `<project directory>/<name>.meridian/proxies/` |
+| Saved project | `<project directory>/<name>.meridian/proxies/` (`<name>.meridian.meridian/proxies/` when the project file is `<name>.meridian`) |
 | Unsaved project | `$XDG_CACHE_HOME/meridian/proxies` or `~/.cache/meridian/proxies` |
 
 The pool toggle **Proxies / Full** is **Prefer Proxies**. When it is on, a layer decodes its proxy if that file is on disk and falls back to the original if it is not. **Full** always decodes the original. The program header shows `Proxy` when a proxy file was actually used, and `Full*` when proxies are preferred but this frame fell back. Generating proxies turns the preference on.
