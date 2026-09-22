@@ -15,9 +15,9 @@
 //! decodes, so a ramp or a constant rate is the same picture in both.
 
 use editor_core::{
-    blur, clip_relative, color_grade, crop, sharpen, source_frame_at, transform, vignette, Clip,
-    ColorGrade, Direction, Frame, MediaAsset, Sequence, Title, ToneCurve, Track, TrackKind,
-    Transform, TransitionKind,
+    blur, clip_relative, color_grade, crop, picture_at, sharpen, source_frame_at, transform,
+    vignette, Clip, ColorGrade, Direction, Frame, MediaAsset, MulticamGroup, Sequence, Title,
+    ToneCurve, Track, TrackKind, Transform, TransitionKind,
 };
 use font8x8::UnicodeFonts;
 
@@ -698,6 +698,7 @@ pub fn program_stack(
         canvas_w,
         canvas_h,
         crate::PreviewSource::Full,
+        &[],
     )
 }
 
@@ -710,6 +711,7 @@ pub fn program_stack_with(
     canvas_w: u32,
     canvas_h: u32,
     source: crate::PreviewSource,
+    groups: &[MulticamGroup],
 ) -> ProgramStack {
     let mut layers = Vec::new();
     let mut errors = Vec::new();
@@ -726,7 +728,7 @@ pub fn program_stack_with(
             let mut dip_plate: Option<([f32; 3], f32)> = None;
             for (clip, outgoing) in [(hit.left, true), (hit.right, false)] {
                 match layer_from_clip(
-                    sequence, track, clip, media, playhead, canvas_w, canvas_h, source,
+                    sequence, track, clip, media, groups, playhead, canvas_w, canvas_h, source,
                 ) {
                     Ok(Some(mut layer)) => {
                         let (place, motion) = apply_transition(
@@ -779,7 +781,7 @@ pub fn program_stack_with(
             .find(|clip| clip.enabled && clip.covers(Frame(playhead)))
         {
             match layer_from_clip(
-                sequence, track, clip, media, playhead, canvas_w, canvas_h, source,
+                sequence, track, clip, media, groups, playhead, canvas_w, canvas_h, source,
             ) {
                 Ok(Some(layer)) => layers.push(layer),
                 Ok(None) => {}
@@ -845,6 +847,7 @@ fn layer_from_clip(
     track: &Track,
     clip: &Clip,
     media: &[MediaAsset],
+    groups: &[MulticamGroup],
     playhead: i64,
     canvas_w: u32,
     canvas_h: u32,
@@ -888,8 +891,11 @@ fn layer_from_clip(
             clip_id: clip.id.0,
         }));
     }
-    let media_id = clip
-        .media_id
+    let resolved_angle = picture_at(clip, groups, media, Frame(playhead), sequence.timebase);
+    let media_id = resolved_angle
+        .as_ref()
+        .map(|hit| hit.media_id)
+        .or(clip.media_id)
         .ok_or_else(|| format!("No media linked to {}", clip.name))?;
     let asset = media
         .iter()
@@ -903,22 +909,32 @@ fn layer_from_clip(
         return Err(format!("Offline — {} is not on disk", asset.name));
     }
     let (width, height) = layer_pixel_size(canvas_w, canvas_h, &place);
-    let mut source_frame = source_frame_at(clip, Frame(playhead), sequence.timebase)
-        .0
-        .max(0);
+    let sample_tb = resolved_angle
+        .as_ref()
+        .map(|hit| hit.timebase)
+        .unwrap_or(clip.media_timebase);
+    let mut source_frame = resolved_angle
+        .as_ref()
+        .map(|hit| hit.source_frame)
+        .unwrap_or_else(|| source_frame_at(clip, Frame(playhead), sequence.timebase).0);
+    source_frame = source_frame.max(0);
     let last_source_frame = asset.duration.0.saturating_sub(1).max(0);
     if source_frame > last_source_frame {
         source_frame = last_source_frame;
     }
     let duration_secs = asset.duration.to_seconds(asset.timebase);
-    let raw_time = Frame(source_frame).to_seconds(clip.media_timebase);
+    let raw_time = Frame(source_frame).to_seconds(sample_tb);
     let time_secs = crate::clamp_preview_time(raw_time, duration_secs).unwrap_or(0.0);
+    let angle_note = resolved_angle
+        .as_ref()
+        .map(|hit| format!("  ·  {}", hit.name))
+        .unwrap_or_default();
     Ok(Some(ProgramLayer {
         source: LayerSource::Media {
             path: resolved.to_string_lossy().into_owned(),
             source_frame,
             time_secs,
-            frame_secs: clip.media_timebase.frame_duration_secs().max(1.0e-4),
+            frame_secs: sample_tb.frame_duration_secs().max(1.0e-4),
             last_source_frame,
         },
         width,
@@ -926,7 +942,11 @@ fn layer_from_clip(
         grade: GradeSample::from_effects(&clip.effects, rel),
         filters: FilterSample::from_effects(&clip.effects, rel),
         place,
-        label: layer_label(track, clip),
+        label: {
+            let mut label = layer_label(track, clip);
+            label.push_str(&angle_note);
+            label
+        },
         using_proxy,
         clip_id: clip.id.0,
     }))
@@ -2346,8 +2366,15 @@ mod tests {
         assert_eq!(full.layers.len(), 1);
         assert!(!full.layers[0].using_proxy);
         assert!(media_path(&full.layers[0]).ends_with("original.mp4"));
-        let preview =
-            program_stack_with(&sequence, &[asset], 2, 64, 36, crate::PreviewSource::Proxy);
+        let preview = program_stack_with(
+            &sequence,
+            &[asset],
+            2,
+            64,
+            36,
+            crate::PreviewSource::Proxy,
+            &[],
+        );
         assert!(preview.layers[0].using_proxy);
         assert!(media_path(&preview.layers[0]).ends_with("proxy.mp4"));
         let _ = std::fs::remove_dir_all(&dir);

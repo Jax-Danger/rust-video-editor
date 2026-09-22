@@ -102,6 +102,7 @@ id_newtype!(
     MarkerId,
     CueId,
     TransitionId,
+    MulticamId,
 );
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,6 +278,50 @@ fn default_title_y() -> f32 {
 }
 fn default_title_plate() -> f32 {
     0.55
+}
+
+/// One camera inside a [`MulticamGroup`].
+///
+/// `sync_offset` is the source frame on this angle that lines up with group
+/// time 0. A camera that started recording earlier has a positive offset so
+/// its clap matches the other angles. Optional `audio` replaces the video
+/// file's own sound for this angle.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MulticamAngle {
+    pub name: String,
+    pub video: MediaId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<MediaId>,
+    #[serde(default)]
+    pub sync_offset: Frame,
+}
+
+/// Angles that share one sync origin. Clips on the timeline point at the group
+/// and store which angle is active over group time.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MulticamGroup {
+    pub id: MulticamId,
+    pub name: String,
+    /// Group time is measured on this timebase. Timeline clips store their
+    /// source in and out in these frames.
+    pub timebase: Timebase,
+    pub angles: Vec<MulticamAngle>,
+}
+
+/// Angle change at a group-time frame. `at` uses the same units as the clip's
+/// source in/out, so moving the clip on the timeline does not move the cut.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AngleCut {
+    pub at: Frame,
+    pub angle: u32,
+}
+
+/// Link from a timeline clip back to its [`MulticamGroup`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MulticamBinding {
+    pub group: MulticamId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cuts: Vec<AngleCut>,
 }
 
 /// Generator text drawn into the frame by the shared compositor.
@@ -475,6 +520,10 @@ pub struct Clip {
     /// both read it through [`crate::source_frame_at`].
     #[serde(default, skip_serializing_if = "ClipSpeed::is_identity")]
     pub speed: ClipSpeed,
+    /// When set, preview and export play the active angle of this group
+    /// instead of [`Self::media_id`] alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multicam: Option<MulticamBinding>,
 }
 
 impl Clip {
@@ -524,6 +573,7 @@ impl Clip {
             title: None,
             adjustment: false,
             speed: ClipSpeed::normal(),
+            multicam: None,
         }
     }
 
@@ -552,6 +602,7 @@ impl Clip {
             title: Some(title),
             adjustment: false,
             speed: ClipSpeed::normal(),
+            multicam: None,
         }
     }
 
@@ -585,6 +636,7 @@ impl Clip {
             title: None,
             adjustment: true,
             speed: ClipSpeed::normal(),
+            multicam: None,
         }
     }
 
@@ -890,6 +942,9 @@ pub struct Project {
     /// Export ignores this and always uses the original.
     #[serde(default, skip_serializing_if = "is_false")]
     pub prefer_proxies: bool,
+    /// Multicam groups shared by clips in any sequence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub multicam_groups: Vec<MulticamGroup>,
 }
 
 impl Project {
@@ -903,6 +958,7 @@ impl Project {
             sequences: Vec::new(),
             active_sequence: None,
             prefer_proxies: false,
+            multicam_groups: Vec::new(),
         }
     }
 
@@ -933,6 +989,14 @@ impl Project {
         self.media.iter().find(|m| m.id == id)
     }
 
+    pub fn multicam_group(&self, id: MulticamId) -> Option<&MulticamGroup> {
+        self.multicam_groups.iter().find(|group| group.id == id)
+    }
+
+    pub fn multicam_group_mut(&mut self, id: MulticamId) -> Option<&mut MulticamGroup> {
+        self.multicam_groups.iter_mut().find(|group| group.id == id)
+    }
+
     pub fn max_assigned_id(&self) -> u64 {
         let mut max_id = 0u64;
         let bump = |max_id: &mut u64, value: u64| {
@@ -942,6 +1006,9 @@ impl Project {
         };
         for bin in &self.bins {
             bump(&mut max_id, bin.id.0);
+        }
+        for group in &self.multicam_groups {
+            bump(&mut max_id, group.id.0);
         }
         for media in &self.media {
             bump(&mut max_id, media.id.0);

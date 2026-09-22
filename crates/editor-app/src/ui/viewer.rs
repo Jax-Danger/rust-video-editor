@@ -14,7 +14,8 @@ use crate::composite::{
     GradeSample, LayerSource, MaskWindow, PictureCache, Place, ProgramLayer,
 };
 use editor_core::{
-    clip_relative, color_grade, transform, ColorGrade, Frame, MediaAsset, TrackKind, Transform,
+    active_angle, clip_relative, color_grade, multicam_target, source_frame_at, transform,
+    ColorGrade, Frame, MediaAsset, MulticamGroup, TrackKind, Transform,
 };
 use editor_media::{fit_preview_size, PreviewBackend};
 use egui::{Color32, FontId, Painter, Pos2, Rect, Sense, Shape, Stroke, Vec2};
@@ -48,11 +49,14 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
     let audio_badge = app.audio.badge();
     let audio_status = app.audio.status().to_string();
     let media = app.session.project().media.clone();
+    let groups = app.session.project().multicam_groups.clone();
     let prefer_proxies = app.session.project().prefer_proxies;
+    let bank = angle_bank(&sequence, &groups, &app.selected, playhead);
     let plan = decode_plan(
         &sequence,
         playhead,
         &media,
+        &groups,
         playing,
         scrubbing,
         reverse,
@@ -212,7 +216,8 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
     let opacity = 1.0;
     let chip = (!plan.chip.is_empty() && picture.is_some()).then(|| plan.chip.clone());
 
-    let monitor_h = (ui.available_height() - SCRUB_H).max(48.0);
+    let bank_h = if bank.is_some() { 44.0 } else { 0.0 };
+    let monitor_h = (ui.available_height() - SCRUB_H - bank_h).max(48.0);
     let (rect, _) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), monitor_h), Sense::hover());
     let painter = ui.painter_at(rect);
@@ -358,7 +363,103 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
     if let Some(text) = banner {
         overlay_note(&painter, frame, &text);
     }
+    if let Some(bank) = bank {
+        angle_bank_ui(ui, app, &bank);
+    }
     program_scrubber(ui, app, sequence.end_frame().0.max(app.playhead));
+}
+
+struct AngleBank {
+    names: Vec<String>,
+    active: u32,
+}
+
+fn angle_bank(
+    sequence: &editor_core::Sequence,
+    groups: &[MulticamGroup],
+    selected: &[editor_core::ClipId],
+    playhead: i64,
+) -> Option<AngleBank> {
+    let clip_id = multicam_target(sequence, selected, playhead)?;
+    let clip = sequence.clip(clip_id)?;
+    let binding = clip.multicam.as_ref()?;
+    let group = groups.iter().find(|item| item.id == binding.group)?;
+    if group.angles.is_empty() {
+        return None;
+    }
+    let group_time = source_frame_at(clip, Frame(playhead), sequence.timebase).0;
+    let active = active_angle(&binding.cuts, group_time);
+    let active = if (active as usize) < group.angles.len() {
+        active
+    } else {
+        0
+    };
+    Some(AngleBank {
+        names: group
+            .angles
+            .iter()
+            .map(|angle| angle.name.clone())
+            .collect(),
+        active,
+    })
+}
+
+fn angle_bank_ui(ui: &mut egui::Ui, app: &mut MeridianApp, bank: &AngleBank) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 44.0), Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 0.0, THEME.panel);
+    painter.hline(
+        rect.x_range(),
+        rect.top(),
+        Stroke::new(1.0_f32, THEME.hairline),
+    );
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect.shrink2(Vec2::new(8.0, 6.0)))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    child.label(
+        egui::RichText::new("ANGLES")
+            .size(10.0)
+            .color(THEME.text_mute),
+    );
+    child.add_space(8.0);
+    egui::ScrollArea::horizontal()
+        .id_salt("multicam_angles")
+        .show(&mut child, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                for (index, name) in bank.names.iter().enumerate() {
+                    let active = bank.active == index as u32;
+                    let (cell, response) =
+                        ui.allocate_exact_size(Vec2::new(108.0, 28.0), Sense::click());
+                    let fill = if active {
+                        THEME.accent_dim
+                    } else {
+                        THEME.header
+                    };
+                    let stroke = if active { THEME.accent } else { THEME.border };
+                    ui.painter().rect_filled(cell, 3.0, fill);
+                    ui.painter().rect_stroke(
+                        cell,
+                        3.0,
+                        Stroke::new(1.0_f32, stroke),
+                        egui::StrokeKind::Inside,
+                    );
+                    ui.painter().text(
+                        cell.left_center() + Vec2::new(8.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        format!("{}   {name}", index + 1),
+                        THEME.font(11.0),
+                        if active { THEME.accent } else { THEME.text },
+                    );
+                    if response.clicked() {
+                        app.switch_multicam_angle(index as u32);
+                    }
+                    response.on_hover_text("Razor at the playhead and switch to this angle");
+                }
+            });
+        });
 }
 
 fn follow_viewer_scrub(ui: &egui::Ui, app: &mut MeridianApp) {
@@ -678,6 +779,7 @@ fn decode_plan(
     sequence: &editor_core::Sequence,
     playhead: i64,
     media: &[MediaAsset],
+    groups: &[MulticamGroup],
     playing: bool,
     scrubbing: bool,
     reverse: bool,
@@ -695,8 +797,9 @@ fn decode_plan(
     } else {
         editor_media::PreviewSource::Full
     };
-    let stack =
-        editor_media::program_stack_with(sequence, media, playhead, canvas_w, canvas_h, source);
+    let stack = editor_media::program_stack_with(
+        sequence, media, playhead, canvas_w, canvas_h, source, groups,
+    );
     let used_proxy = stack.layers.iter().any(|layer| layer.using_proxy);
     let problem = if stack.layers.is_empty() {
         stack.errors.into_iter().next()

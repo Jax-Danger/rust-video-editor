@@ -23,6 +23,32 @@ pub fn media_pool(ui: &mut egui::Ui, app: &mut MeridianApp) {
     });
     proxy_bar(ui, app);
 
+    let video_picks = app
+        .pool_selection
+        .iter()
+        .filter(|id| {
+            app.session
+                .project()
+                .media(**id)
+                .is_some_and(|media| media.has_video)
+        })
+        .count();
+    if video_picks >= 2 {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(format!("{video_picks} video angles"))
+                    .size(11.0)
+                    .color(THEME.text_dim),
+            );
+            if widgets::action_button(ui, "Create Multicam", true) {
+                app.create_multicam_from_pool();
+            }
+        });
+        ui.add_space(2.0);
+    }
+
     let bins: Vec<_> = app
         .session
         .project()
@@ -201,7 +227,7 @@ fn media_row(
     has_audio: bool,
     has_proxy: bool,
 ) {
-    let selected = app.selected_media == Some(id);
+    let selected = app.pool_selection.contains(&id);
     let (rect, response) = ui.allocate_exact_size(
         Vec2::new(ui.available_width(), 36.0),
         Sense::click_and_drag(),
@@ -324,9 +350,29 @@ fn media_row(
     if response.drag_started() {
         app.dragging_media = Some(id);
         app.selected_media = Some(id);
+        if !app.pool_selection.contains(&id) {
+            app.pool_selection = vec![id];
+        }
         app.status = "Drop on the timeline. Shift inserts instead of overwriting.".into();
     } else if response.clicked() {
-        app.selected_media = Some(id);
+        let mods = ui.input(|input| input.modifiers);
+        if mods.command {
+            if let Some(index) = app.pool_selection.iter().position(|item| *item == id) {
+                app.pool_selection.remove(index);
+                app.selected_media = app.pool_selection.last().copied();
+            } else {
+                app.pool_selection.push(id);
+                app.selected_media = Some(id);
+            }
+        } else if mods.shift {
+            if !app.pool_selection.contains(&id) {
+                app.pool_selection.push(id);
+            }
+            app.selected_media = Some(id);
+        } else {
+            app.pool_selection = vec![id];
+            app.selected_media = Some(id);
+        }
         if missing {
             if let Some(pos) = response.interact_pointer_pos() {
                 let pill = Rect::from_min_size(
@@ -341,6 +387,7 @@ fn media_row(
     }
     if response.double_clicked() {
         app.selected_media = Some(id);
+        app.pool_selection = vec![id];
         app.dragging_media = None;
         app.place_selected_media(false);
     }

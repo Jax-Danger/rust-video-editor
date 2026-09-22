@@ -3,10 +3,10 @@
 use std::collections::HashSet;
 
 use editor_core::{
-    align_frame, clamp_timeline_zoom, clip_index_at, collect_snap_points, expand_linked,
-    frame_at_x, ruler_step, snap_span, stacked_hits, timeline_x, visible_clip_span, visible_span,
-    ClipId, Frame, MediaId, TrackFlag, TrackKind, TrimEdge, MAX_PIXELS_PER_FRAME,
-    MIN_PIXELS_PER_FRAME,
+    align_frame, angle_marks, clamp_timeline_zoom, clip_index_at, collect_snap_points,
+    expand_linked, frame_at_x, opening_angle_name, ruler_step, snap_span, stacked_hits, timeline_x,
+    visible_clip_span, visible_span, ClipId, Frame, MediaId, TrackFlag, TrackKind, TrimEdge,
+    MAX_PIXELS_PER_FRAME, MIN_PIXELS_PER_FRAME,
 };
 use egui::{pos2, Align2, Color32, CursorIcon, FontId, Rect, Sense, Shape, Stroke, Vec2};
 
@@ -525,6 +525,7 @@ fn lane(
     offline: &HashSet<MediaId>,
 ) {
     let track = &sequence.tracks[index];
+    let groups = app.session.project().multicam_groups.clone();
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(view_w, ROW_H), Sense::click_and_drag());
     let painter = ui.painter_at(rect);
@@ -626,6 +627,11 @@ fn lane(
                 format!("T  {}", clip.name)
             } else if clip.is_adjustment() {
                 format!("A  {}", clip.name)
+            } else if let Some(angle) = opening_angle_name(clip, &groups) {
+                match clip.speed.badge() {
+                    Some(badge) => format!("{}  ·  {angle}  {badge}", clip.name),
+                    None => format!("{}  ·  {angle}", clip.name),
+                }
             } else if let Some(badge) = clip.speed.badge() {
                 format!("{}  {badge}", clip.name)
             } else {
@@ -638,6 +644,18 @@ fn lane(
                 THEME.font(10.5),
                 Color32::WHITE,
             );
+        }
+        if clip.multicam.is_some() {
+            for (frame, _) in angle_marks(clip, sequence.timebase) {
+                let x = fx(frame, origin, rect.min.x, ppf);
+                if x > crect.left() + 2.0 && x < crect.right() - 2.0 {
+                    painter.vline(
+                        x,
+                        (crect.top() + 2.0)..=(crect.bottom() - 2.0),
+                        Stroke::new(1.0_f32, Color32::from_white_alpha(200)),
+                    );
+                }
+            }
         }
     }
 
