@@ -14,11 +14,11 @@
 
 use editor_core::{
     clip_relative, color_grade, source_frame_at, transform, Clip, ColorGrade, Direction, Frame,
-    MediaAsset, Sequence, Track, TrackKind, Transform, TransitionKind,
+    MediaAsset, Sequence, Title, ToneCurve, Track, TrackKind, Transform, TransitionKind,
 };
 use font8x8::UnicodeFonts;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct GradeSample {
     pub exposure: f32,
     pub contrast: f32,
@@ -27,6 +27,10 @@ pub struct GradeSample {
     pub temperature: f32,
     pub tint: f32,
     pub saturation: f32,
+    pub lift: [f32; 3],
+    pub gamma: [f32; 3],
+    pub gain: [f32; 3],
+    pub luma_curve: ToneCurve,
 }
 
 impl GradeSample {
@@ -39,6 +43,10 @@ impl GradeSample {
             temperature: 0.0,
             tint: 0.0,
             saturation: 1.0,
+            lift: [0.0, 0.0, 0.0],
+            gamma: [0.0, 0.0, 0.0],
+            gain: [0.0, 0.0, 0.0],
+            luma_curve: ToneCurve::identity(),
         }
     }
 
@@ -51,6 +59,10 @@ impl GradeSample {
             temperature: grade.temperature.value_at(rel),
             tint: grade.tint.value_at(rel),
             saturation: grade.saturation.value_at(rel),
+            lift: grade.lift.values_at(rel),
+            gamma: grade.gamma.values_at(rel),
+            gain: grade.gain.values_at(rel),
+            luma_curve: grade.luma_curve.clone(),
         }
     }
 
@@ -60,7 +72,7 @@ impl GradeSample {
             .unwrap_or_else(Self::neutral)
     }
 
-    pub fn is_neutral(self) -> bool {
+    pub fn is_neutral(&self) -> bool {
         self.exposure.abs() < 1.0e-4
             && (self.contrast - 1.0).abs() < 1.0e-4
             && self.highlights.abs() < 1.0e-4
@@ -68,6 +80,53 @@ impl GradeSample {
             && self.temperature.abs() < 1.0e-4
             && self.tint.abs() < 1.0e-4
             && (self.saturation - 1.0).abs() < 1.0e-4
+            && self.lift.iter().all(|v| v.abs() < 1.0e-4)
+            && self.gamma.iter().all(|v| v.abs() < 1.0e-4)
+            && self.gain.iter().all(|v| v.abs() < 1.0e-4)
+            && self.luma_curve == ToneCurve::identity()
+    }
+
+    fn apply_luma_curve(rgb: [f32; 3], curve: &ToneCurve) -> [f32; 3] {
+        if curve == &ToneCurve::identity() {
+            return rgb;
+        }
+        let luma = rec709_luma(rgb);
+        let mapped = curve.eval(luma);
+        if luma < 1.0e-4 {
+            return rgb.map(|_| mapped.clamp(0.0, 1.5));
+        }
+        let scale = mapped / luma;
+        rgb.map(|channel| (channel * scale).clamp(0.0, 1.5))
+    }
+
+    fn apply_wheel_offsets(
+        rgb: [f32; 3],
+        lift: [f32; 3],
+        gamma: [f32; 3],
+        gain: [f32; 3],
+    ) -> [f32; 3] {
+        let luma = rec709_luma(rgb);
+        let lift_w = 1.0 - smoothstep(0.08, 0.40, luma);
+        let gamma_w = smoothstep(0.20, 0.45, luma) * (1.0 - smoothstep(0.55, 0.80, luma));
+        let gain_w = smoothstep(0.60, 0.95, luma);
+        let strength = 0.35;
+        [
+            (rgb[0]
+                + lift[0] * strength * lift_w
+                + gamma[0] * strength * gamma_w
+                + gain[0] * strength * gain_w)
+                .clamp(0.0, 1.5),
+            (rgb[1]
+                + lift[1] * strength * lift_w
+                + gamma[1] * strength * gamma_w
+                + gain[1] * strength * gain_w)
+                .clamp(0.0, 1.5),
+            (rgb[2]
+                + lift[2] * strength * lift_w
+                + gamma[2] * strength * gamma_w
+                + gain[2] * strength * gain_w)
+                .clamp(0.0, 1.5),
+        ]
     }
 
     /// Shared grade. `rgb` channels are 0…1 display values.
@@ -75,9 +134,11 @@ impl GradeSample {
     /// Shadows and highlights use a smooth split: shadows fall off by mid grey,
     /// highlights start there, so a shadow lift does not also brighten the
     /// whites. Coefficients are 0.45 of the parameter at full weight.
-    pub fn apply(self, rgb: [f32; 3]) -> [f32; 3] {
-        let mut c = rgb.map(|channel| channel * 2.0_f32.powf(self.exposure));
+    pub fn apply(&self, rgb: [f32; 3]) -> [f32; 3] {
+        let mut c = Self::apply_luma_curve(rgb, &self.luma_curve);
+        c = c.map(|channel| channel * 2.0_f32.powf(self.exposure));
         c = c.map(|channel| ((channel - 0.5) * self.contrast + 0.5).clamp(0.0, 1.5));
+        c = Self::apply_wheel_offsets(c, self.lift, self.gamma, self.gain);
         c = c.map(|channel| {
             let shadow_w = 1.0 - smoothstep(0.10, 0.55, channel);
             let high_w = smoothstep(0.45, 0.90, channel);
@@ -89,9 +150,13 @@ impl GradeSample {
         c[1] = (c[1] - self.tint * 0.14).clamp(0.0, 1.5);
         c[0] = (c[0] + self.tint * 0.06).clamp(0.0, 1.5);
         c[2] = (c[2] + self.tint * 0.06).clamp(0.0, 1.5);
-        let luma = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        let luma = rec709_luma(c);
         c.map(|channel| (luma + (channel - luma) * self.saturation).clamp(0.0, 1.0))
     }
+}
+
+fn rec709_luma(rgb: [f32; 3]) -> f32 {
+    0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
 }
 
 fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
@@ -374,21 +439,38 @@ pub struct BlitLayer<'a> {
     pub place: Place,
 }
 
-/// One decoded layer, bottom to top. Higher timeline tracks are later.
+/// Where a program layer's pixels come from. Titles are rasterized at composite
+/// time; media is decoded by the caller.
+#[derive(Clone, Debug)]
+pub enum LayerSource {
+    Media {
+        path: String,
+        source_frame: i64,
+        time_secs: f64,
+        frame_secs: f64,
+        last_source_frame: i64,
+    },
+    Title(Title),
+}
+
+/// One layer, bottom to top. Higher timeline tracks are later.
 #[derive(Clone, Debug)]
 pub struct ProgramLayer {
-    pub path: String,
-    pub source_frame: i64,
-    pub time_secs: f64,
-    pub frame_secs: f64,
-    pub last_source_frame: i64,
+    pub source: LayerSource,
     pub width: u32,
     pub height: u32,
     pub grade: GradeSample,
     pub place: Place,
     pub label: String,
-    /// True when `path` is the proxy file rather than the camera original.
+    /// True when the decoded file is the proxy rather than the camera original.
     pub using_proxy: bool,
+    pub clip_id: u64,
+}
+
+impl ProgramLayer {
+    pub fn is_title(&self) -> bool {
+        matches!(self.source, LayerSource::Title(_))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -549,6 +631,19 @@ fn layer_from_clip(
     if place.opacity <= 0.001 {
         return Ok(None);
     }
+    if let Some(title) = clip.title.clone() {
+        let (width, height) = layer_pixel_size(canvas_w, canvas_h, &place);
+        return Ok(Some(ProgramLayer {
+            source: LayerSource::Title(title),
+            width,
+            height,
+            grade: GradeSample::from_effects(&clip.effects, rel),
+            place,
+            label: format!("{}  {}", track.name, clip.name),
+            using_proxy: false,
+            clip_id: clip.id.0,
+        }));
+    }
     let media_id = clip
         .media_id
         .ok_or_else(|| format!("No media linked to {}", clip.name))?;
@@ -575,17 +670,20 @@ fn layer_from_clip(
     let raw_time = Frame(source_frame).to_seconds(clip.media_timebase);
     let time_secs = crate::clamp_preview_time(raw_time, duration_secs).unwrap_or(0.0);
     Ok(Some(ProgramLayer {
-        path: resolved.to_string_lossy().into_owned(),
-        source_frame,
-        time_secs,
-        frame_secs: clip.media_timebase.frame_duration_secs().max(1.0e-4),
-        last_source_frame,
+        source: LayerSource::Media {
+            path: resolved.to_string_lossy().into_owned(),
+            source_frame,
+            time_secs,
+            frame_secs: clip.media_timebase.frame_duration_secs().max(1.0e-4),
+            last_source_frame,
+        },
         width,
         height,
         grade: GradeSample::from_effects(&clip.effects, rel),
         place,
         label: format!("{}  {}", track.name, clip.name),
         using_proxy,
+        clip_id: clip.id.0,
     }))
 }
 
@@ -661,6 +759,49 @@ pub fn composite(
         }
     }
     dst
+}
+
+/// Rasterize title generators and composite every layer. `media_rgba` is only
+/// called for decoded picture; titles never go through it.
+pub fn compose_layers(
+    dst_w: u32,
+    dst_h: u32,
+    seq_w: f32,
+    seq_h: f32,
+    layers: &[ProgramLayer],
+    mut media_rgba: impl FnMut(&ProgramLayer) -> Result<Vec<u8>, String>,
+) -> Result<Vec<u8>, String> {
+    let mut owned: Vec<(Vec<u8>, u32, u32, GradeSample, Place)> = Vec::new();
+    for layer in layers {
+        if !layer.place.contributes() || layer.width == 0 || layer.height == 0 {
+            continue;
+        }
+        let rgba = match &layer.source {
+            LayerSource::Title(title) => render_title(title, layer.width, layer.height),
+            LayerSource::Media { .. } => media_rgba(layer)?,
+        };
+        if rgba.len() < 4 {
+            continue;
+        }
+        owned.push((
+            rgba,
+            layer.width,
+            layer.height,
+            layer.grade.clone(),
+            layer.place,
+        ));
+    }
+    let blits: Vec<BlitLayer<'_>> = owned
+        .iter()
+        .map(|(rgba, width, height, grade, place)| BlitLayer {
+            rgba,
+            width: *width,
+            height: *height,
+            grade: grade.clone(),
+            place: *place,
+        })
+        .collect();
+    Ok(composite(dst_w, dst_h, seq_w, seq_h, &blits))
 }
 
 fn straight_full_frame(layer: &BlitLayer<'_>, dst_w: u32, dst_h: u32) -> bool {
@@ -1019,6 +1160,113 @@ fn stamp_glyph(
     }
 }
 
+/// Burn a title into a transparent RGBA buffer the size of its layer.
+///
+/// Glyphs are the same 8×8 bitmap captions use, scaled to `font_size`. The
+/// plate is a straight-alpha bar behind the block. Empty text stays clear.
+pub fn render_title(title: &Title, width: u32, height: u32) -> Vec<u8> {
+    let mut rgba = vec![0u8; width as usize * height as usize * 4];
+    if width < 4 || height < 4 {
+        return rgba;
+    }
+    let lines: Vec<Vec<char>> = title
+        .text
+        .split('\n')
+        .take(8)
+        .map(|line| line.chars().take(80).collect())
+        .collect();
+    if lines
+        .iter()
+        .all(|line| line.iter().all(|ch| ch.is_whitespace()))
+    {
+        return rgba;
+    }
+    let scale = ((title.font_size.clamp(0.02, 0.2) * height as f32) / 8.0)
+        .round()
+        .clamp(1.0, 40.0) as u32;
+    let glyph = 8 * scale;
+    let gap = scale.max(1);
+    let max_chars = lines.iter().map(|line| line.len()).max().unwrap_or(1) as u32;
+    let text_w = glyph * max_chars.max(1);
+    let text_h = glyph * lines.len() as u32 + gap * lines.len().saturating_sub(1) as u32;
+    let pad_x = glyph / 2;
+    let pad_y = (glyph / 3).max(scale);
+    let block_w = text_w + pad_x * 2;
+    let block_h = text_h + pad_y * 2;
+    let anchor_x = (title.x.clamp(0.0, 1.0) * width as f32).round() as i32;
+    let anchor_y = (title.y.clamp(0.0, 1.0) * height as f32).round() as i32;
+    let left = match title.align {
+        editor_core::TextAlign::Left => anchor_x,
+        editor_core::TextAlign::Center => anchor_x - block_w as i32 / 2,
+        editor_core::TextAlign::Right => anchor_x - block_w as i32,
+    };
+    let top = anchor_y - block_h as i32 / 2;
+    if title.plate > 0.01 {
+        let alpha = (title.plate.clamp(0.0, 1.0) * 255.0).round() as u8;
+        fill_rect(
+            &mut rgba,
+            width,
+            height,
+            left,
+            top,
+            block_w as i32,
+            block_h as i32,
+            [0, 0, 0, alpha],
+        );
+    }
+    let color = [
+        (title.color[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (title.color[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (title.color[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (title.color[3].clamp(0.0, 1.0) * 255.0).round() as u8,
+    ];
+    let mut y = top + pad_y as i32;
+    for line in &lines {
+        let line_w = glyph * line.len() as u32;
+        let line_left = match title.align {
+            editor_core::TextAlign::Left => left + pad_x as i32,
+            editor_core::TextAlign::Center => left + (block_w as i32 - line_w as i32) / 2,
+            editor_core::TextAlign::Right => left + block_w as i32 - pad_x as i32 - line_w as i32,
+        };
+        stamp_line(
+            &mut rgba,
+            width,
+            height,
+            line_left,
+            y,
+            line,
+            scale,
+            [0, 0, 0, color[3]],
+            true,
+        );
+        stamp_line(
+            &mut rgba, width, height, line_left, y, line, scale, color, false,
+        );
+        y += glyph as i32 + gap as i32;
+    }
+    rgba
+}
+
+fn stamp_line(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    mut x: i32,
+    y: i32,
+    chars: &[char],
+    scale: u32,
+    color: [u8; 4],
+    outline: bool,
+) {
+    let advance = 8 * scale as i32;
+    for ch in chars {
+        if let Some(glyph) = glyph_rows(*ch) {
+            stamp_glyph(rgba, width, height, x, y, &glyph, scale, color, outline);
+        }
+        x += advance;
+    }
+}
+
 fn fill_rect(
     rgba: &mut [u8],
     width: u32,
@@ -1078,6 +1326,29 @@ mod tests {
         assert!(lifted[0] > 0.9, "{lifted:?}");
         let neutral = GradeSample::neutral().apply([0.25, 0.5, 0.75]);
         assert!((neutral[1] - 0.5).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn lift_wheel_adds_red_to_shadows_more_than_highlights() {
+        let grade = GradeSample {
+            lift: [0.5, 0.0, 0.0],
+            ..GradeSample::neutral()
+        };
+        let dark = grade.apply([0.05, 0.05, 0.05]);
+        let bright = grade.apply([0.9, 0.9, 0.9]);
+        assert!(dark[0] - 0.05 > bright[0] - 0.9 + 0.02);
+    }
+
+    #[test]
+    fn luma_curve_lifts_mid_grey() {
+        let mut curve = ToneCurve::identity();
+        curve.set_point_y(2, 0.65);
+        let grade = GradeSample {
+            luma_curve: curve,
+            ..GradeSample::neutral()
+        };
+        let out = grade.apply([0.5, 0.5, 0.5]);
+        assert!(out[0] > 0.55, "{out:?}");
     }
 
     #[test]
@@ -1308,7 +1579,8 @@ mod tests {
         let sequence = project.active().unwrap();
         let pip = program_stack(sequence, &project.media, 60, 320, 180);
         assert!(pip.errors.is_empty(), "{:?}", pip.errors);
-        assert_eq!(pip.layers.len(), 2, "base plus picture-in-picture");
+        assert_eq!(pip.layers.len(), 3, "base, picture-in-picture, and title");
+        assert!(pip.layers[2].is_title());
         assert!(pip.layers[0].place.scale_x > 0.9);
         assert!(pip.layers[1].place.scale_x < 0.5);
         assert!(pip.layers[1].place.pos_x > 400.0);
@@ -1435,11 +1707,138 @@ mod tests {
         let full = program_stack(&sequence, &[asset.clone()], 2, 64, 36);
         assert_eq!(full.layers.len(), 1);
         assert!(!full.layers[0].using_proxy);
-        assert!(full.layers[0].path.ends_with("original.mp4"));
+        assert!(media_path(&full.layers[0]).ends_with("original.mp4"));
         let preview =
             program_stack_with(&sequence, &[asset], 2, 64, 36, crate::PreviewSource::Proxy);
         assert!(preview.layers[0].using_proxy);
-        assert!(preview.layers[0].path.ends_with("proxy.mp4"));
+        assert!(media_path(&preview.layers[0]).ends_with("proxy.mp4"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn title_raster_honours_colour_alignment_and_composites_over_picture() {
+        let mut title = editor_core::Title::new("HI");
+        title.plate = 0.0;
+        title.color = [1.0, 0.0, 0.0, 1.0];
+        title.align = editor_core::TextAlign::Center;
+        title.x = 0.5;
+        title.y = 0.5;
+        title.font_size = 0.2;
+        let centered = render_title(&title, 160, 48);
+        let (cx, _) = ink_centroid(&centered, 160, 48);
+        assert!((cx - 80.0).abs() < 18.0, "centered ink at {cx}");
+        assert!(
+            centered
+                .chunks(4)
+                .any(|px| px[0] > 200 && px[1] < 20 && px[2] < 20),
+            "title should stamp red glyphs"
+        );
+
+        title.align = editor_core::TextAlign::Left;
+        title.x = 0.05;
+        let left = render_title(&title, 160, 48);
+        let (lx, _) = ink_centroid(&left, 160, 48);
+        assert!(
+            lx < cx - 20.0,
+            "left ink {lx} should sit left of center {cx}"
+        );
+
+        let blank = editor_core::Title::new("   ");
+        let clear = render_title(&blank, 32, 32);
+        assert!(clear.iter().all(|byte| *byte == 0));
+
+        let mut sequence = Sequence::new(
+            SequenceId(1),
+            "Titles",
+            160,
+            48,
+            editor_core::Timebase::fps_24(),
+        );
+        sequence.add_track(TrackId(2), TrackKind::Video, "V1");
+        sequence.add_track(TrackId(3), TrackKind::Video, "V2");
+        let dir = std::env::temp_dir().join(format!("meridian-title-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plate.mp4");
+        std::fs::write(&path, b"media").unwrap();
+        let mut picture = Clip::basic(4, 0, 12);
+        picture.media_id = Some(MediaId(1));
+        picture.name = "PLATE".into();
+        let lower = Clip::generator(
+            5,
+            0,
+            12,
+            editor_core::Timebase::fps_24(),
+            editor_core::Title::lower_third("HI"),
+        );
+        sequence.tracks[0].clips = vec![picture];
+        sequence.tracks[1].clips = vec![lower];
+        let asset = MediaAsset {
+            id: MediaId(1),
+            bin_id: editor_core::BinId(1),
+            name: "plate".into(),
+            path: path.to_string_lossy().into_owned(),
+            duration: Frame(24),
+            timebase: editor_core::Timebase::fps_24(),
+            width: Some(160),
+            height: Some(48),
+            video_codec: Some("h264".into()),
+            audio_codec: None,
+            audio_channels: None,
+            sample_rate: None,
+            has_video: true,
+            has_audio: false,
+            offline: false,
+            proxy_path: None,
+        };
+        let stack = program_stack(&sequence, &[asset], 2, 160, 48);
+        assert!(stack.errors.is_empty(), "{:?}", stack.errors);
+        assert_eq!(stack.layers.len(), 2);
+        assert!(!stack.layers[0].is_title());
+        assert!(stack.layers[1].is_title());
+        let blue = solid(160, 48, [0, 0, 180, 255]);
+        let out =
+            compose_layers(160, 48, 160.0, 48.0, &stack.layers, |_| Ok(blue.clone())).unwrap();
+        let mut ink = 0;
+        let mut blue_left = 0;
+        for pixel in out.chunks(4) {
+            if pixel[0] > 200 && pixel[1] > 180 && pixel[2] > 160 {
+                ink += 1;
+            }
+            if pixel[2] > 140 && pixel[0] < 30 {
+                blue_left += 1;
+            }
+        }
+        assert!(ink > 8, "composited title produced {ink} light pixels");
+        assert!(
+            blue_left > 8,
+            "picture should remain outside the title plate"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn media_path(layer: &ProgramLayer) -> &str {
+        match &layer.source {
+            LayerSource::Media { path, .. } => path,
+            LayerSource::Title(_) => "",
+        }
+    }
+
+    fn ink_centroid(rgba: &[u8], w: u32, h: u32) -> (f32, f32) {
+        let mut sx = 0.0;
+        let mut sy = 0.0;
+        let mut n = 0.0;
+        for y in 0..h {
+            for x in 0..w {
+                let index = (y * w + x) as usize * 4;
+                if rgba[index] > 200 && rgba[index + 3] > 200 {
+                    sx += x as f32;
+                    sy += y as f32;
+                    n += 1.0;
+                }
+            }
+        }
+        assert!(n > 0.0, "no ink");
+        (sx / n, sy / n)
     }
 }

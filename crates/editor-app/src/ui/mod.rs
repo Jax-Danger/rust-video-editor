@@ -2,10 +2,12 @@
 
 mod audio_slot;
 mod captions;
+mod colour;
 mod deliver;
 mod inspector;
 mod mixer;
 mod pool;
+mod scopes;
 mod timeline;
 mod viewer;
 pub mod widgets;
@@ -17,6 +19,7 @@ pub use captions::captions_panel;
 pub use deliver::deliver_panel;
 pub use inspector::inspector_panel;
 pub use pool::media_pool;
+pub use scopes::scopes_panel;
 pub use timeline::timeline_panel;
 pub use viewer::viewer_panel;
 

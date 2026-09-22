@@ -358,6 +358,79 @@ pub fn param_slider(
     }
 }
 
+/// Slider without a keyframe diamond. Title layout uses this; grades keep [`param_slider`].
+pub fn value_slider(
+    ui: &mut Ui,
+    label: &str,
+    value: f32,
+    range: std::ops::RangeInclusive<f32>,
+) -> SliderEdit {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
+    let painter = ui.painter();
+    let label_end = rect.left() + 92.0;
+    painter.text(
+        pos2(rect.left() + 2.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::new(12.0, egui::FontFamily::Proportional),
+        THEME.text,
+    );
+    let value_rect = Rect::from_min_max(
+        pos2(rect.right() - 58.0, rect.top()),
+        pos2(rect.right() - 4.0, rect.bottom()),
+    );
+    let track = Rect::from_min_max(
+        pos2(label_end, rect.center().y - 2.0),
+        pos2(value_rect.left() - 6.0, rect.center().y + 2.0),
+    );
+    let min = *range.start();
+    let max = *range.end();
+    let span = (max - min).abs().max(0.0001);
+    let t = ((value - min) / span).clamp(0.0, 1.0);
+    painter.rect_filled(track, 2.0, THEME.inset);
+    let filled = Rect::from_min_max(
+        track.min,
+        pos2(track.left() + track.width() * t, track.bottom()),
+    );
+    painter.rect_filled(filled, 2.0, THEME.accent_dim);
+    let knob = Pos2::new(track.left() + track.width() * t, track.center().y);
+    painter.circle_filled(knob, 5.0, THEME.text);
+    painter.circle_stroke(knob, 5.0, Stroke::new(1.0_f32, THEME.accent));
+    let shown = if span >= 40.0 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.2}")
+    };
+    painter.text(
+        value_rect.right_center(),
+        Align2::RIGHT_CENTER,
+        shown,
+        FontId::new(11.0, egui::FontFamily::Monospace),
+        THEME.text_dim,
+    );
+    let hit = Rect::from_min_max(
+        pos2(track.left(), rect.top()),
+        pos2(value_rect.right(), rect.bottom()),
+    );
+    let drag = ui.interact(hit, Id::new(("value", label)), Sense::click_and_drag());
+    let mut next = value;
+    let mut changed = false;
+    if (drag.dragged() || drag.clicked()) && hit.width() > 1.0 {
+        if let Some(pos) = drag.interact_pointer_pos() {
+            let nt = ((pos.x - track.left()) / track.width().max(1.0)).clamp(0.0, 1.0);
+            next = min + nt * span;
+            changed = (next - value).abs() > f32::EPSILON || drag.clicked();
+        }
+    }
+    SliderEdit {
+        value: next,
+        started: drag.drag_started(),
+        changed,
+        stopped: drag.drag_stopped(),
+        key_clicked: false,
+    }
+}
+
 fn paint_diamond(painter: &Painter, rect: Rect, filled: bool) {
     let c = rect.center();
     let points = vec![

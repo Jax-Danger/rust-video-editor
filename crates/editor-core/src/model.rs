@@ -224,6 +224,112 @@ pub struct CaptionCue {
     pub speaker: Option<String>,
 }
 
+/// Horizontal anchor for a title block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextAlign {
+    Left,
+    Center,
+    Right,
+}
+
+impl Default for TextAlign {
+    fn default() -> Self {
+        Self::Center
+    }
+}
+
+fn default_title_text() -> String {
+    "Title".into()
+}
+fn default_title_size() -> f32 {
+    0.064
+}
+fn default_title_color() -> [f32; 4] {
+    [1.0, 1.0, 1.0, 1.0]
+}
+fn default_title_x() -> f32 {
+    0.5
+}
+fn default_title_y() -> f32 {
+    0.8
+}
+fn default_title_plate() -> f32 {
+    0.55
+}
+
+/// Generator text drawn into the frame by the shared compositor.
+///
+/// `x` and `y` are normalized anchors (0…1, y down). `font_size` is the glyph
+/// box as a fraction of the sequence height. `plate` is the opacity of the
+/// bar behind the text; 0 draws glyphs only.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Title {
+    #[serde(default = "default_title_text")]
+    pub text: String,
+    #[serde(default = "default_title_size")]
+    pub font_size: f32,
+    #[serde(default = "default_title_color")]
+    pub color: [f32; 4],
+    #[serde(default)]
+    pub align: TextAlign,
+    #[serde(default = "default_title_x")]
+    pub x: f32,
+    #[serde(default = "default_title_y")]
+    pub y: f32,
+    #[serde(default = "default_title_plate")]
+    pub plate: f32,
+}
+
+impl Title {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            font_size: default_title_size(),
+            color: default_title_color(),
+            align: TextAlign::Center,
+            x: default_title_x(),
+            y: default_title_y(),
+            plate: default_title_plate(),
+        }
+    }
+
+    /// Lower-third defaults: centered, near the bottom, with a readable plate.
+    pub fn lower_third(text: impl Into<String>) -> Self {
+        let mut title = Self::new(text);
+        title.y = 0.82;
+        title.font_size = 0.062;
+        title.plate = 0.62;
+        title
+    }
+
+    pub fn sanitized(mut self) -> Self {
+        if self.text.trim().is_empty() {
+            self.text.clear();
+        }
+        self.font_size = self.font_size.clamp(0.02, 0.2);
+        self.x = self.x.clamp(0.0, 1.0);
+        self.y = self.y.clamp(0.0, 1.0);
+        self.plate = self.plate.clamp(0.0, 1.0);
+        self.color = self.color.map(|channel| channel.clamp(0.0, 1.0));
+        self
+    }
+
+    /// Timeline label: the first non-empty line, trimmed to a clip name.
+    pub fn timeline_name(&self) -> String {
+        let line = self
+            .text
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("Title");
+        let mut name: String = line.trim().chars().take(48).collect();
+        if name.is_empty() {
+            name = "Title".into();
+        }
+        name
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Clip {
     pub id: ClipId,
@@ -262,6 +368,10 @@ pub struct Clip {
         deserialize_with = "deserialize_volume"
     )]
     pub volume: AnimatedF32,
+    /// When set, this clip is a title generator. It has no media file; the
+    /// compositor rasterizes [`Title`] into the frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<Title>,
 }
 
 impl Clip {
@@ -308,7 +418,38 @@ impl Clip {
             effects: Vec::new(),
             label: LabelColor::Neutral,
             volume: AnimatedF32::constant(1.0),
+            title: None,
         }
+    }
+
+    /// A title generator. Source handles are an hour on each side so the clip
+    /// can be trimmed longer without a media file.
+    pub fn generator(id: u64, start: i64, end: i64, timebase: Timebase, title: Title) -> Self {
+        let title = title.sanitized();
+        let dur = (end - start).max(1);
+        let pad = 24 * 60 * 60;
+        Self {
+            id: ClipId(id),
+            media_id: None,
+            name: title.timeline_name(),
+            timeline_in: Frame(start),
+            timeline_out: Frame(start + dur),
+            source_in: Frame(pad),
+            source_out: Frame(pad + dur),
+            source_min: Frame(0),
+            source_max: Frame(pad + dur + pad),
+            media_timebase: timebase,
+            linked: Vec::new(),
+            enabled: true,
+            effects: Vec::new(),
+            label: LabelColor::Rose,
+            volume: AnimatedF32::constant(1.0),
+            title: Some(title),
+        }
+    }
+
+    pub fn is_title(&self) -> bool {
+        self.title.is_some()
     }
 
     /// Give the clip unused media before (`head`) and after (`tail`) the current source.

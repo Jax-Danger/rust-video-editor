@@ -182,6 +182,63 @@
                   },
                   "saturation": {
                     "base": 0.92
+                  },
+                  "lift": {
+                    "red": {
+                      "base": 0.0
+                    },
+                    "green": {
+                      "base": 0.0
+                    },
+                    "blue": {
+                      "base": 0.0
+                    }
+                  },
+                  "gamma": {
+                    "red": {
+                      "base": 0.0
+                    },
+                    "green": {
+                      "base": 0.0
+                    },
+                    "blue": {
+                      "base": 0.0
+                    }
+                  },
+                  "gain": {
+                    "red": {
+                      "base": 0.0
+                    },
+                    "green": {
+                      "base": 0.0
+                    },
+                    "blue": {
+                      "base": 0.0
+                    }
+                  },
+                  "luma_curve": {
+                    "points": [
+                      [
+                        0.0,
+                        0.0
+                      ],
+                      [
+                        0.25,
+                        0.25
+                      ],
+                      [
+                        0.5,
+                        0.5
+                      ],
+                      [
+                        0.75,
+                        0.75
+                      ],
+                      [
+                        1.0,
+                        1.0
+                      ]
+                    ]
                   }
                 }
               ],
@@ -228,6 +285,63 @@
                   },
                   "saturation": {
                     "base": 1.18
+                  },
+                  "lift": {
+                    "red": {
+                      "base": 0.0
+                    },
+                    "green": {
+                      "base": 0.0
+                    },
+                    "blue": {
+                      "base": 0.0
+                    }
+                  },
+                  "gamma": {
+                    "red": {
+                      "base": 0.0
+                    },
+                    "green": {
+                      "base": 0.0
+                    },
+                    "blue": {
+                      "base": 0.0
+                    }
+                  },
+                  "gain": {
+                    "red": {
+                      "base": 0.0
+                    },
+                    "green": {
+                      "base": 0.0
+                    },
+                    "blue": {
+                      "base": 0.0
+                    }
+                  },
+                  "luma_curve": {
+                    "points": [
+                      [
+                        0.0,
+                        0.0
+                      ],
+                      [
+                        0.25,
+                        0.25
+                      ],
+                      [
+                        0.5,
+                        0.5
+                      ],
+                      [
+                        0.75,
+                        0.75
+                      ],
+                      [
+                        1.0,
+                        1.0
+                      ]
+                    ]
                   }
                 }
               ],
@@ -274,6 +388,63 @@
                   },
                   "saturation": {
                     "base": 0.92
+                  },
+                  "lift": {
+                    "red": {
+                      "base": 0.0
+                    },
+                    "green": {
+                      "base": 0.0
+                    },
+                    "blue": {
+                      "base": 0.0
+                    }
+                  },
+                  "gamma": {
+                    "red": {
+                      "base": 0.0
+                    },
+                    "green": {
+                      "base": 0.0
+                    },
+                    "blue": {
+                      "base": 0.0
+                    }
+                  },
+                  "gain": {
+                    "red": {
+                      "base": 0.0
+                    },
+                    "green": {
+                      "base": 0.0
+                    },
+                    "blue": {
+                      "base": 0.0
+                    }
+                  },
+                  "luma_curve": {
+                    "points": [
+                      [
+                        0.0,
+                        0.0
+                      ],
+                      [
+                        0.25,
+                        0.25
+                      ],
+                      [
+                        0.5,
+                        0.5
+                      ],
+                      [
+                        0.75,
+                        0.75
+                      ],
+                      [
+                        1.0,
+                        1.0
+                      ]
+                    ]
                   }
                 }
               ],
@@ -393,7 +564,38 @@
           "muted": false,
           "solo": false,
           "sync_lock": true,
-          "clips": []
+          "clips": [
+            {
+              "id": 305,
+              "name": "NORTHLINE",
+              "timeline_in": 0,
+              "timeline_out": 120,
+              "source_in": 86400,
+              "source_out": 86520,
+              "source_min": 0,
+              "source_max": 172920,
+              "media_timebase": {
+                "numerator": 24,
+                "denominator": 1
+              },
+              "enabled": true,
+              "label": "rose",
+              "title": {
+                "text": "NORTHLINE",
+                "font_size": 0.062,
+                "color": [
+                  0.96,
+                  0.93,
+                  0.86,
+                  1.0
+                ],
+                "align": "center",
+                "x": 0.5,
+                "y": 0.82,
+                "plate": 0.62
+              }
+            }
+          ]
         },
         {
           "id": 211,

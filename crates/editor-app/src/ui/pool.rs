@@ -14,6 +14,9 @@ pub fn media_pool(ui: &mut egui::Ui, app: &mut MeridianApp) {
         if widgets::ghost_button(ui, "Import") {
             app.import_dialog();
         }
+        if widgets::ghost_button(ui, "New Title") {
+            app.add_title();
+        }
     });
     proxy_bar(ui, app);
 

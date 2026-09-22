@@ -604,10 +604,15 @@ fn lane(
             }
         }
         if crect.width() >= 18.0 {
+            let clip_label = if clip.is_title() {
+                format!("T  {}", clip.name)
+            } else {
+                clip.name.clone()
+            };
             painter.with_clip_rect(crect.shrink(3.0)).text(
                 crect.left_center() + Vec2::new(5.0, 0.0),
                 Align2::LEFT_CENTER,
-                &clip.name,
+                &clip_label,
                 THEME.font(10.5),
                 Color32::WHITE,
             );
