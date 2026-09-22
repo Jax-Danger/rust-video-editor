@@ -126,6 +126,144 @@ pub enum GradeParam {
     Temperature,
     Tint,
     Saturation,
+    LiftRed,
+    LiftGreen,
+    LiftBlue,
+    GammaRed,
+    GammaGreen,
+    GammaBlue,
+    GainRed,
+    GainGreen,
+    GainBlue,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WheelKind {
+    Lift,
+    Gamma,
+    Gain,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WheelChannel {
+    Red,
+    Green,
+    Blue,
+}
+
+/// RGB offset for a lift / gamma / gain wheel. Each channel is keyframeable.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RgbWheel {
+    pub red: AnimatedF32,
+    pub green: AnimatedF32,
+    pub blue: AnimatedF32,
+}
+
+impl RgbWheel {
+    pub fn neutral() -> Self {
+        Self {
+            red: AnimatedF32::constant(0.0),
+            green: AnimatedF32::constant(0.0),
+            blue: AnimatedF32::constant(0.0),
+        }
+    }
+
+    pub fn channel_mut(&mut self, channel: WheelChannel) -> &mut AnimatedF32 {
+        match channel {
+            WheelChannel::Red => &mut self.red,
+            WheelChannel::Green => &mut self.green,
+            WheelChannel::Blue => &mut self.blue,
+        }
+    }
+
+    pub fn channel(&self, channel: WheelChannel) -> &AnimatedF32 {
+        match channel {
+            WheelChannel::Red => &self.red,
+            WheelChannel::Green => &self.green,
+            WheelChannel::Blue => &self.blue,
+        }
+    }
+
+    pub fn values_at(&self, rel: i64) -> [f32; 3] {
+        [
+            self.red.value_at(rel),
+            self.green.value_at(rel),
+            self.blue.value_at(rel),
+        ]
+    }
+}
+
+impl Default for RgbWheel {
+    fn default() -> Self {
+        Self::neutral()
+    }
+}
+
+/// Monotone luma curve. Endpoints stay at (0, 0) and (1, 1); interior points
+/// are editable in the Colour workspace.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToneCurve {
+    /// Sorted (input, output) pairs in 0…1. The first and last are fixed.
+    pub points: Vec<(f32, f32)>,
+}
+
+impl ToneCurve {
+    pub fn identity() -> Self {
+        Self {
+            points: vec![
+                (0.0, 0.0),
+                (0.25, 0.25),
+                (0.5, 0.5),
+                (0.75, 0.75),
+                (1.0, 1.0),
+            ],
+        }
+    }
+
+    /// Evaluate the curve at `x` with linear segments between control points.
+    pub fn eval(&self, x: f32) -> f32 {
+        let x = x.clamp(0.0, 1.0);
+        if self.points.is_empty() {
+            return x;
+        }
+        let mut pts = self.points.clone();
+        pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        if x <= pts[0].0 {
+            return pts[0].1;
+        }
+        if x >= pts[pts.len() - 1].0 {
+            return pts[pts.len() - 1].1;
+        }
+        for pair in pts.windows(2) {
+            let (x0, y0) = pair[0];
+            let (x1, y1) = pair[1];
+            if x >= x0 && x <= x1 {
+                if (x1 - x0).abs() < 1.0e-6 {
+                    return y0;
+                }
+                let t = (x - x0) / (x1 - x0);
+                return y0 + (y1 - y0) * t;
+            }
+        }
+        x
+    }
+
+    /// Move an interior control point. Index 0 and len-1 are the fixed ends.
+    pub fn set_point_y(&mut self, index: usize, y: f32) {
+        if index == 0 || index + 1 >= self.points.len() {
+            return;
+        }
+        let y = y.clamp(0.0, 1.0);
+        self.points[index].1 = y;
+    }
+}
+
+impl Default for ToneCurve {
+    fn default() -> Self {
+        Self::identity()
+    }
 }
 
 /// Neutral grade: exposure 0 stops, contrast 1, saturation 1, offsets 0.
@@ -138,6 +276,14 @@ pub struct ColorGrade {
     pub temperature: AnimatedF32,
     pub tint: AnimatedF32,
     pub saturation: AnimatedF32,
+    #[serde(default)]
+    pub lift: RgbWheel,
+    #[serde(default)]
+    pub gamma: RgbWheel,
+    #[serde(default)]
+    pub gain: RgbWheel,
+    #[serde(default)]
+    pub luma_curve: ToneCurve,
 }
 
 impl ColorGrade {
@@ -150,6 +296,26 @@ impl ColorGrade {
             temperature: AnimatedF32::constant(0.0),
             tint: AnimatedF32::constant(0.0),
             saturation: AnimatedF32::constant(1.0),
+            lift: RgbWheel::neutral(),
+            gamma: RgbWheel::neutral(),
+            gain: RgbWheel::neutral(),
+            luma_curve: ToneCurve::identity(),
+        }
+    }
+
+    pub fn wheel_mut(&mut self, kind: WheelKind) -> &mut RgbWheel {
+        match kind {
+            WheelKind::Lift => &mut self.lift,
+            WheelKind::Gamma => &mut self.gamma,
+            WheelKind::Gain => &mut self.gain,
+        }
+    }
+
+    pub fn wheel(&self, kind: WheelKind) -> &RgbWheel {
+        match kind {
+            WheelKind::Lift => &self.lift,
+            WheelKind::Gamma => &self.gamma,
+            WheelKind::Gain => &self.gain,
         }
     }
 
@@ -162,6 +328,15 @@ impl ColorGrade {
             GradeParam::Temperature => &mut self.temperature,
             GradeParam::Tint => &mut self.tint,
             GradeParam::Saturation => &mut self.saturation,
+            GradeParam::LiftRed => &mut self.lift.red,
+            GradeParam::LiftGreen => &mut self.lift.green,
+            GradeParam::LiftBlue => &mut self.lift.blue,
+            GradeParam::GammaRed => &mut self.gamma.red,
+            GradeParam::GammaGreen => &mut self.gamma.green,
+            GradeParam::GammaBlue => &mut self.gamma.blue,
+            GradeParam::GainRed => &mut self.gain.red,
+            GradeParam::GainGreen => &mut self.gain.green,
+            GradeParam::GainBlue => &mut self.gain.blue,
         }
     }
 
@@ -174,6 +349,15 @@ impl ColorGrade {
             GradeParam::Temperature => &self.temperature,
             GradeParam::Tint => &self.tint,
             GradeParam::Saturation => &self.saturation,
+            GradeParam::LiftRed => &self.lift.red,
+            GradeParam::LiftGreen => &self.lift.green,
+            GradeParam::LiftBlue => &self.lift.blue,
+            GradeParam::GammaRed => &self.gamma.red,
+            GradeParam::GammaGreen => &self.gamma.green,
+            GradeParam::GammaBlue => &self.gamma.blue,
+            GradeParam::GainRed => &self.gain.red,
+            GradeParam::GainGreen => &self.gain.green,
+            GradeParam::GainBlue => &self.gain.blue,
         }
     }
 }
@@ -335,5 +519,16 @@ mod tests {
         anim.write_at(8, 4.0);
         assert!(anim.has_key(8));
         assert!((anim.value_at(8) - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tone_curve_identity_and_lift() {
+        let curve = ToneCurve::identity();
+        assert!((curve.eval(0.5) - 0.5).abs() < 1.0e-4);
+        let mut lifted = ToneCurve::identity();
+        lifted.set_point_y(2, 0.65);
+        assert!(lifted.eval(0.5) > 0.5);
+        assert!((lifted.eval(0.0) - 0.0).abs() < 1.0e-4);
+        assert!((lifted.eval(1.0) - 1.0).abs() < 1.0e-4);
     }
 }

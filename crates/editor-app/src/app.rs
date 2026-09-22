@@ -1483,6 +1483,13 @@ impl eframe::App for MeridianApp {
                     .show(ctx, |ui| ui::viewer_panel(ui, self));
             }
             Workspace::Colour => {
+                egui::SidePanel::left("colour_scopes")
+                    .resizable(true)
+                    .default_width(248.0)
+                    .width_range(180.0..=400.0)
+                    .frame(theme::panel_frame())
+                    .show_separator_line(true)
+                    .show(ctx, |ui| ui::scopes_panel(ui, self));
                 egui::SidePanel::right("colour_inspector")
                     .resizable(true)
                     .default_width((inspector_w + 56.0).min(460.0))

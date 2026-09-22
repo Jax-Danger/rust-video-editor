@@ -821,6 +821,48 @@ pub fn set_grade_at(
     })
 }
 
+/// Write all three RGB offsets for a lift / gamma / gain wheel at once.
+pub fn set_wheel_offsets_at(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    clip_id: ClipId,
+    wheel: crate::effects::WheelKind,
+    clip_relative_frame: i64,
+    red: f32,
+    green: f32,
+    blue: f32,
+) -> Result<(), EditError> {
+    map_sequence(project, sequence_id, |sequence, _alloc| {
+        let (ti, ci) = sequence
+            .locate_clip(clip_id)
+            .ok_or(EditError::ClipNotFound)?;
+        let grade = color_grade_mut(&mut sequence.tracks[ti].clips[ci].effects);
+        let wheel = grade.wheel_mut(wheel);
+        wheel.red.write_at(clip_relative_frame, red);
+        wheel.green.write_at(clip_relative_frame, green);
+        wheel.blue.write_at(clip_relative_frame, blue);
+        Ok(())
+    })
+}
+
+/// Move an interior luma-curve control point. Endpoints stay fixed.
+pub fn set_luma_curve_point(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    clip_id: ClipId,
+    index: usize,
+    output_y: f32,
+) -> Result<(), EditError> {
+    map_sequence(project, sequence_id, |sequence, _alloc| {
+        let (ti, ci) = sequence
+            .locate_clip(clip_id)
+            .ok_or(EditError::ClipNotFound)?;
+        let grade = color_grade_mut(&mut sequence.tracks[ti].clips[ci].effects);
+        grade.luma_curve.set_point_y(index, output_y);
+        Ok(())
+    })
+}
+
 pub fn set_transform_at(
     project: &mut Project,
     sequence_id: SequenceId,

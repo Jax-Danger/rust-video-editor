@@ -95,7 +95,7 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
                                 rgba: &image.rgba,
                                 width: image.width,
                                 height: image.height,
-                                grade: layer.grade,
+                                grade: layer.grade.clone(),
                                 place: layer.place,
                             })
                             .collect();
@@ -518,6 +518,19 @@ impl DecodePlan {
             bits(layer.grade.temperature).hash(&mut hasher);
             bits(layer.grade.tint).hash(&mut hasher);
             bits(layer.grade.saturation).hash(&mut hasher);
+            for channel in layer.grade.lift {
+                bits(channel).hash(&mut hasher);
+            }
+            for channel in layer.grade.gamma {
+                bits(channel).hash(&mut hasher);
+            }
+            for channel in layer.grade.gain {
+                bits(channel).hash(&mut hasher);
+            }
+            for (input, output) in &layer.grade.luma_curve.points {
+                bits(*input).hash(&mut hasher);
+                bits(*output).hash(&mut hasher);
+            }
             bits(layer.place.scale_x).hash(&mut hasher);
             bits(layer.place.scale_y).hash(&mut hasher);
             bits(layer.place.pos_x).hash(&mut hasher);
