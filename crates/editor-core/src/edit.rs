@@ -16,8 +16,8 @@ use crate::effects::{
     TransformParam,
 };
 use crate::model::{
-    CaptionCue, Clip, ClipId, CueId, Marker, MarkerId, MediaAsset, MediaId, Project, Sequence,
-    SequenceId, Title, TrackId, TrackKind, Transition, TransitionAlign, TransitionId,
+    CaptionCue, Clip, ClipId, ClipSpeed, CueId, Marker, MarkerId, MediaAsset, MediaId, Project,
+    Sequence, SequenceId, Title, TrackId, TrackKind, Transition, TransitionAlign, TransitionId,
     TransitionKind,
 };
 use crate::time::{convert_frames, mul_div_round, Frame, Timebase};
@@ -587,7 +587,7 @@ pub fn ripple_trim(
                 sequence.tracks[ti].clips[ci].timeline_out = Frame(new_out);
             }
         }
-        ripple_downstream(sequence, origin, old_out, delta, clip_id)?;
+        ripple_downstream_except(sequence, origin, old_out, delta, clip_id, &[])?;
         Ok(())
     })
 }
@@ -904,7 +904,9 @@ pub fn set_filter_at(
         let effects = &mut sequence.tracks[ti].clips[ci].effects;
         match param {
             crate::effects::FilterParam::BlurRadius => {
-                blur_mut(effects).radius.write_at(clip_relative_frame, value.max(0.0));
+                blur_mut(effects)
+                    .radius
+                    .write_at(clip_relative_frame, value.max(0.0));
             }
             crate::effects::FilterParam::VignetteAmount => {
                 vignette_mut(effects)
@@ -1379,6 +1381,7 @@ pub fn clip_from_media(
         },
         volume: crate::effects::AnimatedF32::constant(1.0),
         title: None,
+        speed: ClipSpeed::normal(),
     })
 }
 
@@ -1494,6 +1497,17 @@ pub fn link_clips(a: &mut Clip, b: &mut Clip) {
 }
 
 fn source_delta(clip: &Clip, timeline_delta: i64, sequence_timebase: Timebase) -> i64 {
+    // A retimed clip consumes source at its average rate, so a trim of one
+    // timeline frame moves as many source frames as playback would.
+    if !clip.speed.is_identity() {
+        let rate = clip.speed.average_rate(clip.duration().max(1));
+        return crate::speed::source_frames_for_rate(
+            timeline_delta,
+            rate,
+            sequence_timebase,
+            clip.media_timebase,
+        );
+    }
     // Prefer the clip's own source/timeline ratio so a 1x clip stays 1:1 even
     // after trims, and fall back to the timebase mapping when the spans match
     // a pure rate conversion.
@@ -1510,9 +1524,68 @@ fn source_delta(clip: &Clip, timeline_delta: i64, sequence_timebase: Timebase) -
 }
 
 /// Media frame of `clip` corresponding to `timeline_frame` on the sequence.
+///
+/// A 100% forward clip keeps the integer timebase mapping. Any other speed,
+/// including a ramp or reverse, samples the integral of the rate curve.
 pub fn source_frame_at(clip: &Clip, timeline_frame: Frame, sequence_timebase: Timebase) -> Frame {
+    if !clip.speed.is_identity() {
+        return crate::speed::mapped_source_frame(clip, timeline_frame, sequence_timebase);
+    }
     let delta = timeline_frame.0 - clip.timeline_in.0;
     Frame(clip.source_in.0 + source_delta(clip, delta, sequence_timebase))
+}
+
+/// Set playback speed on `clip_id` and every clip linked to it.
+///
+/// The timeline duration becomes the length that consumes the same source
+/// range at the new average rate. Later clips on the clip's track and on
+/// sync-locked tracks shift by that change. Linked clips take the same speed
+/// and the same duration so picture and sound stay aligned. Reverse does not
+/// change the duration.
+pub fn set_clip_speed(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    clip_id: ClipId,
+    speed: ClipSpeed,
+) -> Result<(), EditError> {
+    let speed = speed.sanitized();
+    map_sequence(project, sequence_id, |sequence, _alloc| {
+        let (ti, ci) = sequence
+            .locate_clip(clip_id)
+            .ok_or(EditError::ClipNotFound)?;
+        if sequence.tracks[ti].locked {
+            return Err(EditError::TrackLocked);
+        }
+        let group = linked_group(sequence, clip_id);
+        for id in &group {
+            let (track_index, _) = sequence.locate_clip(*id).ok_or(EditError::ClipNotFound)?;
+            if sequence.tracks[track_index].locked {
+                return Err(EditError::TrackLocked);
+            }
+        }
+        let primary = sequence.tracks[ti].clips[ci].clone();
+        let old_out = primary.timeline_out.0;
+        let rate = speed.average_rate(primary.duration().max(1));
+        let new_span = crate::speed::timeline_span_for_speed(
+            primary.source_duration().max(1),
+            rate,
+            primary.media_timebase,
+            sequence.timebase,
+        );
+        let delta = new_span - primary.duration();
+        for id in &group {
+            let (track_index, clip_index) =
+                sequence.locate_clip(*id).ok_or(EditError::ClipNotFound)?;
+            let clip = &mut sequence.tracks[track_index].clips[clip_index];
+            clip.speed = speed.clone();
+            clip.timeline_out = Frame(clip.timeline_in.0 + new_span);
+        }
+        if delta != 0 {
+            let origin = sequence.tracks[ti].id;
+            ripple_downstream_except(sequence, origin, old_out, delta, clip_id, &group)?;
+        }
+        Ok(())
+    })
 }
 
 fn overlap_pair(duration: i64, alignment: TransitionAlign) -> (i64, i64) {
@@ -1784,12 +1857,13 @@ fn relink_splits(sequence: &mut Sequence, pairs: &[(ClipId, ClipId)]) {
     }
 }
 
-fn ripple_downstream(
+fn ripple_downstream_except(
     sequence: &mut Sequence,
     origin: TrackId,
     at: i64,
     delta: i64,
     skip: ClipId,
+    except: &[ClipId],
 ) -> Result<(), EditError> {
     let timebase = sequence.timebase;
     for track in &mut sequence.tracks {
@@ -1803,7 +1877,7 @@ fn ripple_downstream(
             continue;
         }
         for clip in &mut track.clips {
-            if clip.id == skip {
+            if clip.id == skip || except.contains(&clip.id) {
                 continue;
             }
             if clip.timeline_in.0 >= at {
@@ -1975,6 +2049,103 @@ mod tests {
             source_frame_at(&handled, Frame(25), Timebase::fps_24()).0,
             20
         );
+    }
+
+    #[test]
+    fn set_speed_ripples_duration_and_linked_audio_keeps_the_same_span() {
+        let mut sequence = Sequence::new(SequenceId(1), "T", 1920, 1080, Timebase::fps_24());
+        let video = sequence.add_track(TrackId(2), TrackKind::Video, "V1");
+        let audio = sequence.add_track(TrackId(3), TrackKind::Audio, "A1");
+        sequence.tracks[0].sync_lock = true;
+        sequence.tracks[1].sync_lock = true;
+        let mut picture = Clip::basic(1, 0, 48);
+        let mut voice = Clip::basic(2, 0, 48);
+        link_clips(&mut picture, &mut voice);
+        sequence.tracks[0].clips = vec![picture, Clip::basic(3, 48, 96)];
+        sequence.tracks[1].clips = vec![voice];
+        let mut project = project_with(sequence);
+        set_clip_speed(
+            &mut project,
+            SequenceId(1),
+            ClipId(1),
+            ClipSpeed::constant(2.0, false),
+        )
+        .unwrap();
+        let seq = project.sequence(SequenceId(1)).unwrap();
+        let picture = seq.clip(ClipId(1)).unwrap();
+        assert_eq!((picture.timeline_in.0, picture.timeline_out.0), (0, 24));
+        assert_eq!((picture.source_in.0, picture.source_out.0), (0, 48));
+        assert!((picture.speed.start_rate() - 2.0).abs() < 1.0e-6);
+        assert_eq!(source_frame_at(picture, Frame(0), Timebase::fps_24()).0, 0);
+        assert_eq!(
+            source_frame_at(picture, Frame(12), Timebase::fps_24()).0,
+            24
+        );
+        let voice = seq.clip(ClipId(2)).unwrap();
+        assert_eq!((voice.timeline_in.0, voice.timeline_out.0), (0, 24));
+        assert!(voice.speed.mutes_audio());
+        assert_eq!(source_frame_at(voice, Frame(12), Timebase::fps_24()).0, 24);
+        let later = seq.clip(ClipId(3)).unwrap();
+        assert_eq!((later.timeline_in.0, later.timeline_out.0), (24, 72));
+        assert_eq!(later.source_in.0, 0);
+
+        set_clip_speed(
+            &mut project,
+            SequenceId(1),
+            ClipId(1),
+            ClipSpeed::ramp(1.0, 3.0, false),
+        )
+        .unwrap();
+        let seq = project.sequence(SequenceId(1)).unwrap();
+        let picture = seq.clip(ClipId(1)).unwrap();
+        assert_eq!(picture.duration(), 24);
+        assert_eq!(
+            source_frame_at(picture, Frame(12), Timebase::fps_24()).0,
+            18
+        );
+        let later = seq.clip(ClipId(3)).unwrap();
+        assert_eq!((later.timeline_in.0, later.timeline_out.0), (24, 72));
+
+        set_clip_speed(
+            &mut project,
+            SequenceId(1),
+            ClipId(1),
+            ClipSpeed::constant(1.0, true),
+        )
+        .unwrap();
+        let seq = project.sequence(SequenceId(1)).unwrap();
+        let picture = seq.clip(ClipId(1)).unwrap();
+        assert_eq!((picture.timeline_in.0, picture.timeline_out.0), (0, 48));
+        assert_eq!(source_frame_at(picture, Frame(0), Timebase::fps_24()).0, 47);
+        assert_eq!(source_frame_at(picture, Frame(1), Timebase::fps_24()).0, 46);
+        let later = seq.clip(ClipId(3)).unwrap();
+        assert_eq!((later.timeline_in.0, later.timeline_out.0), (48, 96));
+        let _ = (video, audio);
+    }
+
+    #[test]
+    fn trim_on_a_fast_clip_consumes_source_at_that_speed() {
+        let (mut sequence, track) = video_sequence();
+        sequence.tracks[0].clips = vec![Clip::basic(1, 0, 48).with_handles(0, 24)];
+        let mut project = project_with(sequence);
+        set_clip_speed(
+            &mut project,
+            SequenceId(1),
+            ClipId(1),
+            ClipSpeed::constant(2.0, false),
+        )
+        .unwrap();
+        trim(&mut project, SequenceId(1), ClipId(1), TrimEdge::Tail, 2).unwrap();
+        let clip = project
+            .sequence(SequenceId(1))
+            .unwrap()
+            .track(track)
+            .unwrap()
+            .clips[0]
+            .clone();
+        assert_eq!((clip.timeline_in.0, clip.timeline_out.0), (0, 26));
+        assert_eq!((clip.source_in.0, clip.source_out.0), (0, 52));
+        assert_eq!(source_frame_at(&clip, Frame(25), Timebase::fps_24()).0, 50);
     }
 
     fn video_sequence() -> (Sequence, TrackId) {

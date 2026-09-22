@@ -1,8 +1,8 @@
 use editor_core::{
-    blur, clip_relative, color_grade, crop, set_clip_gain_at, set_clip_title, set_filter_at,
-    set_grade_at, set_transform_at, sharpen, toggle_filter_key, toggle_grade_key,
-    toggle_transform_key, toggle_volume_key, transform, vignette, ClipId, FilterParam, GradeParam,
-    TextAlign, Title, TrackKind, TransformParam,
+    blur, clip_relative, color_grade, crop, set_clip_gain_at, set_clip_speed, set_clip_title,
+    set_filter_at, set_grade_at, set_transform_at, sharpen, source_frame_at, toggle_filter_key,
+    toggle_grade_key, toggle_transform_key, toggle_volume_key, transform, vignette, ClipId,
+    ClipSpeed, FilterParam, GradeParam, TextAlign, Title, TrackKind, TransformParam,
 };
 use egui::RichText;
 
@@ -83,6 +83,8 @@ fn inspector_body(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId, sna
 
     if snapshot.is_title {
         title_controls(ui, app, clip_id);
+    } else {
+        speed_controls(ui, app, clip_id);
     }
 
     let rel = clip_relative(
@@ -304,6 +306,160 @@ struct ClipSnap {
     tail_handle: i64,
     timebase: editor_core::Timebase,
     media_tb: editor_core::Timebase,
+}
+
+fn speed_controls(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId) {
+    let Some(speed) = clip_speed(app, clip_id) else {
+        return;
+    };
+    ui.add_space(8.0);
+    widgets::section_label(ui, "Speed");
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        let start = (speed.start_rate() * 100.0).round();
+        let ramping = speed.ramp_end().is_some();
+        for preset in [25.0_f32, 50.0, 100.0, 200.0, 400.0] {
+            let on = !ramping && (start - preset).abs() < 0.5;
+            if ui.selectable_label(on, format!("{preset:.0}%")).clicked() && !on {
+                write_speed(
+                    app,
+                    clip_id,
+                    ClipSpeed::constant(preset / 100.0, speed.reverse),
+                    "Speed",
+                );
+            }
+        }
+    });
+
+    let speed = clip_speed(app, clip_id).unwrap_or(speed);
+    let percent = speed.start_rate() * 100.0;
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        ui.vertical(|ui| {
+            let edit = widgets::value_slider(ui, "Speed %", percent, 25.0..=400.0);
+            if edit.started {
+                app.session.begin_interactive("Speed");
+            }
+            if edit.changed {
+                let current = clip_speed(app, clip_id).unwrap_or_else(ClipSpeed::normal);
+                let rate = edit.value.round().clamp(25.0, 400.0) / 100.0;
+                let next = match current.ramp_end() {
+                    Some(end) => ClipSpeed::ramp(rate, end, current.reverse),
+                    None => ClipSpeed::constant(rate, current.reverse),
+                };
+                write_speed(app, clip_id, next, "Speed");
+            }
+            if edit.stopped {
+                app.session.end_interactive();
+            }
+        });
+    });
+
+    let speed = clip_speed(app, clip_id).unwrap_or(speed);
+    let mut ramp = speed.ramp_end().is_some();
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        if ui.checkbox(&mut ramp, "Ramp over clip").changed() {
+            let current = clip_speed(app, clip_id).unwrap_or_else(ClipSpeed::normal);
+            let start = current.start_rate();
+            let next = if ramp {
+                let end = (start * 2.0).clamp(0.25, 4.0);
+                ClipSpeed::ramp(start, end, current.reverse)
+            } else {
+                ClipSpeed::constant(start, current.reverse)
+            };
+            write_speed(app, clip_id, next, "Speed ramp");
+        }
+    });
+    if let Some(end) = clip_speed(app, clip_id).and_then(|speed| speed.ramp_end()) {
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.vertical(|ui| {
+                let edit = widgets::value_slider(ui, "Ramp to %", end * 100.0, 25.0..=400.0);
+                if edit.started {
+                    app.session.begin_interactive("Speed ramp");
+                }
+                if edit.changed {
+                    let current = clip_speed(app, clip_id).unwrap_or_else(ClipSpeed::normal);
+                    let rate = edit.value.round().clamp(25.0, 400.0) / 100.0;
+                    write_speed(
+                        app,
+                        clip_id,
+                        ClipSpeed::ramp(current.start_rate(), rate, current.reverse),
+                        "Speed ramp",
+                    );
+                }
+                if edit.stopped {
+                    app.session.end_interactive();
+                }
+            });
+        });
+    }
+
+    let speed = clip_speed(app, clip_id).unwrap_or(speed);
+    let mut reverse = speed.reverse;
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        if ui.checkbox(&mut reverse, "Reverse").changed() {
+            let current = clip_speed(app, clip_id).unwrap_or_else(ClipSpeed::normal);
+            let next = match current.ramp_end() {
+                Some(end) => ClipSpeed::ramp(current.start_rate(), end, reverse),
+                None => ClipSpeed::constant(current.start_rate(), reverse),
+            };
+            write_speed(app, clip_id, next, "Reverse");
+        }
+    });
+
+    if let Some(line) = playhead_source_line(app, clip_id) {
+        ui.horizontal(|ui| {
+            ui.add_space(12.0);
+            ui.label(
+                RichText::new(line)
+                    .size(11.0)
+                    .monospace()
+                    .color(THEME.text_dim),
+            );
+        });
+    }
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new(
+                "Duration ripples with the average speed and later sync-locked clips shift. Linked clips follow. Audio on a retimed clip is muted.",
+            )
+            .size(11.0)
+            .color(THEME.text_mute),
+        );
+    });
+}
+
+fn clip_speed(app: &MeridianApp, id: ClipId) -> Option<ClipSpeed> {
+    Some(app.session.project().active()?.clip(id)?.speed.clone())
+}
+
+fn write_speed(app: &mut MeridianApp, clip_id: ClipId, speed: ClipSpeed, label: &str) {
+    let result = app.session.edit(label, |project| {
+        let sequence = project
+            .active_sequence
+            .ok_or(editor_core::EditError::NoActiveSequence)?;
+        set_clip_speed(project, sequence, clip_id, speed)
+    });
+    if let Err(err) = result {
+        app.status = err.to_string();
+    }
+}
+
+fn playhead_source_line(app: &MeridianApp, id: ClipId) -> Option<String> {
+    let sequence = app.session.project().active()?;
+    let clip = sequence.clip(id)?;
+    if !clip.covers(editor_core::Frame(app.playhead)) {
+        return None;
+    }
+    let frame = source_frame_at(clip, editor_core::Frame(app.playhead), sequence.timebase);
+    Some(format!(
+        "Playhead source {}",
+        format_tc(frame.0, clip.media_timebase)
+    ))
 }
 
 fn title_controls(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId) {
@@ -628,7 +784,15 @@ fn effects_controls(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId, r
             widgets::section_label(ui, "Effects");
         });
     });
-    filter_slider(ui, app, clip_id, rel, FilterParam::BlurRadius, "Blur", 0.0..=48.0);
+    filter_slider(
+        ui,
+        app,
+        clip_id,
+        rel,
+        FilterParam::BlurRadius,
+        "Blur",
+        0.0..=48.0,
+    );
     filter_slider(
         ui,
         app,
@@ -647,11 +811,51 @@ fn effects_controls(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId, r
         "Vignette softness",
         0.05..=1.0,
     );
-    filter_slider(ui, app, clip_id, rel, FilterParam::CropLeft, "Crop left", 0.0..=0.4);
-    filter_slider(ui, app, clip_id, rel, FilterParam::CropRight, "Crop right", 0.0..=0.4);
-    filter_slider(ui, app, clip_id, rel, FilterParam::CropTop, "Crop top", 0.0..=0.4);
-    filter_slider(ui, app, clip_id, rel, FilterParam::CropBottom, "Crop bottom", 0.0..=0.4);
-    filter_slider(ui, app, clip_id, rel, FilterParam::SharpenAmount, "Sharpen", 0.0..=2.0);
+    filter_slider(
+        ui,
+        app,
+        clip_id,
+        rel,
+        FilterParam::CropLeft,
+        "Crop left",
+        0.0..=0.4,
+    );
+    filter_slider(
+        ui,
+        app,
+        clip_id,
+        rel,
+        FilterParam::CropRight,
+        "Crop right",
+        0.0..=0.4,
+    );
+    filter_slider(
+        ui,
+        app,
+        clip_id,
+        rel,
+        FilterParam::CropTop,
+        "Crop top",
+        0.0..=0.4,
+    );
+    filter_slider(
+        ui,
+        app,
+        clip_id,
+        rel,
+        FilterParam::CropBottom,
+        "Crop bottom",
+        0.0..=0.4,
+    );
+    filter_slider(
+        ui,
+        app,
+        clip_id,
+        rel,
+        FilterParam::SharpenAmount,
+        "Sharpen",
+        0.0..=2.0,
+    );
 }
 
 fn filter_value(app: &MeridianApp, clip: ClipId, rel: i64, param: FilterParam) -> (f32, bool) {

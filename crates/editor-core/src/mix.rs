@@ -535,6 +535,12 @@ pub fn audio_topology(sequence: &Sequence) -> u64 {
             clip.timeline_out.0.hash(&mut hasher);
             clip.source_in.0.hash(&mut hasher);
             clip.source_out.0.hash(&mut hasher);
+            clip.speed.reverse.hash(&mut hasher);
+            clip.speed.rate.base.to_bits().hash(&mut hasher);
+            for key in &clip.speed.rate.keys {
+                key.frame.hash(&mut hasher);
+                key.value.to_bits().hash(&mut hasher);
+            }
         }
     }
     hasher.finish()

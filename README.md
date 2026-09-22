@@ -194,6 +194,18 @@ Preview (`--features ffmpeg`) and Deliver call one compositor in `editor-media`.
 
 A source is stretched to fill the clip's quad. It is not letterboxed when its aspect differs from the sequence. The monitor fits the sequence inside 960×540 before compositing; export composites at sequence size, with a decoded edge capped at 1920px. On the Northline picture-in-picture frame, a 16×16 block average of the H.264 export sits within about 1.3 levels of the CPU composite. That is the same picture through a codec, not a bit-identical file. Keyframes are evaluated on every frame in both paths.
 
+## Clip speed
+
+Select a video or audio clip. The inspector **Speed** section sets a constant rate from 25% to 400%, with presets at 25, 50, 100, 200, and 400. **Reverse** plays that same source range backwards. **Ramp over clip** draws a straight line from the start speed at the first frame to **Ramp to** at the out point.
+
+The rate is stored on the clip as an [`AnimatedF32`](crates/editor-core/src/effects.rs). A constant is `rate.base` with no keys. A ramp is a key at frame 0 and a key at frame `-1`. Frame `-1` means the clip's current out point, so a trim keeps the ramp stretched across whatever duration the clip has now. 100% forward is omitted from the project JSON. Older projects load as 100%.
+
+Changing the speed or the ramp ripples the clip's timeline duration so the same source in and out are consumed at the new average rate. Later clips on that track, and on sync-locked tracks, shift with the edit. Linked clips take the same speed and the same duration, so a linked picture and audio clip stay in line. Reverse does not change the duration. The timeline clip label shows the rate (`200%`, `100–300%`, `100% Rev`).
+
+Preview and Deliver sample picture through one function, `source_frame_at`. A 200% clip steps two source frames per timeline frame. A 50% clip holds each source frame for two timeline frames. A ramp follows the integral of the line. Once the integral leaves the source in/out, the picture holds the first or last included frame.
+
+Audio on a retimed clip is muted during playback and left out of the Deliver graph. Deliver names the clip in its report. A constant 100% forward clip, and a ramp that sits on 100% at both ends, still play. Reverse is muted too. The picture stays on the timeline clock; the sound does not play at the wrong rate and drift. Pitch-preserving resample is a follow-up.
+
 ## Templates
 
 **File → New Project** lists the presets in [`templates/`](templates/). They set resolution, frame rate, and the default video, audio, and caption tracks.
@@ -367,12 +379,13 @@ A progress bar follows ffmpeg's `out_time`. **Cancel** sends `SIGTERM`. A failed
 
 ## Tests
 
-`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, deliver presets (apply, custom JSON, last-settings round-trip), the sample project round-trip, imported media paths in JSON, proxy attach and relink, timeline culling on an 800-clip sequence, ruler spacing across an hour, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, proxy argument planning and preview fallback, the disk frame cache, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, pan, fader, burned captions, deliver bitrate hints, audio-only WAV planning), the mix bus (pan law, mute, solo, keyframed gain, peak and RMS), and the shared composite (luma curve, lift/gamma/gain wheels, grade split, dissolve mix, wipe angle, push, dip, slide, blur dissolve, iris, clip filters, anchor, caption burn-in). It does not spawn ffmpeg or whisper.
+`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, deliver presets (apply, custom JSON, last-settings round-trip), the sample project round-trip, imported media paths in JSON, proxy attach and relink, timeline culling on an 800-clip sequence, ruler spacing across an hour, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, proxy argument planning and preview fallback, the disk frame cache, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, pan, fader, burned captions, deliver bitrate hints, audio-only WAV planning, retimed source frames, muted retimed audio), the mix bus (pan law, mute, solo, keyframed gain, peak and RMS), clip speed (constant 25–400%, reverse, a linear ramp, JSON round-trip, and duration ripple), and the shared composite (luma curve, lift/gamma/gain wheels, grade split, dissolve mix, wipe angle, push, dip, slide, blur dissolve, iris, clip filters, anchor, caption burn-in). It does not spawn ffmpeg or whisper.
 
 `cargo test -p editor-media --features ffmpeg` also encodes a short H.264/AAC mp4 when `ffmpeg` is on `PATH`. `cargo test -p editor-app --features whisper` builds the local speech-to-text path; the binary and model are resolved at runtime, not at compile time.
 
 ## Roadmap
 
+- Pitch-preserving audio resample for retimed clips. Picture speed is sampled in preview and export; retimed audio is muted so it does not drift
 - GPU viewer. The CPU composite already stacks tracks, grades, transforms, eight transitions, and four clip filters; it is not a full optical-flow or blend-mode engine
 - Adjustment layers (grade/effects everything below on a track)
 - Fairlight-class dynamics, EQ, and track sends. The mixer already has faders, pan, mute, solo, meters, and keyframed clip gain

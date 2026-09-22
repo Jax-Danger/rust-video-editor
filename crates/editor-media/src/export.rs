@@ -102,8 +102,7 @@ pub fn plan_encode(
     let audio_only = hints.audio_only || is_audio_only_codec(codec, container);
     if audio_only && burn_captions {
         warnings.push(
-            "Captions are not burned into an audio-only export; use a video preset instead."
-                .into(),
+            "Captions are not burned into an audio-only export; use a video preset instead.".into(),
         );
     }
     let width = even_dim(sequence.width);
@@ -868,6 +867,13 @@ fn audible_pieces(
             warnings.push(format!("Skipped offline audio {}", asset.name));
             continue;
         }
+        if clip.speed.mutes_audio() {
+            warnings.push(format!(
+                "Muted audio on {} — retimed clips stay silent so they do not drift from the picture",
+                clip.name
+            ));
+            continue;
+        }
         let at_in = source_frame_at(clip, clip.timeline_in, sequence.timebase);
         let at_next = source_frame_at(clip, Frame(clip.timeline_in.0 + 1), sequence.timebase);
         let mut seconds_per_frame =
@@ -1154,17 +1160,16 @@ mod tests {
             asset(2, &pip, true, false),
             asset(3, &voice, false, true),
         ];
-        let script =
-            plan_encode(
-                &sequence,
-                &media,
-                ExportRange::InOut,
-                "H.264",
-                "mp4",
-                true,
-                EncodeHints::default(),
-            )
-            .unwrap();
+        let script = plan_encode(
+            &sequence,
+            &media,
+            ExportRange::InOut,
+            "H.264",
+            "mp4",
+            true,
+            EncodeHints::default(),
+        )
+        .unwrap();
         let pip_frame = &script.raster.frames[8];
         assert!(
             pip_frame
@@ -1199,6 +1204,83 @@ mod tests {
         assert!((script.duration_secs - 2.0).abs() < 1.0e-6);
         assert!(script.inputs.iter().any(|path| path.ends_with("voice.wav")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retimed_picture_samples_source_frames_and_mutes_audio() {
+        let dir = std::env::temp_dir().join(format!("meridian-plan-speed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let picture = touch(&dir, "picture.mp4");
+        let voice = touch(&dir, "voice.wav");
+        let mut sequence = Sequence::new(SequenceId(1), "Speed", 320, 180, Timebase::fps_24());
+        sequence.add_track(TrackId(2), TrackKind::Video, "V1");
+        sequence.add_track(TrackId(3), TrackKind::Audio, "A1");
+        let mut video = Clip::basic(10, 0, 24);
+        video.media_id = Some(MediaId(1));
+        video.name = "FAST".into();
+        video.source_out = Frame(48);
+        video.source_max = Frame(240);
+        video.speed = editor_core::ClipSpeed::constant(2.0, false);
+        let mut audio = Clip::basic(11, 0, 24);
+        audio.media_id = Some(MediaId(2));
+        audio.name = "FAST-A".into();
+        audio.source_out = Frame(48);
+        audio.source_max = Frame(240);
+        audio.speed = editor_core::ClipSpeed::constant(2.0, false);
+        sequence.tracks[0].clips = vec![video];
+        sequence.tracks[1].clips = vec![audio];
+        let media = vec![
+            asset(1, &picture, true, false),
+            asset(2, &voice, false, true),
+        ];
+        let script = plan_encode(
+            &sequence,
+            &media,
+            ExportRange::WholeSequence,
+            "H.264",
+            "mp4",
+            false,
+            EncodeHints::default(),
+        )
+        .unwrap();
+        assert_eq!(script.raster.frames.len(), 24);
+        assert_eq!(source_of(&script.raster.frames[0].layers[0]), 0);
+        assert_eq!(source_of(&script.raster.frames[10].layers[0]), 20);
+        assert!(script.raster.frames[0].layers[0].label.contains("200%"));
+        assert!(script
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("FAST-A") && warning.contains("Muted")));
+        assert!(script.filter.contains("anullsrc"));
+        assert!(!script.inputs.iter().any(|path| path.ends_with("voice.wav")));
+
+        sequence.tracks[0].clips[0].speed = editor_core::ClipSpeed::constant(1.0, true);
+        sequence.tracks[0].clips[0].source_out = Frame(24);
+        sequence.tracks[0].clips[0].timeline_out = Frame(8);
+        sequence.tracks[1].clips.clear();
+        let script = plan_encode(
+            &sequence,
+            &media,
+            ExportRange::WholeSequence,
+            "H.264",
+            "mp4",
+            false,
+            EncodeHints::default(),
+        )
+        .unwrap();
+        assert_eq!(source_of(&script.raster.frames[0].layers[0]), 23);
+        assert_eq!(source_of(&script.raster.frames[1].layers[0]), 22);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn source_of(layer: &ProgramLayer) -> i64 {
+        match &layer.source {
+            crate::composite::LayerSource::Media { source_frame, .. } => *source_frame,
+            crate::composite::LayerSource::Title(_)
+            | crate::composite::LayerSource::Solid { .. } => {
+                panic!("expected a media layer")
+            }
+        }
     }
 
     #[test]
