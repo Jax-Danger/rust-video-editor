@@ -3,17 +3,17 @@
 //! With `--features ffmpeg`, clips are decoded to stereo PCM by the ffmpeg CLI
 //! and played through rodio (ALSA, which PipeWire serves via `pipewire-alsa`).
 //! One worker decodes about two seconds at a time. Fader, pan, mute, solo,
-//! master, and clip gain — including keyframes — are applied in the playback
-//! callback, so a mixer move is heard on the next few milliseconds rather than
-//! the next decoded chunk. The default build keeps the same meters and reports
-//! that output is compiled into the ffmpeg feature.
+//! master, clip gain, EQ, and compressor — including keyframes — are applied
+//! in the playback callback, so a mixer move is heard on the next few
+//! milliseconds rather than the next decoded chunk. The default build keeps the
+//! same meters and reports that output is compiled into the ffmpeg feature.
 
 use editor_core::{
     audio_topology, mix_regions, multicam_audio_spans, source_frame_at, update_hold, BusState,
     Frame, MediaAsset, MulticamGroup, Sequence, TrackKind,
 };
 #[cfg(feature = "ffmpeg")]
-use editor_core::{channel_clips, mix_frame, EqProcessor};
+use editor_core::{channel_clips, mix_frame, CompressorProcessor, EqProcessor};
 use editor_media::resolve_media_path;
 
 #[cfg(feature = "ffmpeg")]
@@ -773,6 +773,7 @@ struct BusSource {
     track_ids: Vec<u64>,
     acc: Vec<(u64, f32, f32)>,
     eq: Vec<(u64, EqProcessor)>,
+    compressor: Vec<(u64, CompressorProcessor)>,
     control: std::sync::Arc<MixControl>,
     cached: std::sync::Arc<BusState>,
     fps: f64,
@@ -817,22 +818,24 @@ impl BusSource {
                 })
             });
         let mut eq = Vec::new();
+        let mut compressor = Vec::new();
         for id in &track_ids {
-            let params = cached
-                .tracks
-                .iter()
-                .find(|track| track.id == *id)
-                .map(|track| track.eq)
-                .unwrap_or_default();
-            let mut processor = EqProcessor::new();
-            processor.set_params(params);
-            eq.push((*id, processor));
+            let track = cached.tracks.iter().find(|track| track.id == *id);
+            let eq_params = track.map(|track| track.eq).unwrap_or_default();
+            let mut eq_processor = EqProcessor::new();
+            eq_processor.set_params(eq_params);
+            eq.push((*id, eq_processor));
+            let comp_params = track.map(|track| track.compressor).unwrap_or_default();
+            let mut comp_processor = CompressorProcessor::new();
+            comp_processor.set_params(comp_params);
+            compressor.push((*id, comp_processor));
         }
         Self {
             pieces,
             acc: track_ids.iter().map(|id| (*id, 0.0, 0.0)).collect(),
             track_ids,
             eq,
+            compressor,
             control,
             cached,
             fps: fps.max(1.0),
@@ -859,12 +862,31 @@ impl BusSource {
                     processor.set_params(track.eq);
                 }
             }
+            for (id, processor) in &mut self.compressor {
+                if let Some(track) = guard.tracks.iter().find(|track| track.id == *id) {
+                    processor.set_params(track.compressor);
+                }
+            }
         }
     }
 
     fn apply_track_eq(&mut self) {
         for slot in &mut self.acc {
             if let Some((_, processor)) = self.eq.iter_mut().find(|(id, _)| *id == slot.0) {
+                let (left, right) = processor.process(slot.1, slot.2);
+                slot.1 = left;
+                slot.2 = right;
+            }
+        }
+    }
+
+    fn apply_track_compressor(&mut self) {
+        for slot in &mut self.acc {
+            if let Some((_, processor)) = self
+                .compressor
+                .iter_mut()
+                .find(|(id, _)| *id == slot.0)
+            {
                 let (left, right) = processor.process(slot.1, slot.2);
                 slot.1 = left;
                 slot.2 = right;
@@ -899,6 +921,7 @@ impl BusSource {
             slot.2 += piece.samples[base + 1] * gain;
         }
         self.apply_track_eq();
+        self.apply_track_compressor();
         let mixed = mix_frame(&self.acc, &bus);
         self.window = self.window.saturating_add(1);
         self.master_clip |= mixed.overload;

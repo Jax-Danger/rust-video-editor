@@ -1810,6 +1810,8 @@ impl MeridianApp {
                 seconds_per_frame: piece.seconds_per_frame,
                 gain: piece.gain,
                 pan: piece.pan,
+                eq: editor_core::TrackEq3::default(),
+                compressor: editor_core::TrackCompressor::default(),
                 gain_keys: piece.gain_keys.clone(),
             })
             .collect();

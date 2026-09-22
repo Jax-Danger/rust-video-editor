@@ -1,13 +1,14 @@
 //! Stereo mix shared by playback and export.
 //!
 //! Clip gain (constant or keyframed) is multiplied by the track fader.
-//! Pan is constant-power and unity at center, so an unpanned clip sounds the
-//! same as it did before the mixer existed. Mute and solo decide which tracks
-//! reach the bus. The master fader scales the sum, then the sum is hard-limited.
+//! Per-track EQ and compressor run pre-fader: clip gain → EQ → compressor →
+//! fader/pan → master sum → hard limiter. Pan is constant-power and unity at
+//! center. Mute and solo decide which tracks reach the bus.
 
 use serde::{Deserialize, Serialize};
 
 use crate::effects::Interpolation;
+use crate::compressor::TrackCompressor;
 use crate::eq::TrackEq3;
 use crate::model::{Clip, Sequence, Track, TrackKind};
 
@@ -305,6 +306,7 @@ pub struct BusTrack {
     pub fader: f32,
     pub pan: f32,
     pub eq: TrackEq3,
+    pub compressor: TrackCompressor,
     pub audible: bool,
 }
 
@@ -336,6 +338,7 @@ impl BusState {
                 fader: clamp_gain(track.fader),
                 pan: clamp_pan(track.pan),
                 eq: track.eq,
+                compressor: track.compressor,
                 audible: track_is_audible(track, solo),
             });
             for clip in &track.clips {
@@ -728,6 +731,7 @@ mod tests {
                     fader: 1.0,
                     pan: 0.0,
                     eq: TrackEq3::default(),
+                    compressor: TrackCompressor::default(),
                     audible: true,
                 },
                 BusTrack {
@@ -735,6 +739,7 @@ mod tests {
                     fader: 1.0,
                     pan: 0.0,
                     eq: TrackEq3::default(),
+                    compressor: TrackCompressor::default(),
                     audible: true,
                 },
             ],

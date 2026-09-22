@@ -5,6 +5,7 @@ use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
 use crate::effects::{AnimatedF32, Effect};
+use crate::compressor::TrackCompressor;
 use crate::eq::TrackEq3;
 use crate::time::{Frame, Timebase};
 
@@ -717,6 +718,9 @@ pub struct Track {
     /// Three-band EQ applied pre-fader on this track.
     #[serde(default, skip_serializing_if = "TrackEq3::is_bypass")]
     pub eq: TrackEq3,
+    /// Dynamics compressor applied after EQ and before the fader.
+    #[serde(default, skip_serializing_if = "TrackCompressor::is_bypass")]
+    pub compressor: TrackCompressor,
     #[serde(default)]
     pub clips: Vec<Clip>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -742,6 +746,7 @@ impl Track {
             fader: 1.0,
             pan: 0.0,
             eq: TrackEq3::default(),
+            compressor: TrackCompressor::default(),
             clips: Vec::new(),
             transitions: Vec::new(),
             cues: Vec::new(),

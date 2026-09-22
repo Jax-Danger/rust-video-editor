@@ -1,15 +1,20 @@
 //! Fairlight-inspired mixer: one strip per audio track, plus the master bus.
 //!
 //! Faders are decibels (−∞…+12). Pan is constant-power and unity at center.
-//! Each strip has a 3-band EQ (L/M/H ±12 dB, optional low-cut). Meters show
-//! peak, a brighter RMS fill, and a peak-hold tick. Mute, solo, fader, pan,
-//! EQ, and clip gain all feed the same bus playback and export use.
+//! Each strip has a 3-band EQ (L/M/H ±12 dB, optional low-cut) and a dynamics
+//! compressor (threshold, ratio, attack, release, makeup). Meters show peak, a
+//! brighter RMS fill, and a peak-hold tick. Mute, solo, fader, pan, EQ,
+//! compressor, and clip gain all feed the same bus playback and export use.
 
 use editor_core::{
-    clamp_eq_db, fader_pos_to_linear, format_db, format_eq_db, format_pan, linear_to_fader_pos,
-    meter_amount, set_clip_gain_at, set_master_fader, set_track_eq, set_track_eq_low_cut,
-    set_track_fader, set_track_pan, toggle_volume_key, ClipId, EqBand, Frame, TrackEq3, TrackId,
-    TrackKind, EQ_DB_MAX, EQ_DB_MIN,
+    clamp_attack_ms, clamp_eq_db, clamp_makeup_db, clamp_ratio, clamp_release_ms,
+    clamp_threshold_db, fader_pos_to_linear, format_db, format_eq_db, format_makeup_db,
+    format_pan, format_ratio, format_threshold_db, format_time_ms, linear_to_fader_pos,
+    meter_amount, set_clip_gain_at, set_master_fader, set_track_compressor, set_track_eq,
+    set_track_eq_low_cut, set_track_fader, set_track_pan, toggle_volume_key, ClipId,
+    CompressorParam, EqBand, Frame, TrackCompressor, TrackEq3, TrackId, TrackKind, ATTACK_MS_MAX,
+    ATTACK_MS_MIN, EQ_DB_MAX, EQ_DB_MIN, MAKEUP_DB_MAX, MAKEUP_DB_MIN, RATIO_MAX, RATIO_MIN,
+    RELEASE_MS_MAX, RELEASE_MS_MIN, THRESHOLD_DB_MAX, THRESHOLD_DB_MIN,
 };
 use egui::{pos2, Align2, Color32, Id, Rect, Sense, Shape, Stroke, Vec2};
 
@@ -26,6 +31,7 @@ struct StripSnap {
     fader: f32,
     pan: f32,
     eq: TrackEq3,
+    compressor: TrackCompressor,
     muted: bool,
     solo: bool,
     clip_id: Option<ClipId>,
@@ -94,6 +100,7 @@ fn snapshot(app: &MeridianApp, playhead: i64) -> Vec<StripSnap> {
             fader: track.fader,
             pan: track.pan,
             eq: track.eq,
+            compressor: track.compressor,
             muted: track.muted,
             solo: track.solo,
             clip_id: clip.map(|clip| clip.id),
@@ -189,7 +196,7 @@ fn channel_strip(ui: &mut egui::Ui, app: &mut MeridianApp, strip: &StripSnap, he
         );
     }
 
-    let gain_top = rect.bottom() - 112.0;
+    let gain_top = rect.bottom() - 182.0;
     let meter_top = db.bottom() + 8.0;
     let meter_rect = Rect::from_min_max(
         pos2(rect.left() + 14.0, meter_top),
@@ -252,9 +259,15 @@ fn channel_strip(ui: &mut egui::Ui, app: &mut MeridianApp, strip: &StripSnap, he
     );
     eq_section(ui, app, eq_rect, strip);
 
+    let dyn_rect = Rect::from_min_size(
+        pos2(rect.left() + 8.0, eq_rect.bottom() + 4.0),
+        Vec2::new(rect.width() - 16.0, 70.0),
+    );
+    dynamics_section(ui, app, dyn_rect, strip);
+
     if strip.clip_id.is_some() {
         let gain_rect = Rect::from_min_size(
-            pos2(rect.left() + 8.0, eq_rect.bottom() + 4.0),
+            pos2(rect.left() + 8.0, dyn_rect.bottom() + 4.0),
             Vec2::new(rect.width() - 16.0, 28.0),
         );
         clip_gain_row(ui, app, gain_rect, strip);
@@ -405,6 +418,173 @@ fn eq_band_row(
                     .active_sequence
                     .ok_or(editor_core::EditError::NoActiveSequence)?;
                 set_track_eq(project, seq, track_id, band, next)
+            });
+        }
+    }
+    if response.drag_stopped() {
+        app.session.end_interactive();
+    }
+}
+
+fn dynamics_section(ui: &mut egui::Ui, app: &mut MeridianApp, rect: Rect, strip: &StripSnap) {
+    let painter = ui.painter();
+    painter.text(
+        rect.left_top(),
+        Align2::LEFT_TOP,
+        "DYN",
+        THEME.font(10.0),
+        THEME.text_mute,
+    );
+    let row_h = 12.0;
+    let start_y = rect.top() + 14.0;
+    let row_w = rect.width();
+    dyn_row(
+        ui,
+        app,
+        Rect::from_min_size(pos2(rect.left(), start_y), Vec2::new(row_w, row_h)),
+        strip,
+        CompressorParam::Threshold,
+        "THR",
+        strip.compressor.threshold_db,
+        THRESHOLD_DB_MIN,
+        THRESHOLD_DB_MAX,
+        format_threshold_db,
+    );
+    dyn_row(
+        ui,
+        app,
+        Rect::from_min_size(pos2(rect.left(), start_y + row_h), Vec2::new(row_w, row_h)),
+        strip,
+        CompressorParam::Ratio,
+        "RAT",
+        strip.compressor.ratio,
+        RATIO_MIN,
+        RATIO_MAX,
+        format_ratio,
+    );
+    dyn_row(
+        ui,
+        app,
+        Rect::from_min_size(pos2(rect.left(), start_y + row_h * 2.0), Vec2::new(row_w, row_h)),
+        strip,
+        CompressorParam::Attack,
+        "ATK",
+        strip.compressor.attack_ms,
+        ATTACK_MS_MIN,
+        ATTACK_MS_MAX,
+        format_time_ms,
+    );
+    dyn_row(
+        ui,
+        app,
+        Rect::from_min_size(pos2(rect.left(), start_y + row_h * 3.0), Vec2::new(row_w, row_h)),
+        strip,
+        CompressorParam::Release,
+        "REL",
+        strip.compressor.release_ms,
+        RELEASE_MS_MIN,
+        RELEASE_MS_MAX,
+        format_time_ms,
+    );
+    dyn_row(
+        ui,
+        app,
+        Rect::from_min_size(pos2(rect.left(), start_y + row_h * 4.0), Vec2::new(row_w, row_h)),
+        strip,
+        CompressorParam::Makeup,
+        "MK",
+        strip.compressor.makeup_db,
+        MAKEUP_DB_MIN,
+        MAKEUP_DB_MAX,
+        format_makeup_db,
+    );
+}
+
+fn dyn_row<F>(
+    ui: &mut egui::Ui,
+    app: &mut MeridianApp,
+    rect: Rect,
+    strip: &StripSnap,
+    param: CompressorParam,
+    label: &str,
+    value: f32,
+    min: f32,
+    max: f32,
+    format: F,
+) where
+    F: Fn(f32) -> String,
+{
+    let painter = ui.painter();
+    painter.text(
+        rect.left_center(),
+        Align2::LEFT_CENTER,
+        label,
+        THEME.mono(9.0),
+        THEME.text_dim,
+    );
+    let track = Rect::from_min_max(
+        pos2(rect.left() + 24.0, rect.center().y - 2.0),
+        pos2(rect.right() - 28.0, rect.center().y + 2.0),
+    );
+    let response = ui.interact(
+        track.expand2(Vec2::new(0.0, 5.0)),
+        Id::new(("mix_dyn", strip.id.0, label)),
+        Sense::click_and_drag(),
+    );
+    painter.rect_filled(track, 2.0, THEME.inset);
+    let t = if max > min {
+        ((value - min) / (max - min)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let knob = pos2(track.left() + track.width() * t, track.center().y);
+    painter.circle_filled(knob, 3.0, THEME.text);
+    painter.circle_stroke(knob, 3.0, Stroke::new(1.0_f32, THEME.amber));
+    painter.text(
+        pos2(rect.right(), rect.center().y),
+        Align2::RIGHT_CENTER,
+        format(value),
+        THEME.mono(8.0),
+        THEME.text_mute,
+    );
+    let default = match param {
+        CompressorParam::Threshold => 0.0,
+        CompressorParam::Ratio => 1.0,
+        CompressorParam::Attack => editor_core::DEFAULT_ATTACK_MS,
+        CompressorParam::Release => editor_core::DEFAULT_RELEASE_MS,
+        CompressorParam::Makeup => 0.0,
+    };
+    if response.double_clicked() {
+        app.session.end_interactive();
+        let track_id = strip.id;
+        let _ = app.session.edit("Dynamics", |project| {
+            let seq = project
+                .active_sequence
+                .ok_or(editor_core::EditError::NoActiveSequence)?;
+            set_track_compressor(project, seq, track_id, param, default)
+        });
+        return;
+    }
+    if response.drag_started() {
+        app.session.begin_interactive("Dynamics");
+    }
+    if response.dragged() || response.clicked() {
+        if let Some(pointer) = response.interact_pointer_pos() {
+            let pos = ((pointer.x - track.left()) / track.width()).clamp(0.0, 1.0);
+            let next = min + pos * (max - min);
+            let next = match param {
+                CompressorParam::Threshold => clamp_threshold_db(next),
+                CompressorParam::Ratio => clamp_ratio(next),
+                CompressorParam::Attack => clamp_attack_ms(next),
+                CompressorParam::Release => clamp_release_ms(next),
+                CompressorParam::Makeup => clamp_makeup_db(next),
+            };
+            let track_id = strip.id;
+            let _ = app.session.edit("Dynamics", |project| {
+                let seq = project
+                    .active_sequence
+                    .ok_or(editor_core::EditError::NoActiveSequence)?;
+                set_track_compressor(project, seq, track_id, param, next)
             });
         }
     }

@@ -1315,6 +1315,49 @@ pub fn set_track_eq_low_cut(
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompressorParam {
+    Threshold,
+    Ratio,
+    Attack,
+    Release,
+    Makeup,
+}
+
+pub fn set_track_compressor(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    track_id: TrackId,
+    param: CompressorParam,
+    value: f32,
+) -> Result<(), EditError> {
+    map_sequence(project, sequence_id, |sequence, _alloc| {
+        let track = sequence
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .ok_or(EditError::TrackNotFound)?;
+        match param {
+            CompressorParam::Threshold => {
+                track.compressor.threshold_db = crate::compressor::clamp_threshold_db(value);
+            }
+            CompressorParam::Ratio => {
+                track.compressor.ratio = crate::compressor::clamp_ratio(value);
+            }
+            CompressorParam::Attack => {
+                track.compressor.attack_ms = crate::compressor::clamp_attack_ms(value);
+            }
+            CompressorParam::Release => {
+                track.compressor.release_ms = crate::compressor::clamp_release_ms(value);
+            }
+            CompressorParam::Makeup => {
+                track.compressor.makeup_db = crate::compressor::clamp_makeup_db(value);
+            }
+        }
+        Ok(())
+    })
+}
+
 pub fn set_master_fader(
     project: &mut Project,
     sequence_id: SequenceId,
