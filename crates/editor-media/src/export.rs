@@ -11,7 +11,10 @@
 use std::path::Path;
 use std::path::PathBuf;
 
-use editor_core::{source_frame_at, ExportRange, Frame, MediaAsset, Sequence, Timebase, TrackKind};
+use editor_core::{
+    ffmpeg_pan_filter, ffmpeg_volume_arg, mix_regions, source_frame_at, ExportRange, Frame,
+    GainCurve, MediaAsset, Sequence, Timebase, TrackKind,
+};
 
 use crate::composite::{active_captions, program_stack, ProgramLayer};
 
@@ -24,7 +27,12 @@ pub struct WavPiece {
     pub timeline_out: i64,
     pub source_at_in: f64,
     pub seconds_per_frame: f64,
+    /// Clip gain × track fader at the clip in-point. Used when `gain_keys` is empty.
     pub gain: f32,
+    /// Track pan, −1 left … +1 right. Center omits the pan filter.
+    pub pan: f32,
+    /// Keyed clip gain × track fader, in sequence frames.
+    pub gain_keys: Vec<editor_core::GainKey>,
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +100,7 @@ pub fn plan_encode(
         range_out,
         sequence.timebase,
         dur,
+        sequence.master_fader,
     );
 
     let mut frames = Vec::with_capacity((range_out - range_in) as usize);
@@ -185,7 +194,7 @@ pub fn write_timeline_wav(
     }
     let dur = frames_secs(range_out - range_in, timebase);
     let mut graph = Graph::default();
-    let audio = slice_audio(&mut graph, pieces, range_in, range_out, timebase, dur);
+    let audio = slice_audio(&mut graph, pieces, range_in, range_out, timebase, dur, 1.0);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
@@ -638,6 +647,7 @@ fn slice_audio(
     end: i64,
     timebase: Timebase,
     dur: f64,
+    master: f32,
 ) -> String {
     let mut layers = Vec::new();
     for piece in pieces {
@@ -652,17 +662,33 @@ fn slice_audio(
         let delay_ms = frames_secs(overlap_in - start, timebase).max(0.0) * 1000.0;
         let index = graph.add_input(&piece.path);
         let label = graph.lab();
-        graph.filters.push(format!(
-            "[{index}:a]atrim=start={}:end={},asetpts=PTS-STARTPTS,volume={:.4},adelay={}|{},aformat=sample_rates=48000:channel_layouts=stereo[{label}]",
+        let curve = if piece.gain_keys.is_empty() {
+            GainCurve::constant(piece.gain)
+        } else {
+            GainCurve {
+                constant: piece.gain,
+                keys: piece.gain_keys.clone(),
+            }
+        };
+        let volume = ffmpeg_volume_arg(&curve, overlap_in, timebase.fps_f64());
+        let mut filter = format!(
+            "[{index}:a]atrim=start={}:end={},asetpts=PTS-STARTPTS,volume={volume}",
             secs(src),
             secs(src + src_dur.max(0.01)),
-            piece.gain.clamp(0.0, 4.0),
+        );
+        if let Some(pan) = ffmpeg_pan_filter(piece.pan) {
+            filter.push(',');
+            filter.push_str(&pan);
+        }
+        filter.push_str(&format!(
+            ",adelay={}|{},aformat=sample_rates=48000:channel_layouts=stereo[{label}]",
             delay_ms.round() as i64,
             delay_ms.round() as i64,
         ));
+        graph.filters.push(filter);
         layers.push(label);
     }
-    let mixed = if layers.is_empty() {
+    let summed = if layers.is_empty() {
         let label = graph.lab();
         graph.filters.push(format!(
             "anullsrc=channel_layout=stereo:sample_rate=48000:d={},aformat=sample_fmts=fltp:channel_layouts=stereo[{label}]",
@@ -680,6 +706,16 @@ fn slice_audio(
         ));
         label
     };
+    let master = editor_core::clamp_gain(master);
+    let mixed = if (master - 1.0).abs() > 1.0e-4 {
+        let label = graph.lab();
+        graph
+            .filters
+            .push(format!("[{summed}]volume={master:.4}[{label}]"));
+        label
+    } else {
+        summed
+    };
     let out = graph.lab();
     graph.filters.push(format!(
         "[{mixed}]apad,atrim=0:{},asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo[{out}]",
@@ -695,52 +731,44 @@ fn audible_pieces(
     to: i64,
     warnings: &mut Vec<String>,
 ) -> Vec<WavPiece> {
-    let solos = sequence
-        .tracks
-        .iter()
-        .any(|track| track.kind == TrackKind::Audio && track.solo);
     let mut pieces = Vec::new();
-    for track in &sequence.tracks {
-        if track.kind != TrackKind::Audio || track.muted {
+    for region in mix_regions(sequence, from, to, false) {
+        let Some(asset) = media.iter().find(|item| item.id == region.media_id) else {
+            continue;
+        };
+        if !asset.has_audio {
             continue;
         }
-        if solos && !track.solo {
+        let Some(clip) = sequence
+            .tracks
+            .iter()
+            .flat_map(|track| track.clips.iter())
+            .find(|clip| clip.id.0 == region.clip_id)
+        else {
+            continue;
+        };
+        let resolved = crate::resolve_media_path(&asset.path);
+        if !resolved.is_file() {
+            warnings.push(format!("Skipped offline audio {}", asset.name));
             continue;
         }
-        for clip in &track.clips {
-            if !clip.enabled || clip.timeline_out.0 <= from || clip.timeline_in.0 >= to {
-                continue;
-            }
-            let Some(asset) = clip
-                .media_id
-                .and_then(|id| media.iter().find(|item| item.id == id))
-            else {
-                continue;
-            };
-            if !asset.has_audio {
-                continue;
-            }
-            let resolved = crate::resolve_media_path(&asset.path);
-            if !resolved.is_file() {
-                warnings.push(format!("Skipped offline audio {}", asset.name));
-                continue;
-            }
-            let at_in = source_frame_at(clip, clip.timeline_in, sequence.timebase);
-            let at_next = source_frame_at(clip, Frame(clip.timeline_in.0 + 1), sequence.timebase);
-            let mut seconds_per_frame =
-                (at_next.0 - at_in.0) as f64 * clip.media_timebase.frame_duration_secs();
-            if seconds_per_frame <= 0.0 {
-                seconds_per_frame = sequence.timebase.frame_duration_secs();
-            }
-            pieces.push(WavPiece {
-                path: resolved.to_string_lossy().into_owned(),
-                timeline_in: clip.timeline_in.0,
-                timeline_out: clip.timeline_out.0,
-                source_at_in: at_in.to_seconds(clip.media_timebase).max(0.0),
-                seconds_per_frame,
-                gain: clip.volume.clamp(0.0, 4.0),
-            });
+        let at_in = source_frame_at(clip, clip.timeline_in, sequence.timebase);
+        let at_next = source_frame_at(clip, Frame(clip.timeline_in.0 + 1), sequence.timebase);
+        let mut seconds_per_frame =
+            (at_next.0 - at_in.0) as f64 * clip.media_timebase.frame_duration_secs();
+        if seconds_per_frame <= 0.0 {
+            seconds_per_frame = sequence.timebase.frame_duration_secs();
         }
+        pieces.push(WavPiece {
+            path: resolved.to_string_lossy().into_owned(),
+            timeline_in: region.timeline_in,
+            timeline_out: region.timeline_out,
+            source_at_in: at_in.to_seconds(clip.media_timebase).max(0.0),
+            seconds_per_frame,
+            gain: region.gain,
+            pan: region.pan,
+            gain_keys: region.gain_keys,
+        });
     }
     pieces
 }
@@ -960,7 +988,7 @@ mod tests {
         sequence.tracks[1].clips = vec![inset];
         let mut audio = Clip::basic(20, 0, 96);
         audio.media_id = Some(MediaId(3));
-        audio.volume = 0.25;
+        audio.volume.base = 0.25;
         sequence.tracks[2].clips = vec![audio];
         sequence.tracks[3].cues.push(editor_core::CaptionCue {
             id: CueId(30),
@@ -1071,6 +1099,59 @@ mod tests {
     }
 
     #[test]
+    fn fader_pan_master_and_keyframes_share_the_playback_mix() {
+        let dir = std::env::temp_dir().join(format!("meridian-plan-mix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let voice = touch(&dir, "voice.wav");
+        let mut sequence = Sequence::new(SequenceId(1), "Mix", 320, 180, Timebase::fps_24());
+        sequence.add_track(TrackId(2), TrackKind::Video, "V1");
+        sequence.add_track(TrackId(3), TrackKind::Audio, "A1");
+        let mut picture = Clip::basic(10, 0, 24);
+        picture.media_id = Some(MediaId(1));
+        sequence.tracks[0].clips = vec![picture];
+        let mut audio = Clip::basic(11, 0, 24);
+        audio.media_id = Some(MediaId(2));
+        audio.volume.base = 0.5;
+        audio.volume.set_key(0, 0.5);
+        audio.volume.set_key(12, 1.0);
+        sequence.tracks[1].clips = vec![audio];
+        sequence.tracks[1].fader = 0.5;
+        sequence.tracks[1].pan = -1.0;
+        sequence.master_fader = 0.5;
+        let media = vec![asset(1, &voice, true, false), asset(2, &voice, false, true)];
+        let script = plan_encode(
+            &sequence,
+            &media,
+            ExportRange::WholeSequence,
+            "H.264",
+            "mp4",
+            false,
+        )
+        .unwrap();
+        assert!(
+            script.filter.contains("eval=frame"),
+            "keyed gain missing: {}",
+            script.filter
+        );
+        assert!(
+            script.filter.contains("0.2500"),
+            "fader should scale the first key: {}",
+            script.filter
+        );
+        assert!(
+            script.filter.contains("pan=stereo|c0=1.4142*c0"),
+            "hard left pan missing: {}",
+            script.filter
+        );
+        assert!(
+            script.filter.contains("volume=0.5000"),
+            "master fader missing: {}",
+            script.filter
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn srt_timestamps_are_relative_to_the_range() {
         let text = cues_to_srt(&[(0.5, 1.25, "Ridge".into())]);
         assert!(text.contains("00:00:00,500 --> 00:00:01,250"));
@@ -1124,7 +1205,7 @@ mod tests {
         video.effects.push(Effect::Color(grade));
         let mut audio = Clip::basic(11, 0, 24);
         audio.media_id = Some(MediaId(1));
-        audio.volume = 0.5;
+        audio.volume.base = 0.5;
         sequence.tracks[0].clips = vec![video];
         sequence.tracks[1].clips = vec![audio];
         sequence.tracks[2].cues.push(editor_core::CaptionCue {
@@ -1437,7 +1518,7 @@ mod tests {
         video.effects.push(Effect::Color(grade));
         let mut audio = Clip::basic(11, 0, 96);
         audio.media_id = Some(MediaId(1));
-        audio.volume = 0.8;
+        audio.volume.base = 0.8;
         sequence.tracks[0].clips = vec![video];
         sequence.tracks[1].clips = vec![audio];
         let path = clip_path.to_string_lossy().into_owned();

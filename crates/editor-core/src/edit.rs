@@ -847,11 +847,97 @@ pub fn set_clip_volume(
     clip_id: ClipId,
     volume: f32,
 ) -> Result<(), EditError> {
+    set_clip_gain_at(project, sequence_id, clip_id, 0, volume)
+}
+
+/// Write clip gain at a clip-relative frame.
+///
+/// With no keys this edits the constant. With keys it writes a key, matching
+/// the other animated parameters.
+pub fn set_clip_gain_at(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    clip_id: ClipId,
+    clip_relative_frame: i64,
+    volume: f32,
+) -> Result<(), EditError> {
     map_sequence(project, sequence_id, |sequence, _alloc| {
         let (ti, ci) = sequence
             .locate_clip(clip_id)
             .ok_or(EditError::ClipNotFound)?;
-        sequence.tracks[ti].clips[ci].volume = volume.clamp(0.0, 4.0);
+        sequence.tracks[ti].clips[ci]
+            .volume
+            .write_at(clip_relative_frame, crate::mix::clamp_gain(volume));
+        Ok(())
+    })
+}
+
+pub fn toggle_volume_key(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    clip_id: ClipId,
+    clip_relative_frame: i64,
+) -> Result<(), EditError> {
+    map_sequence(project, sequence_id, |sequence, _alloc| {
+        let (ti, ci) = sequence
+            .locate_clip(clip_id)
+            .ok_or(EditError::ClipNotFound)?;
+        let anim = &mut sequence.tracks[ti].clips[ci].volume;
+        if anim.has_key(clip_relative_frame) {
+            let value = anim.value_at(clip_relative_frame);
+            anim.remove_key(clip_relative_frame);
+            if anim.keys.is_empty() {
+                anim.base = value;
+            }
+        } else {
+            let value = anim.value_at(clip_relative_frame);
+            anim.set_key(clip_relative_frame, value);
+        }
+        Ok(())
+    })
+}
+
+pub fn set_track_fader(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    track_id: TrackId,
+    fader: f32,
+) -> Result<(), EditError> {
+    map_sequence(project, sequence_id, |sequence, _alloc| {
+        let track = sequence
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .ok_or(EditError::TrackNotFound)?;
+        track.fader = crate::mix::clamp_gain(fader);
+        Ok(())
+    })
+}
+
+pub fn set_track_pan(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    track_id: TrackId,
+    pan: f32,
+) -> Result<(), EditError> {
+    map_sequence(project, sequence_id, |sequence, _alloc| {
+        let track = sequence
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .ok_or(EditError::TrackNotFound)?;
+        track.pan = crate::mix::clamp_pan(pan);
+        Ok(())
+    })
+}
+
+pub fn set_master_fader(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    fader: f32,
+) -> Result<(), EditError> {
+    map_sequence(project, sequence_id, |sequence, _alloc| {
+        sequence.master_fader = crate::mix::clamp_gain(fader);
         Ok(())
     })
 }
@@ -1111,7 +1197,7 @@ pub fn clip_from_media(
         } else {
             crate::model::LabelColor::Green
         },
-        volume: 1.0,
+        volume: crate::effects::AnimatedF32::constant(1.0),
     })
 }
 

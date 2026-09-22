@@ -1,8 +1,10 @@
 //! Project, media pool, sequences, tracks, clips, and markers.
 
+use serde::de::{self, Deserializer, MapAccess, Visitor};
+use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
-use crate::effects::Effect;
+use crate::effects::{AnimatedF32, Effect};
 use crate::time::{Frame, Timebase};
 
 fn default_version() -> u32 {
@@ -11,11 +13,60 @@ fn default_version() -> u32 {
 fn default_true() -> bool {
     true
 }
-fn default_volume() -> f32 {
+fn default_volume() -> AnimatedF32 {
+    AnimatedF32::constant(1.0)
+}
+fn is_unity_volume(value: &AnimatedF32) -> bool {
+    value.keys.is_empty() && (value.base - 1.0).abs() < 1.0e-5
+}
+fn default_fader() -> f32 {
     1.0
 }
-fn is_unity_volume(value: &f32) -> bool {
+fn is_unity_fader(value: &f32) -> bool {
     (*value - 1.0).abs() < 1.0e-5
+}
+fn is_center_pan(value: &f32) -> bool {
+    value.abs() < 1.0e-5
+}
+
+fn serialize_volume<S: Serializer>(value: &AnimatedF32, serializer: S) -> Result<S::Ok, S::Error> {
+    if value.keys.is_empty() {
+        serializer.serialize_f32(value.base)
+    } else {
+        value.serialize(serializer)
+    }
+}
+
+fn deserialize_volume<'de, D: Deserializer<'de>>(deserializer: D) -> Result<AnimatedF32, D::Error> {
+    struct VolumeVisitor;
+    impl<'de> Visitor<'de> for VolumeVisitor {
+        type Value = AnimatedF32;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a linear gain or an animated gain")
+        }
+
+        fn visit_f32<E: de::Error>(self, value: f32) -> Result<Self::Value, E> {
+            Ok(AnimatedF32::constant(value))
+        }
+
+        fn visit_f64<E: de::Error>(self, value: f64) -> Result<Self::Value, E> {
+            Ok(AnimatedF32::constant(value as f32))
+        }
+
+        fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
+            Ok(AnimatedF32::constant(value as f32))
+        }
+
+        fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
+            Ok(AnimatedF32::constant(value as f32))
+        }
+
+        fn visit_map<M: MapAccess<'de>>(self, map: M) -> Result<Self::Value, M::Error> {
+            AnimatedF32::deserialize(de::value::MapAccessDeserializer::new(map))
+        }
+    }
+    deserializer.deserialize_any(VolumeVisitor)
 }
 fn default_label() -> LabelColor {
     LabelColor::Neutral
@@ -202,9 +253,15 @@ pub struct Clip {
     pub effects: Vec<Effect>,
     #[serde(default = "default_label")]
     pub label: LabelColor,
-    /// Linear clip gain. 1 is unity. Audio playback and export both read it.
-    #[serde(default = "default_volume", skip_serializing_if = "is_unity_volume")]
-    pub volume: f32,
+    /// Linear clip gain. 1 is unity. A bare number in JSON is a constant;
+    /// an object is an [`AnimatedF32`] curve. Playback and export both read it.
+    #[serde(
+        default = "default_volume",
+        skip_serializing_if = "is_unity_volume",
+        serialize_with = "serialize_volume",
+        deserialize_with = "deserialize_volume"
+    )]
+    pub volume: AnimatedF32,
 }
 
 impl Clip {
@@ -250,7 +307,7 @@ impl Clip {
             enabled: true,
             effects: Vec::new(),
             label: LabelColor::Neutral,
-            volume: 1.0,
+            volume: AnimatedF32::constant(1.0),
         }
     }
 
@@ -292,6 +349,12 @@ pub struct Track {
     /// When set, insert and ripple edits on other sync-locked tracks move this track too.
     #[serde(default = "default_true")]
     pub sync_lock: bool,
+    /// Linear track fader. 1 is unity. Multiplied by clip gain in the mix.
+    #[serde(default = "default_fader", skip_serializing_if = "is_unity_fader")]
+    pub fader: f32,
+    /// Stereo pan, −1 hard left, 0 center, +1 hard right.
+    #[serde(default, skip_serializing_if = "is_center_pan")]
+    pub pan: f32,
     #[serde(default)]
     pub clips: Vec<Clip>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -310,6 +373,8 @@ impl Track {
             muted: false,
             solo: false,
             sync_lock: true,
+            fader: 1.0,
+            pan: 0.0,
             clips: Vec::new(),
             transitions: Vec::new(),
             cues: Vec::new(),
@@ -336,6 +401,9 @@ pub struct Sequence {
     pub in_point: Option<Frame>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub out_point: Option<Frame>,
+    /// Linear master fader. 1 is unity. Applied after the track sum.
+    #[serde(default = "default_fader", skip_serializing_if = "is_unity_fader")]
+    pub master_fader: f32,
 }
 
 fn default_pixel() -> u32 {
@@ -362,6 +430,7 @@ impl Sequence {
             markers: Vec::new(),
             in_point: None,
             out_point: None,
+            master_fader: 1.0,
         }
     }
 

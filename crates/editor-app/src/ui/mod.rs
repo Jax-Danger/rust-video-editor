@@ -4,6 +4,7 @@ mod audio_slot;
 mod captions;
 mod deliver;
 mod inspector;
+mod mixer;
 mod pool;
 mod timeline;
 mod viewer;

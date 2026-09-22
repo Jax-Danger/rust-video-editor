@@ -1,6 +1,7 @@
 use editor_core::{
-    clip_relative, color_grade, set_clip_volume, set_grade_at, set_transform_at, toggle_grade_key,
-    toggle_transform_key, transform, ClipId, GradeParam, TrackKind, TransformParam,
+    clip_relative, color_grade, set_clip_gain_at, set_grade_at, set_transform_at, toggle_grade_key,
+    toggle_transform_key, toggle_volume_key, transform, ClipId, GradeParam, TrackKind,
+    TransformParam,
 };
 use egui::{Color32, RichText, Sense, Shape, Stroke, Vec2};
 
@@ -79,8 +80,8 @@ fn inspector_body(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId, sna
     if snapshot.kind == TrackKind::Audio {
         ui.add_space(8.0);
         widgets::section_label(ui, "Sound");
-        let (current, _) = (snapshot.volume, false);
-        let edit = widgets::param_slider(ui, "Clip gain", current, 0.0..=2.0, false);
+        let (current, keyed) = clip_gain(app, clip_id, rel);
+        let edit = widgets::param_slider(ui, "Clip gain", current, 0.0..=2.0, keyed);
         if edit.started {
             app.session.begin_interactive("Clip gain");
         }
@@ -90,7 +91,7 @@ fn inspector_body(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId, sna
                 let seq = project
                     .active_sequence
                     .ok_or(editor_core::EditError::NoActiveSequence)?;
-                set_clip_volume(project, seq, clip_id, value)
+                set_clip_gain_at(project, seq, clip_id, rel, value)
             });
             if let Err(err) = result {
                 app.status = err.to_string();
@@ -98,6 +99,17 @@ fn inspector_body(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId, sna
         }
         if edit.stopped {
             app.session.end_interactive();
+        }
+        if edit.key_clicked {
+            let result = app.session.edit("Clip gain key", |project| {
+                let seq = project
+                    .active_sequence
+                    .ok_or(editor_core::EditError::NoActiveSequence)?;
+                toggle_volume_key(project, seq, clip_id, rel)
+            });
+            if let Err(err) = result {
+                app.status = err.to_string();
+            }
         }
     }
 
@@ -265,7 +277,6 @@ struct ClipSnap {
     name: String,
     track_name: String,
     kind: TrackKind,
-    volume: f32,
     timeline_in: i64,
     timeline_out: i64,
     source_in: i64,
@@ -284,7 +295,6 @@ fn clip_snapshot(app: &MeridianApp, id: ClipId) -> Option<ClipSnap> {
         name: clip.name.clone(),
         track_name: sequence.tracks[ti].name.clone(),
         kind: sequence.tracks[ti].kind,
-        volume: clip.volume,
         timeline_in: clip.timeline_in.0,
         timeline_out: clip.timeline_out.0,
         source_in: clip.source_in.0,
@@ -325,6 +335,16 @@ fn sequence_summary(ui: &mut egui::Ui, app: &MeridianApp) {
             );
         });
     });
+}
+
+fn clip_gain(app: &MeridianApp, clip: ClipId, rel: i64) -> (f32, bool) {
+    let Some(sequence) = app.session.project().active() else {
+        return (1.0, false);
+    };
+    let Some(clip) = sequence.clip(clip) else {
+        return (1.0, false);
+    };
+    (clip.volume.value_at(rel), clip.volume.has_key(rel))
 }
 
 fn grade_value(app: &MeridianApp, clip: ClipId, rel: i64, param: GradeParam) -> (f32, bool) {

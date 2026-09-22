@@ -2,14 +2,14 @@
 
 use editor_core::{
     add_transition, builtin_templates, clip_from_media, expand_linked, link_clips, plan_export,
-    replace_captions, Bin, BinId, CaptionTranscriber, ClipId, CueId, Direction, EditError,
-    ExportRange, Frame, MediaAsset, MediaId, Project, Session, Timebase, Track, TrackFlag, TrackId,
-    TrackKind, TransitionKind, TrimEdge,
+    replace_captions, Bin, BinId, BusState, CaptionTranscriber, ClipId, CueId, Direction,
+    EditError, ExportRange, Frame, MediaAsset, MediaId, Project, Session, Timebase, Track,
+    TrackFlag, TrackId, TrackKind, TransitionKind, TrimEdge,
 };
 use editor_media::{duration_frames, probe, resolve_media_path};
 use egui::{Event, Key, Modifiers, RichText, ViewportCommand};
 
-use crate::audio::{collect_pieces, AudioEngine};
+use crate::audio::{collect_bus_pieces, collect_pieces, topology_of, AudioEngine};
 use crate::dialogs;
 use crate::preview::PreviewEngine;
 use crate::theme;
@@ -264,6 +264,11 @@ impl MeridianApp {
     }
 
     fn tick_playback(&mut self, ctx: &egui::Context) {
+        self.sync_audio_bus();
+        self.follow_audio_topology();
+        if self.audio.meters_hot() {
+            ctx.request_repaint();
+        }
         if !self.playing {
             let _ = self.audio.pump();
             return;
@@ -380,18 +385,54 @@ impl MeridianApp {
         }
     }
 
-    fn start_audio(&mut self) {
-        let fps = self.timebase().fps_f64();
-        let end = self.sequence_end();
-        let pieces = self
+    fn sync_audio_bus(&mut self) {
+        let bus = self.session.project().active().map(BusState::from_sequence);
+        if let Some(bus) = bus {
+            self.audio.set_bus(bus);
+        }
+    }
+
+    fn follow_audio_topology(&mut self) {
+        if !(self.playing && self.play_rate == 1) {
+            return;
+        }
+        let hash = self
             .session
             .project()
             .active()
-            .map(|sequence| {
-                collect_pieces(sequence, &self.session.project().media, self.playhead, end)
-            })
-            .unwrap_or_default();
-        self.audio.begin(self.playhead, end, fps, pieces);
+            .map(topology_of)
+            .unwrap_or(0);
+        if hash != self.audio.topology() {
+            self.start_audio();
+        }
+    }
+
+    fn start_audio(&mut self) {
+        let fps = self.timebase().fps_f64();
+        let end = self.sequence_end();
+        let playhead = self.playhead;
+        let (pieces, hash, bus) = {
+            let project = self.session.project();
+            match project.active() {
+                Some(sequence) => (
+                    collect_bus_pieces(sequence, &project.media, playhead, end),
+                    topology_of(sequence),
+                    BusState::from_sequence(sequence),
+                ),
+                None => (
+                    Vec::new(),
+                    0,
+                    BusState {
+                        master: 1.0,
+                        tracks: Vec::new(),
+                        clips: Vec::new(),
+                    },
+                ),
+            }
+        };
+        self.audio.set_bus(bus);
+        self.audio.set_topology(hash);
+        self.audio.begin(playhead, end, fps, pieces);
     }
 
     pub(crate) fn step_playhead(&mut self, delta: i64) {
@@ -788,6 +829,8 @@ impl MeridianApp {
                 source_at_in: piece.source_at_in,
                 seconds_per_frame: piece.seconds_per_frame,
                 gain: piece.gain,
+                pan: piece.pan,
+                gain_keys: piece.gain_keys.clone(),
             })
             .collect();
         self.caption_job = Some(crate::caption_job::spawn_caption(
