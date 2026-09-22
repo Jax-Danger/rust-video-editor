@@ -271,7 +271,7 @@ fn placed(
         enabled: true,
         effects: Vec::new(),
         label,
-        volume: 1.0,
+        volume: AnimatedF32::constant(1.0),
     }
 }
 

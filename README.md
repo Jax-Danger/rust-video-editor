@@ -32,15 +32,15 @@ cargo run
 
 ### Fedora
 
-Daily editing needs a desktop session, GTK 3 (native file dialogs), and ffmpeg. Audio playback also needs ALSA (PipeWire's ALSA plugin is enough).
+Daily editing needs a desktop session, GTK 3 (native file dialogs), and ffmpeg. The 1× mix plays through ALSA. On Fedora Workstation that device is PipeWire's ALSA plugin, so both the ALSA library and `pipewire-alsa` are required.
 
 ```bash
-sudo dnf install gcc gcc-c++ cmake pkg-config gtk3-devel alsa-lib-devel ffmpeg \
-  dejavu-sans-fonts libxkbcommon-x11 mesa-libGL mesa-libEGL pipewire-alsa
+sudo dnf install gcc gcc-c++ cmake pkg-config gtk3-devel alsa-lib-devel pipewire-alsa ffmpeg \
+  dejavu-sans-fonts libxkbcommon-x11 mesa-libGL mesa-libEGL
 cargo run -p editor-app --features ffmpeg
 ```
 
-`gtk3-devel` is required to compile: the open, save, and import dialogs link GTK 3. `alsa-lib-devel` is required only for `--features ffmpeg`, which is the build that plays audio and encodes. The default `cargo build` / `cargo test` does not link ALSA and does not spawn ffmpeg. Auto Caption with a local model is a separate build: `cargo run -p editor-app --features whisper` (that feature includes ffmpeg). `gcc-c++` and `cmake` are only for building whisper.cpp itself — use `g++`, not Clang, because the Cloud and Fedora Clang packages often cannot find `libstdc++`. `dejavu-sans-fonts` is the UI font when it is installed. Caption burn-in does not use it: preview and export stamp the same built-in 8×8 bitmap.
+`gtk3-devel` is required to compile: the open, save, and import dialogs link GTK 3. `alsa-lib-devel` is required only for `--features ffmpeg`, which is the build that links rodio and plays the mix. `pipewire-alsa` makes that ALSA default device the PipeWire sink (Pulse-only setups stay silent until it is installed). The default `cargo build` / `cargo test` does not link ALSA and does not spawn ffmpeg. Auto Caption with a local model is a separate build: `cargo run -p editor-app --features whisper` (that feature includes ffmpeg). `gcc-c++` and `cmake` are only for building whisper.cpp itself — use `g++`, not Clang, because the Cloud and Fedora Clang packages often cannot find `libstdc++`. `dejavu-sans-fonts` is the UI font when it is installed. Caption burn-in does not use it: preview and export stamp the same built-in 8×8 bitmap.
 
 ### Debian / Ubuntu
 
@@ -113,9 +113,9 @@ Shortcuts are global while you are not typing in a text field. The same list is 
 | Scroll | Pan timeline |
 | Shift+Z | Zoom timeline to fit |
 
-Reverse shuttle and rates other than 1× play the picture and stay silent. At 1×, the ffmpeg build decodes interleaved stereo PCM at 48 kHz in about two-second chunks and plays it through the default ALSA device (rodio). The viewer shows a stereo meter and a badge: `Audio`, `Buffering`, `Silent`, `No device`, or `No audio`. A missing device does not stop the picture. The default build (no `ffmpeg` feature) does not link an audio backend; its badge is `No audio` and the status line says to rebuild with `--features ffmpeg`.
+Reverse shuttle and rates other than 1× play the picture and stay silent. At 1×, the ffmpeg build decodes interleaved stereo PCM at 48 kHz in about two-second chunks and plays it through the default ALSA device (rodio, via PipeWire on Fedora). The viewer shows a stereo meter and a badge: `Audio`, `Buffering`, `Silent`, `No device`, or `No audio`. A missing device does not stop the picture. The default build (no `ffmpeg` feature) does not link an audio backend; its badge is `No audio` and the status line says to rebuild with `--features ffmpeg`.
 
-Muted audio tracks, and every non-solo track while any audio track is soloed, stay out of the mix. Each clip has a **Clip gain** slider in the inspector (0 to 2 in the UI, stored up to 4). Playback, the meters, caption extraction, and export all use that gain. Meters are the peak of the chunk currently playing, so they move with the mix rather than with a single clip.
+The **Audio** workspace is the mixer. Each audio track has a fader (−∞ to +12 dB, unity at 0 dB), a constant-power pan (center is unity, so an unpanned clip is unchanged), mute, solo, and peak / RMS / peak-hold meters. A red clip lamp latches when that strip, or the master, reaches full scale; click it to clear. The master fader sits on the bus after the tracks. Fader, pan, mute, solo, master, and clip gain are applied while the chunk plays, so a move is heard without waiting for the next decode. Clip gain is an `AnimatedF32`: the inspector diamond (and the one on the strip) keys it at the playhead. The slider is 0 to 2; the value is stored up to 4. Playback, the meters, caption extraction, and export all use the same rules: audible tracks only, clip gain × track fader × pan, then the master fader, then a hard limit at full scale.
 
 Colour and transform parameters are `AnimatedF32`: a constant until you add a keyframe, then linear or hold interpolation in clip-relative frames. The inspector diamond toggles a key at the playhead. The Colour workspace adds an offset pad for temperature and tint.
 
@@ -125,6 +125,7 @@ Transitions (cross dissolve, wipe, push) are centered on a cut and consume head 
 
 - **Edit** — media pool, program viewer, inspector, captions, timeline
 - **Colour** — viewer plus grade, wheels, and transform
+- **Audio** — the mixer docks in this page: faders, pan, mute, solo, and meters in the track bay, with the program meter on the right and the timeline still underneath
 - **Deliver** — codec, container, in/out, and **Export**. With `--features ffmpeg` this encodes a real file. Without that feature, Export still writes the JSON manifest and says the encoder is compiled out.
 
 The program monitor draws mute/solo, grade, transform, dissolve, wipe, push, and caption burn-in as proxy cards when decode is off. With `--features ffmpeg` it decodes every visible video layer under the playhead and runs the same CPU compositor Deliver uses. Play, keyboard stepping, and mouse scrubbing all follow the sequence timebase. If ffmpeg is missing or every layer is offline, the proxy stays up and the viewer says why. Active caption cues are burned into that decoded picture; on the proxy they are drawn with the UI font in the same bottom safe area.
@@ -245,21 +246,21 @@ The graph is the sequence, or the marked in/out when that checkbox is on. Pictur
 
 - Visible video tracks, bottom to top, with each clip's opacity, transform, and grade. A muted video track is skipped, so the tracks under it show through. Solo hides the other video tracks. An empty stack is black.
 - A cross dissolve, wipe, or push on a track composites the outgoing and incoming clips for that frame. Wipe angle and push direction follow the project. Anchor is included.
-- Audio is mixed with each clip's gain. Offline audio is skipped and named in the report. Offline video that is actually visible fails the export.
+- Audio uses the mixer bus: mute and solo, clip gain (with keyframes), track fader, constant-power pan, then the master fader. Offline audio is skipped and named in the report. Offline video that is actually visible fails the export.
 - Captions are burned with the shared bitmap when **Burn captions into the picture** is checked, and written as `mov_text` soft subtitles on mp4 and mov. Uncheck the box to keep them soft only. MXF does not get the soft-sub input.
 
 A progress bar follows ffmpeg's `out_time`. **Cancel** sends `SIGTERM`. A failed or cancelled encode deletes the partial file. Without `--features ffmpeg`, Export writes the JSON manifest instead and explains how to rebuild.
 
 ## Tests
 
-`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, the sample project round-trip, imported media paths in JSON, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, burned captions), and the shared composite (grade split, dissolve mix, wipe angle, push, anchor, caption burn-in). It does not spawn ffmpeg or whisper.
+`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, the sample project round-trip, imported media paths in JSON, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, pan, fader, burned captions), the mix bus (pan law, mute, solo, keyframed gain, peak and RMS), and the shared composite (grade split, dissolve mix, wipe angle, push, anchor, caption burn-in). It does not spawn ffmpeg or whisper.
 
 `cargo test -p editor-media --features ffmpeg` also encodes a short H.264/AAC mp4 when `ffmpeg` is on `PATH`. `cargo test -p editor-app --features whisper` builds the local speech-to-text path; the binary and model are resolved at runtime, not at compile time.
 
 ## Roadmap
 
 - GPU viewer. The CPU composite already stacks tracks, grades, transforms, and the three transitions; it is not a full optical-flow or blend-mode engine
-- Fairlight-class mixing beyond mute, solo, and clip gain
+- Fairlight-class dynamics, EQ, and track sends. The mixer already has faders, pan, mute, solo, meters, and keyframed clip gain
 - OFX-style plugins for third-party effects
 - Scene-linear grading and a hinted caption font. Preview and export already share the display-space formula and the bitmap burn-in
 - Multi-cam: sync groups and angle switching
