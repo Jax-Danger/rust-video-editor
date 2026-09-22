@@ -1,0 +1,11 @@
+{
+  "id": "audio-wav",
+  "name": "Audio only (WAV)",
+  "description": "Mixed timeline audio as 48 kHz PCM in a WAV file — no picture.",
+  "codec": "PCM",
+  "container": "wav",
+  "filename_suffix": "_audio",
+  "burn_captions": false,
+  "use_in_out": false,
+  "audio_only": true
+}

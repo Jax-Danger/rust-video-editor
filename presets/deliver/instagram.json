@@ -1,0 +1,11 @@
+{
+  "id": "instagram",
+  "name": "Instagram",
+  "description": "H.264/AAC mp4 for Instagram feed and Stories upload.",
+  "codec": "H.264",
+  "container": "mp4",
+  "filename_suffix": "_instagram",
+  "burn_captions": true,
+  "use_in_out": false,
+  "audio_bitrate_kbps": 128
+}

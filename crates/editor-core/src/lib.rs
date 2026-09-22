@@ -5,6 +5,7 @@
 
 pub mod caption;
 pub mod deliver;
+pub mod deliver_preset;
 pub mod demo;
 pub mod edit;
 pub mod effects;
@@ -20,6 +21,12 @@ pub use caption::{
     StubTranscriber, TimedWord, TranscribeRequest,
 };
 pub use deliver::{plan_export, ExportPlan, ExportRange};
+pub use deliver_preset::{
+    all_deliver_presets, builtin_deliver_presets, container_extension, custom_deliver_preset_dir,
+    default_deliver_preset, load_deliver_preset_dir, load_last_deliver_settings,
+    save_deliver_preset, save_last_deliver_settings, suggest_output_path, DeliverPreset,
+    DeliverPresetError, DeliverSettings,
+};
 pub use demo::{demo_project, dense_project};
 pub use edit::{
     active_sequence_id, add_marker, add_title, add_transition, attach_proxies, clip_from_media,

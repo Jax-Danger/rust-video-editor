@@ -168,7 +168,7 @@ Northline opens with **NORTHLINE** on V3 for the first five seconds.
 - **Edit** — media pool, program viewer, inspector, captions, timeline
 - **Colour** — scopes, viewer, lift/gamma/gain wheels, luma curve, white balance, and grade sliders
 - **Audio** — the mixer docks in this page: faders, pan, mute, solo, and meters in the track bay, with the program meter on the right and the timeline still underneath
-- **Deliver** — codec, container, in/out, and **Export**. With `--features ffmpeg` this encodes a real file. Without that feature, Export still writes the JSON manifest and says the encoder is compiled out.
+- **Deliver** — export presets (YouTube, Shorts, Instagram, ProRes master, H.265, audio WAV), codec/container, in/out, and **Export**. With `--features ffmpeg` this encodes a real file. Without that feature, Export still writes the JSON manifest and says the encoder is compiled out.
 
 The program monitor draws mute/solo, grade, transform, dissolve, wipe, push, and caption burn-in as proxy cards when decode is off. Title generators are the exception: proxy and decode both stamp the shared bitmap. With `--features ffmpeg` it decodes every visible video layer under the playhead and runs the same CPU compositor Deliver uses, titles included. Play, keyboard stepping, and mouse scrubbing all follow the sequence timebase. If ffmpeg is missing or every layer is offline, the proxy stays up and the viewer says why. Active caption cues are burned into that decoded picture; on the proxy they are drawn with the UI font in the same bottom safe area.
 
@@ -339,6 +339,23 @@ The Northline sample audio is sine tones, so Whisper on the example falls back t
 
 **Deliver → Export** runs ffmpeg and writes the file in the path field (default `/tmp/meridian-export.mp4`). The tested path is H.264 + AAC in an mp4. H.265, ProRes, and DNxHR are passed through as codec arguments when that ffmpeg build has the encoder.
 
+### Export presets
+
+The **Preset** menu at the top of Deliver applies a profile that sets codec, container, suggested filename suffix, burn-captions default, and use in/out default. Built-in presets live in [`presets/deliver/`](presets/deliver/):
+
+| Preset | Codec / container | Notes |
+|--------|-------------------|-------|
+| YouTube 1080p | H.264 / mp4 | AAC 192 kbps, burned captions on |
+| YouTube Shorts | H.264 / mp4 | Vertical-friendly naming suffix |
+| Instagram | H.264 / mp4 | AAC 128 kbps |
+| Master (ProRes 422) | ProRes 422 / mov | Archive handoff; needs `prores_ks` in ffmpeg |
+| H.265 (smaller file) | H.265 / mp4 | CRF 20 when no bitrate hint is set |
+| Audio only (WAV) | PCM / wav | Mixed timeline bus only — skips picture encode |
+
+Selecting a preset fills the format fields and rewrites the output path from the sequence name plus the preset suffix (for example `Northline-Opening_youtube.mp4`). **Save JSON** writes the current settings as a custom preset under `~/.config/meridian/presets/deliver/`. The last-used Deliver settings are restored on the next launch from `~/.config/meridian/deliver-last.json`.
+
+Optional **video** and **audio bitrate hints** on a preset replace the default CRF / AAC rate in the ffmpeg arguments. ProRes and DNxHR show a note when selected; if the encoder is missing, Export surfaces the ffmpeg error.
+
 The graph is the sequence, or the marked in/out when that checkbox is on. Picture is rasterized with the shared compositor (one frame at a time, decoded in short bursts) and piped to ffmpeg as raw video. Audio is still an ffmpeg filter graph:
 
 - Visible video tracks, bottom to top, with each clip's opacity, transform, and grade. A muted video track is skipped, so the tracks under it show through. Solo hides the other video tracks. An empty stack is black.
@@ -350,7 +367,7 @@ A progress bar follows ffmpeg's `out_time`. **Cancel** sends `SIGTERM`. A failed
 
 ## Tests
 
-`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, the sample project round-trip, imported media paths in JSON, proxy attach and relink, timeline culling on an 800-clip sequence, ruler spacing across an hour, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, proxy argument planning and preview fallback, the disk frame cache, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, pan, fader, burned captions), the mix bus (pan law, mute, solo, keyframed gain, peak and RMS), and the shared composite (luma curve, lift/gamma/gain wheels, grade split, dissolve mix, wipe angle, push, dip, slide, blur dissolve, iris, clip filters, anchor, caption burn-in). It does not spawn ffmpeg or whisper.
+`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, deliver presets (apply, custom JSON, last-settings round-trip), the sample project round-trip, imported media paths in JSON, proxy attach and relink, timeline culling on an 800-clip sequence, ruler spacing across an hour, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, proxy argument planning and preview fallback, the disk frame cache, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, pan, fader, burned captions, deliver bitrate hints, audio-only WAV planning), the mix bus (pan law, mute, solo, keyframed gain, peak and RMS), and the shared composite (luma curve, lift/gamma/gain wheels, grade split, dissolve mix, wipe angle, push, dip, slide, blur dissolve, iris, clip filters, anchor, caption burn-in). It does not spawn ffmpeg or whisper.
 
 `cargo test -p editor-media --features ffmpeg` also encodes a short H.264/AAC mp4 when `ffmpeg` is on `PATH`. `cargo test -p editor-app --features whisper` builds the local speech-to-text path; the binary and model are resolved at runtime, not at compile time.
 
