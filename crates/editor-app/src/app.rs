@@ -1,14 +1,14 @@
 //! Application state, commands, and workspace layout.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use editor_core::{
     add_adjustment_layer, add_title, add_transition, builtin_templates, clip_from_media,
     create_multicam, create_nested_sequence, expand_linked, link_clips, multicam_target,
-    nested_sequence_id, plan_export, replace_captions, set_angle_sync, switch_angle, Bin, BinId,
-    BusState, CaptionTranscriber, ClipId, CueId, Direction, EditError, ExportRange, Frame,
-    MediaAsset, MediaId, MulticamId, Project, SequenceId, Session, Timebase, Track, TrackFlag,
-    TrackId, TrackKind, TransitionKind, TrimEdge,
+    nested_sequence_id, plan_export, replace_captions, resolve_source_marks, set_angle_sync,
+    switch_angle, Bin, BinId, BusState, CaptionTranscriber, ClipId, CueId, Direction, EditError,
+    ExportRange, Frame, MediaAsset, MediaId, MulticamId, Project, SequenceId, Session, Timebase,
+    Track, TrackFlag, TrackId, TrackKind, TransitionKind, TrimEdge,
 };
 use editor_media::{duration_frames, probe, resolve_media_path};
 use egui::{Event, Key, Modifiers, RichText, ViewportCommand};
@@ -23,6 +23,20 @@ use crate::ui::{self, format_tc};
 pub enum ScrubSource {
     Ruler,
     Viewer,
+    Source,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MonitorFocus {
+    Source,
+    Program,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SourceMarks {
+    pub playhead: i64,
+    pub in_point: Option<i64>,
+    pub out_point: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -226,6 +240,14 @@ pub struct MeridianApp {
     pub ruler_rect: Option<egui::Rect>,
     pub viewer_bar: Option<egui::Rect>,
     pub viewer_bar_end: i64,
+    pub source_bar: Option<egui::Rect>,
+    pub source_bar_end: i64,
+    /// Per-pool-item source playhead and in/out marks (media timebase).
+    pub source_marks: HashMap<MediaId, SourceMarks>,
+    pub focused_monitor: MonitorFocus,
+    pub source_playing: bool,
+    pub source_play_rate: i32,
+    pub source_play_accum: f32,
     pub audio: AudioEngine,
     pub picture_cache: Option<crate::composite::PictureCache>,
     pub proxy_job: Option<crate::proxy_job::ProxyJob>,
@@ -278,6 +300,13 @@ impl MeridianApp {
             ruler_rect: None,
             viewer_bar: None,
             viewer_bar_end: 0,
+            source_bar: None,
+            source_bar_end: 0,
+            source_marks: HashMap::new(),
+            focused_monitor: MonitorFocus::Program,
+            source_playing: false,
+            source_play_rate: 0,
+            source_play_accum: 0.0,
             audio: AudioEngine::new(),
             picture_cache: None,
             proxy_job: None,
@@ -437,6 +466,7 @@ impl MeridianApp {
         if self.audio.meters_hot() {
             ctx.request_repaint();
         }
+        self.tick_source_playback(ctx);
         if !self.playing {
             let _ = self.audio.pump();
             return;
@@ -486,6 +516,49 @@ impl MeridianApp {
         }
     }
 
+    fn tick_source_playback(&mut self, ctx: &egui::Context) {
+        if !self.source_playing {
+            return;
+        }
+        let Some(media_id) = self.selected_media else {
+            self.halt_source_transport();
+            return;
+        };
+        let Some(media) = self.session.project().media(media_id).cloned() else {
+            self.halt_source_transport();
+            return;
+        };
+        ctx.request_repaint();
+        let end = media.duration.0.max(0);
+        let rate = if self.source_play_rate == 0 {
+            1
+        } else {
+            self.source_play_rate
+        };
+        let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
+        self.source_play_accum += dt * rate.unsigned_abs().max(1) as f32;
+        let frame_dur = media.timebase.frame_duration_secs().max(1.0 / 120.0) as f32;
+        while self.source_play_accum >= frame_dur {
+            self.source_play_accum -= frame_dur;
+            let marks = self.source_marks.entry(media_id).or_default();
+            if rate < 0 {
+                if marks.playhead <= 0 {
+                    marks.playhead = 0;
+                    self.halt_source_transport();
+                    break;
+                }
+                marks.playhead -= 1;
+            } else {
+                marks.playhead += 1;
+                if marks.playhead >= end {
+                    marks.playhead = end;
+                    self.halt_source_transport();
+                    break;
+                }
+            }
+        }
+    }
+
     pub fn halt_transport(&mut self) {
         let running = self.playing || self.play_rate != 0;
         self.playing = false;
@@ -494,6 +567,82 @@ impl MeridianApp {
         if running {
             self.audio.stop();
         }
+    }
+
+    pub fn halt_source_transport(&mut self) {
+        self.source_playing = false;
+        self.source_play_rate = 0;
+        self.source_play_accum = 0.0;
+    }
+
+    pub fn focus_monitor(&mut self, focus: MonitorFocus) {
+        if self.focused_monitor == focus {
+            return;
+        }
+        self.focused_monitor = focus;
+        match focus {
+            MonitorFocus::Source => {
+                self.halt_transport();
+                self.status = "Source monitor focused. \\ toggles.".into();
+            }
+            MonitorFocus::Program => {
+                self.halt_source_transport();
+                self.status = "Program monitor focused. \\ toggles.".into();
+            }
+        }
+    }
+
+    pub fn toggle_monitor_focus(&mut self) {
+        match self.focused_monitor {
+            MonitorFocus::Source => self.focus_monitor(MonitorFocus::Program),
+            MonitorFocus::Program => self.focus_monitor(MonitorFocus::Source),
+        }
+    }
+
+    pub fn open_in_source(&mut self, media_id: MediaId) {
+        self.selected_media = Some(media_id);
+        if !self.pool_selection.contains(&media_id) {
+            self.pool_selection = vec![media_id];
+        }
+        self.source_marks.entry(media_id).or_default();
+        self.focus_monitor(MonitorFocus::Source);
+        let name = self
+            .session
+            .project()
+            .media(media_id)
+            .map(|media| media.name.clone())
+            .unwrap_or_else(|| "clip".into());
+        self.status = format!("Opened {name} in source.");
+    }
+
+    pub fn source_marks_for(&self, media_id: MediaId) -> SourceMarks {
+        self.source_marks
+            .get(&media_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn set_source_playhead(&mut self, frame: i64) {
+        let Some(media_id) = self.selected_media else {
+            return;
+        };
+        let end = self
+            .session
+            .project()
+            .media(media_id)
+            .map(|media| media.duration.0.max(0))
+            .unwrap_or(0);
+        let marks = self.source_marks.entry(media_id).or_default();
+        marks.playhead = frame.clamp(0, end);
+    }
+
+    fn source_edit_range(&self, media: &MediaAsset) -> Result<(Frame, Frame), EditError> {
+        let marks = self.source_marks_for(media.id);
+        resolve_source_marks(
+            media.duration,
+            marks.in_point.map(Frame),
+            marks.out_point.map(Frame),
+        )
     }
 
     pub fn zoom_by(&mut self, factor: f32) {
@@ -559,6 +708,10 @@ impl MeridianApp {
     }
 
     fn shuttle(&mut self, direction: i32) {
+        if self.focused_monitor == MonitorFocus::Source {
+            self.shuttle_source(direction);
+            return;
+        }
         self.audio.stop();
         if direction > 0 {
             self.play_rate = if self.play_rate > 0 {
@@ -586,12 +739,37 @@ impl MeridianApp {
         }
     }
 
+    fn shuttle_source(&mut self, direction: i32) {
+        self.halt_transport();
+        if direction > 0 {
+            self.source_play_rate = if self.source_play_rate > 0 {
+                (self.source_play_rate.saturating_mul(2)).min(8)
+            } else {
+                1
+            };
+        } else {
+            self.source_play_rate = if self.source_play_rate < 0 {
+                (self.source_play_rate.saturating_mul(2)).max(-8)
+            } else {
+                -1
+            };
+        }
+        self.source_playing = true;
+        self.source_play_accum = 0.0;
+        self.status = format!("Source shuttle {}×.", self.source_play_rate);
+    }
+
     pub(crate) fn toggle_play(&mut self) {
+        if self.focused_monitor == MonitorFocus::Source {
+            self.toggle_source_play();
+            return;
+        }
         if self.playing {
             self.halt_transport();
             self.status = "Paused.".into();
             return;
         }
+        self.halt_source_transport();
         self.play_rate = 1;
         self.playing = true;
         self.play_accum = 0.0;
@@ -603,6 +781,23 @@ impl MeridianApp {
         } else {
             self.status = "Play.".into();
         }
+    }
+
+    fn toggle_source_play(&mut self) {
+        if self.source_playing {
+            self.halt_source_transport();
+            self.status = "Source paused.".into();
+            return;
+        }
+        if self.selected_media.is_none() {
+            self.status = "Select a clip in the media pool.".into();
+            return;
+        }
+        self.halt_transport();
+        self.source_play_rate = 1;
+        self.source_playing = true;
+        self.source_play_accum = 0.0;
+        self.status = "Source play.".into();
     }
 
     fn sync_audio_bus(&mut self) {
@@ -662,10 +857,30 @@ impl MeridianApp {
     }
 
     pub(crate) fn step_playhead(&mut self, delta: i64) {
+        if self.focused_monitor == MonitorFocus::Source {
+            self.step_source_playhead(delta);
+            return;
+        }
         self.halt_transport();
         self.preview_scrub = true;
         self.reveal_playhead = true;
         self.playhead = (self.playhead + delta).max(0);
+    }
+
+    fn step_source_playhead(&mut self, delta: i64) {
+        self.halt_source_transport();
+        self.preview_scrub = true;
+        let Some(media_id) = self.selected_media else {
+            return;
+        };
+        let end = self
+            .session
+            .project()
+            .media(media_id)
+            .map(|media| media.duration.0.max(0))
+            .unwrap_or(0);
+        let marks = self.source_marks.entry(media_id).or_default();
+        marks.playhead = (marks.playhead + delta).clamp(0, end);
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
@@ -717,6 +932,8 @@ impl MeridianApp {
             self.place_selected_media(false);
         } else if tap(Key::Period) {
             self.place_selected_media(true);
+        } else if tap(Key::Backslash) {
+            self.toggle_monitor_focus();
         } else if let Some(digit) = tap_digit(ctx, &mods) {
             if mods.shift {
                 self.toggle_audio_target(digit);
@@ -734,7 +951,11 @@ impl MeridianApp {
         } else if tap(Key::J) {
             self.shuttle(-1);
         } else if tap(Key::K) {
-            self.halt_transport();
+            if self.focused_monitor == MonitorFocus::Source {
+                self.halt_source_transport();
+            } else {
+                self.halt_transport();
+            }
             self.status = "Stop.".into();
         } else if tap(Key::L) {
             self.shuttle(1);
@@ -747,17 +968,36 @@ impl MeridianApp {
         } else if pressed(Key::ArrowRight) {
             self.step_playhead(1);
         } else if pressed(Key::ArrowUp) {
-            self.jump_edit(-1);
+            if self.focused_monitor == MonitorFocus::Program {
+                self.jump_edit(-1);
+            }
         } else if pressed(Key::ArrowDown) {
-            self.jump_edit(1);
+            if self.focused_monitor == MonitorFocus::Program {
+                self.jump_edit(1);
+            }
         } else if pressed(Key::Home) {
-            self.halt_transport();
-            self.playhead = 0;
-            self.reveal_playhead = true;
+            if self.focused_monitor == MonitorFocus::Source {
+                self.halt_source_transport();
+                self.set_source_playhead(0);
+            } else {
+                self.halt_transport();
+                self.playhead = 0;
+                self.reveal_playhead = true;
+            }
         } else if pressed(Key::End) {
-            self.halt_transport();
-            self.playhead = self.sequence_end();
-            self.reveal_playhead = true;
+            if self.focused_monitor == MonitorFocus::Source {
+                self.halt_source_transport();
+                let end = self
+                    .selected_media
+                    .and_then(|id| self.session.project().media(id))
+                    .map(|media| media.duration.0.max(0))
+                    .unwrap_or(0);
+                self.set_source_playhead(end);
+            } else {
+                self.halt_transport();
+                self.playhead = self.sequence_end();
+                self.reveal_playhead = true;
+            }
         } else if pressed(Key::I) && !mods.command {
             self.mark_in();
         } else if pressed(Key::O) && !mods.command {
@@ -817,6 +1057,22 @@ impl MeridianApp {
     }
 
     pub fn mark_in(&mut self) {
+        if self.focused_monitor == MonitorFocus::Source {
+            self.mark_source_in();
+            return;
+        }
+        self.mark_program_in();
+    }
+
+    pub fn mark_out(&mut self) {
+        if self.focused_monitor == MonitorFocus::Source {
+            self.mark_source_out();
+            return;
+        }
+        self.mark_program_out();
+    }
+
+    pub fn mark_program_in(&mut self) {
         let frame = Frame(self.playhead);
         if let Err(err) = self.session.set_in_point(Some(frame)) {
             self.status = err.to_string();
@@ -825,7 +1081,7 @@ impl MeridianApp {
         }
     }
 
-    pub fn mark_out(&mut self) {
+    pub fn mark_program_out(&mut self) {
         let frame = Frame(self.playhead);
         if let Err(err) = self.session.set_out_point(Some(frame)) {
             self.status = err.to_string();
@@ -835,9 +1091,60 @@ impl MeridianApp {
     }
 
     pub fn clear_marks(&mut self) {
+        if self.focused_monitor == MonitorFocus::Source {
+            if let Some(media_id) = self.selected_media {
+                let marks = self.source_marks.entry(media_id).or_default();
+                marks.in_point = None;
+                marks.out_point = None;
+                self.status = "Cleared source in and out.".into();
+            } else {
+                self.status = "Select a clip in the media pool.".into();
+            }
+            return;
+        }
         let _ = self.session.set_in_point(None);
         let _ = self.session.set_out_point(None);
         self.status = "Cleared in and out.".into();
+    }
+
+    fn mark_source_in(&mut self) {
+        let Some(media_id) = self.selected_media else {
+            self.status = "Select a clip in the media pool.".into();
+            return;
+        };
+        let Some(media) = self.session.project().media(media_id).cloned() else {
+            self.status = "Media not found.".into();
+            return;
+        };
+        let marks = self.source_marks.entry(media_id).or_default();
+        marks.in_point = Some(marks.playhead.clamp(0, media.duration.0.max(0)));
+        if marks.out_point.is_some_and(|out| out <= marks.in_point.unwrap_or(0)) {
+            marks.out_point = None;
+        }
+        self.status = format!(
+            "Source in {}",
+            format_tc(marks.in_point.unwrap_or(0), media.timebase)
+        );
+    }
+
+    fn mark_source_out(&mut self) {
+        let Some(media_id) = self.selected_media else {
+            self.status = "Select a clip in the media pool.".into();
+            return;
+        };
+        let Some(media) = self.session.project().media(media_id).cloned() else {
+            self.status = "Media not found.".into();
+            return;
+        };
+        let marks = self.source_marks.entry(media_id).or_default();
+        marks.out_point = Some(marks.playhead.clamp(0, media.duration.0.max(0)));
+        if marks.in_point.is_some_and(|inn| inn >= marks.out_point.unwrap_or(0)) {
+            marks.in_point = None;
+        }
+        self.status = format!(
+            "Source out {}",
+            format_tc(marks.out_point.unwrap_or(0), media.timebase)
+        );
     }
 
     pub fn add_marker(&mut self) {
@@ -1127,11 +1434,30 @@ impl MeridianApp {
             self.status = "Select a clip in the media pool.".into();
             return;
         };
+        let Some(media) = self.session.project().media(media_id).cloned() else {
+            self.status = "Media not found.".into();
+            return;
+        };
+        let (source_in, source_out) = match self.source_edit_range(&media) {
+            Ok(range) => range,
+            Err(err) => {
+                self.status = err.to_string();
+                return;
+            }
+        };
         let playhead = self.playhead.max(0);
         let label = if insert { "Insert" } else { "Overwrite" };
         let targeted = self.targeted_tracks.clone();
         let result = self.session.edit(label, |project| {
-            place_media(project, media_id, playhead, insert, &targeted)
+            place_media(
+                project,
+                media_id,
+                playhead,
+                insert,
+                &targeted,
+                source_in,
+                source_out,
+            )
         });
         self.status = match result {
             Ok(()) => {
@@ -1153,7 +1479,11 @@ impl MeridianApp {
                         };
                     }
                 }
-                format!("{label} at {}.", format_tc(playhead, self.timebase()))
+                let span = format_tc(source_out.0 - source_in.0, media.timebase);
+                format!(
+                    "{label} {span} at {}.",
+                    format_tc(playhead, self.timebase())
+                )
             }
             Err(err) => err.to_string(),
         };
@@ -1635,7 +1965,7 @@ impl MeridianApp {
                     format!("  {}", errors.join("  "))
                 };
                 self.status = format!(
-                    "Imported {count} file(s). Double-click, drag onto the timeline, or use Overwrite / Insert.{extra}"
+                    "Imported {count} file(s). Double-click to open in source, or use Overwrite / Insert.{extra}"
                 );
                 self.modal = Modal::None;
             }
@@ -1971,6 +2301,8 @@ fn place_media(
     playhead: i64,
     insert: bool,
     targeted: &HashSet<TrackId>,
+    source_in: Frame,
+    source_out: Frame,
 ) -> Result<(), EditError> {
     let seq_id = project.active_sequence.ok_or(EditError::NoActiveSequence)?;
     let timebase = project
@@ -2011,8 +2343,8 @@ fn place_media(
                 &media,
                 timebase,
                 Frame(playhead),
-                Frame::ZERO,
-                media.duration,
+                source_in,
+                source_out,
                 media.name.clone(),
             )?,
         ));
@@ -2027,8 +2359,8 @@ fn place_media(
                 &media,
                 timebase,
                 Frame(playhead),
-                Frame::ZERO,
-                media.duration,
+                source_in,
+                source_out,
                 media.name.clone(),
             )?,
         ));
@@ -2215,7 +2547,7 @@ impl eframe::App for MeridianApp {
                     .show(ctx, |ui| ui::inspector_panel(ui, self));
                 egui::CentralPanel::default()
                     .frame(theme::chrome_frame().fill(theme::THEME.stage))
-                    .show(ctx, |ui| ui::viewer_panel(ui, self));
+                    .show(ctx, |ui| ui::dual_monitor_panel(ui, self));
             }
             Workspace::Colour => {
                 egui::SidePanel::left("colour_scopes")
@@ -2422,11 +2754,11 @@ impl MeridianApp {
                         }
                         ui.separator();
                         if ui.button("Mark In").clicked() {
-                            self.mark_in();
+                            self.mark_program_in();
                             ui.close_menu();
                         }
                         if ui.button("Mark Out").clicked() {
-                            self.mark_out();
+                            self.mark_program_out();
                             ui.close_menu();
                         }
                         if ui.button("Clear In/Out").clicked() {
@@ -2912,13 +3244,14 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+Left / Right", "Jump one second"),
     ("Up / Down", "Previous / next edit"),
     ("Home / End", "Go to start / end"),
-    ("I / O", "Mark in / out"),
+    ("I / O", "Mark in / out on the focused monitor (source or program)"),
+    ("\\", "Toggle focus between source and program monitors"),
     ("M", "Add marker"),
     ("V", "Select tool"),
     ("C  /  Ctrl+K", "Razor at the playhead (also selects the razor tool)"),
     ("/", "Razor at the playhead (keeps the active tool)"),
     ("Q / W", "Ripple trim previous / next edit to the playhead (targeted tracks)"),
-    (", / .", "Overwrite / insert selected pool item at the playhead"),
+    (", / .", "Overwrite / insert source in–out at the program playhead"),
     ("1–9", "Toggle video track target (V1–V9)"),
     ("Shift+1–9", "Toggle audio track target (A1–A9)"),
     ("Alt+1–9", "Switch multicam angle at the playhead"),

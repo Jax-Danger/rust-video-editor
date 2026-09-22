@@ -1,10 +1,14 @@
-//! Program monitor.
+//! Program and source monitors.
 //!
 //! With the `ffmpeg` feature and a readable file, every visible video layer
 //! under the playhead is decoded and composited with the shared engine (the
 //! same one Deliver encodes). Otherwise the monitor keeps the graded proxy
 //! cards and explains why picture is missing. Active captions are burned into
 //! that composite, and drawn on the proxy when decode is off.
+//!
+//! The Edit workspace shows a source monitor beside the program monitor. The
+//! source plays the selected pool clip with its own playhead and in/out marks;
+//! Overwrite / Insert place that marked range at the program playhead.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -18,10 +22,10 @@ use editor_core::{
     active_angle, clip_relative, color_grade, multicam_target, source_frame_at, transform,
     ColorGrade, Frame, MediaAsset, MulticamGroup, TrackKind, Transform,
 };
-use editor_media::{fit_preview_size, PreviewBackend};
-use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Sense, Shape, Stroke, Vec2};
+use editor_media::{fit_preview_size, preview_file, PreviewBackend, PreviewSource};
+use egui::{Align, Align2, Color32, FontId, Layout, Painter, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 
-use crate::app::{MeridianApp, ScrubSource};
+use crate::app::{MeridianApp, MonitorFocus, ScrubSource};
 use crate::preview::{FrameKey, FrameView, PreviewImage, PreviewQuery};
 use crate::theme::THEME;
 use crate::ui::format_tc;
@@ -35,6 +39,466 @@ const SCRUB_H: f32 = 28.0;
 const SCRUB_INSET_X: f32 = 16.0;
 const WELL_PAD: f32 = 12.0;
 const WELL_TC_H: f32 = 30.0;
+const MONITOR_GAP: f32 = 6.0;
+
+/// Side-by-side source and program monitors for the Edit workspace.
+pub fn dual_monitor_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
+    let total = ui.available_width();
+    let height = ui.available_height();
+    let half = ((total - MONITOR_GAP) * 0.5).max(160.0);
+    ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(
+            Vec2::new(half, height),
+            Layout::top_down(Align::Min),
+            |ui| {
+                ui.set_min_height(height);
+                source_viewer_panel(ui, app);
+            },
+        );
+        ui.add_space(MONITOR_GAP);
+        ui.allocate_ui_with_layout(
+            Vec2::new((total - half - MONITOR_GAP).max(160.0), height),
+            Layout::top_down(Align::Min),
+            |ui| {
+                ui.set_min_height(height);
+                viewer_panel(ui, app);
+            },
+        );
+    });
+}
+
+pub fn source_viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
+    follow_source_scrub(ui, app);
+    let focused = app.focused_monitor == MonitorFocus::Source;
+    let media = app
+        .selected_media
+        .and_then(|id| app.session.project().media(id).cloned());
+    let prefer_proxies = app.session.project().prefer_proxies;
+    let backend = app.preview.backend().clone();
+    let playing = app.source_playing;
+    let scrubbing = app.preview_scrub;
+    let reverse = app.source_play_rate < 0;
+
+    let Some(media) = media else {
+        widgets::panel_header(ui, "Source", |ui| {
+            focus_badge(ui, focused);
+            ui.label(
+                egui::RichText::new("No clip")
+                    .size(12.0)
+                    .color(THEME.text_dim),
+            );
+        });
+        empty_monitor(ui, "Select a pool clip, or double-click one to open it here.");
+        claim_focus_on_click(ui, app, MonitorFocus::Source);
+        return;
+    };
+
+    let marks = app.source_marks_for(media.id);
+    let playhead = marks.playhead.clamp(0, media.duration.0.max(0));
+    let end = media.duration.0.max(0);
+    let (mut banner, picture, mode, used_proxy, _canvas) =
+        source_picture(ui, app, &media, playhead, prefer_proxies, playing, scrubbing, reverse);
+
+    let header_name = media.name.clone();
+    let timebase = media.timebase;
+    let size_label = match (media.width, media.height) {
+        (Some(w), Some(h)) => format!("{w}×{h}"),
+        _ => "—".into(),
+    };
+
+    widgets::panel_header(ui, "Source", |ui| {
+        focus_badge(ui, focused);
+        ui.label(
+            egui::RichText::new(&header_name)
+                .size(12.0)
+                .color(THEME.text_dim),
+        );
+        ui.add_space(8.0);
+        widgets::readout(ui, &size_label, 92.0, false);
+        ui.add_space(6.0);
+        widgets::readout(ui, mode, 78.0, mode == "Preview");
+        ui.add_space(4.0);
+        let resolution = if used_proxy {
+            "Proxy"
+        } else if prefer_proxies {
+            "Full*"
+        } else {
+            "Full"
+        };
+        widgets::readout(ui, resolution, 58.0, used_proxy);
+        ui.add_space(6.0);
+        widgets::readout(ui, &format_tc(playhead, timebase), 118.0, true);
+    });
+
+    let monitor_h = (ui.available_height() - SCRUB_H).max(48.0);
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), monitor_h), Sense::click());
+    if response.clicked() {
+        app.focus_monitor(MonitorFocus::Source);
+    }
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, THEME.stage);
+    if focused {
+        painter.rect_stroke(
+            rect.shrink(1.0),
+            0.0,
+            Stroke::new(1.5_f32, THEME.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let well = rect.shrink(WELL_PAD);
+    painter.rect_filled(well, THEME.radius as f32, THEME.inset);
+    painter.rect_stroke(
+        well,
+        THEME.radius as f32,
+        Stroke::new(1.0_f32, THEME.border),
+        egui::StrokeKind::Inside,
+    );
+    let tc_h = WELL_TC_H.min((well.height() * 0.16).max(22.0));
+    let tc_bar = Rect::from_min_max(
+        Pos2::new(well.left(), well.bottom() - tc_h),
+        well.right_bottom(),
+    );
+    painter.hline(
+        tc_bar.x_range(),
+        tc_bar.top(),
+        Stroke::new(1.0_f32, THEME.hairline),
+    );
+    let glass = Rect::from_min_max(
+        well.min + Vec2::new(8.0, 8.0),
+        Pos2::new(well.right() - 8.0, tc_bar.top() - 8.0),
+    );
+    let src_w = media.width.unwrap_or(1920) as f32;
+    let src_h = media.height.unwrap_or(1080) as f32;
+    let frame = letterbox(glass, src_w, src_h);
+    painter.rect_filled(frame.expand(1.0), 0.0, Color32::BLACK);
+    painter.rect_stroke(
+        frame.expand(1.0),
+        0.0,
+        Stroke::new(1.0_f32, THEME.border),
+        egui::StrokeKind::Outside,
+    );
+    checker(&painter, frame);
+    painter.rect_filled(frame, 0.0, Color32::BLACK);
+
+    if let Some(image) = &picture {
+        let texture = app.preview.texture(ui.ctx(), image);
+        paint_decoded(&painter, frame, texture, image.width, image.height, 1.0);
+    } else if media.has_video {
+        paint_source_proxy(&painter, frame, &media, playhead);
+        if banner.is_none() && matches!(backend, PreviewBackend::Disabled) {
+            banner = Some(
+                "Decoded preview is off. Run cargo run -p editor-app --features ffmpeg.".into(),
+            );
+        }
+    } else {
+        banner = Some("Audio-only clip — mark in/out, then Overwrite or Insert.".into());
+    }
+
+    monitor_corners(&painter, frame);
+    let tc = format_tc(playhead, timebase);
+    let dur = format_tc(end, timebase);
+    painter.text(
+        Pos2::new(tc_bar.left() + 12.0, tc_bar.center().y),
+        egui::Align2::LEFT_CENTER,
+        "SRC",
+        THEME.font(9.0),
+        THEME.text_mute,
+    );
+    painter.text(
+        Pos2::new(tc_bar.left() + 40.0, tc_bar.center().y),
+        egui::Align2::LEFT_CENTER,
+        &tc,
+        THEME.mono(15.0),
+        THEME.accent,
+    );
+    painter.text(
+        Pos2::new(tc_bar.right() - 12.0, tc_bar.center().y),
+        egui::Align2::RIGHT_CENTER,
+        &dur,
+        THEME.mono(12.0),
+        THEME.text_dim,
+    );
+    if let Some(text) = banner {
+        overlay_note(&painter, frame, &text);
+    }
+
+    source_scrubber(ui, app, media.id, end, marks.in_point, marks.out_point);
+}
+
+fn source_picture(
+    ui: &mut egui::Ui,
+    app: &mut MeridianApp,
+    media: &MediaAsset,
+    playhead: i64,
+    prefer_proxies: bool,
+    playing: bool,
+    scrubbing: bool,
+    reverse: bool,
+) -> (
+    Option<String>,
+    Option<PreviewImage>,
+    &'static str,
+    bool,
+    (u32, u32),
+) {
+    let src_w = media.width.unwrap_or(1920).max(2);
+    let src_h = media.height.unwrap_or(1080).max(2);
+    let (canvas_w, canvas_h) =
+        fit_preview_size(src_w, src_h, PREVIEW_MAX_W, PREVIEW_MAX_H).unwrap_or((960, 540));
+    let source = if prefer_proxies {
+        PreviewSource::Proxy
+    } else {
+        PreviewSource::Full
+    };
+    let (path, used_proxy) = preview_file(media, source);
+    let backend = app.preview.backend().clone();
+    let mut banner = None;
+    let mut picture = None;
+    let mode = match &backend {
+        PreviewBackend::Disabled => {
+            banner = Some(
+                "Decoded preview is off. Run cargo run -p editor-app --features ffmpeg.".into(),
+            );
+            "Proxy"
+        }
+        PreviewBackend::Unavailable(message) => {
+            banner = Some(format!("ffmpeg is not available — {message}"));
+            "Proxy"
+        }
+        PreviewBackend::Cli => {
+            if !media.has_video {
+                "Empty"
+            } else if !path.is_file() {
+                banner = Some(format!("Offline — {} is not on disk", media.name));
+                "Offline"
+            } else {
+                let last_source_frame = media.duration.0.saturating_sub(1).max(0);
+                let source_frame = playhead.clamp(0, last_source_frame);
+                let duration_secs = media.duration.to_seconds(media.timebase);
+                let raw_time = Frame(source_frame).to_seconds(media.timebase);
+                let time_secs = editor_media::clamp_preview_time(raw_time, duration_secs)
+                    .unwrap_or(0.0);
+                let burst = if playing && !scrubbing {
+                    PLAY_BURST
+                } else {
+                    SCRUB_BURST
+                };
+                let lead = if scrubbing || reverse { burst / 3 } else { 0 };
+                let query = PreviewQuery {
+                    path: path.to_string_lossy().into_owned(),
+                    source_frame,
+                    width: canvas_w,
+                    height: canvas_h,
+                    time_secs,
+                    frame_secs: media.timebase.frame_duration_secs().max(1.0e-4),
+                    last_source_frame,
+                    burst,
+                    lead,
+                };
+                match app.preview.request(query) {
+                    FrameView::Exact(image) | FrameView::Nearby(image) => {
+                        picture = Some(image);
+                    }
+                    FrameView::Pending => {
+                        banner = Some("Decoding preview…".into());
+                        ui.ctx()
+                            .request_repaint_after(std::time::Duration::from_millis(16));
+                    }
+                    FrameView::Failed(message) => banner = Some(message),
+                    FrameView::Unavailable => {
+                        banner = Some("ffmpeg is not available.".into());
+                    }
+                }
+                if app.preview.busy() {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(16));
+                }
+                if picture.is_some() {
+                    "Preview"
+                } else if banner.as_deref() == Some("Decoding preview…") {
+                    "Preview"
+                } else {
+                    "Offline"
+                }
+            }
+        }
+    };
+    (banner, picture, mode, used_proxy, (canvas_w, canvas_h))
+}
+
+fn paint_source_proxy(painter: &Painter, frame: Rect, media: &MediaAsset, playhead: i64) {
+    let hue = ((media.id.0 as u32).wrapping_mul(47) % 360) as f32;
+    let color = Color32::from_rgb(
+        ((hue / 360.0) * 80.0 + 40.0) as u8,
+        70,
+        ((1.0 - hue / 360.0) * 90.0 + 50.0) as u8,
+    );
+    painter.rect_filled(frame, 0.0, color);
+    painter.text(
+        frame.center(),
+        egui::Align2::CENTER_CENTER,
+        format!("{}\n{}", media.name, format_tc(playhead, media.timebase)),
+        THEME.font(14.0),
+        THEME.text,
+    );
+}
+
+fn empty_monitor(ui: &mut egui::Ui, note: &str) {
+    let monitor_h = (ui.available_height() - SCRUB_H).max(48.0);
+    let (rect, _) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), monitor_h), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, THEME.stage);
+    let well = rect.shrink(WELL_PAD);
+    painter.rect_filled(well, THEME.radius as f32, THEME.inset);
+    overlay_note(&painter, well.shrink(16.0), note);
+    let _ = ui.allocate_exact_size(Vec2::new(ui.available_width(), SCRUB_H), Sense::hover());
+}
+
+fn focus_badge(ui: &mut egui::Ui, focused: bool) {
+    if focused {
+        widgets::readout(ui, "FOCUS", 56.0, true);
+        ui.add_space(6.0);
+    }
+}
+
+fn claim_focus_on_click(ui: &mut egui::Ui, app: &mut MeridianApp, focus: MonitorFocus) {
+    if ui.input(|input| {
+        input.pointer.any_click()
+            && input
+                .pointer
+                .interact_pos()
+                .is_some_and(|pos| ui.max_rect().contains(pos))
+    }) {
+        app.focus_monitor(focus);
+    }
+}
+
+fn follow_source_scrub(ui: &egui::Ui, app: &mut MeridianApp) {
+    let pointer = ui.input(|input| {
+        (
+            input.pointer.primary_down(),
+            input.pointer.primary_pressed(),
+            input.pointer.interact_pos(),
+        )
+    });
+    let (down, pressed, pos) = pointer;
+    if pressed {
+        if let (Some(pos), Some(bar)) = (pos, app.source_bar) {
+            if bar.contains(pos) {
+                app.scrub = Some(ScrubSource::Source);
+                app.focus_monitor(MonitorFocus::Source);
+            }
+        }
+    }
+    if !down {
+        if app.scrub == Some(ScrubSource::Source) {
+            app.scrub = None;
+        }
+        return;
+    }
+    if app.scrub != Some(ScrubSource::Source) {
+        return;
+    }
+    let (Some(pos), Some(bar)) = (pos, app.source_bar) else {
+        return;
+    };
+    let track = scrub_track(bar);
+    let span = (track.right() - track.left()).max(1.0);
+    let t = ((pos.x - track.left()) / span).clamp(0.0, 1.0);
+    let end = app.source_bar_end.max(0);
+    let frame = if end == 0 {
+        0
+    } else {
+        (t * end as f32).round() as i64
+    };
+    app.set_source_playhead(frame);
+    app.preview_scrub = true;
+    app.halt_source_transport();
+}
+
+fn source_scrubber(
+    ui: &mut egui::Ui,
+    app: &mut MeridianApp,
+    media_id: editor_core::MediaId,
+    end: i64,
+    in_point: Option<i64>,
+    out_point: Option<i64>,
+) {
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), SCRUB_H),
+        Sense::click_and_drag(),
+    );
+    let bar = scrub_track(rect);
+    app.source_bar = Some(rect);
+    app.source_bar_end = end.max(0);
+    let painter = ui.painter();
+    painter.rect_filled(rect, 0.0, THEME.header);
+    painter.hline(
+        rect.x_range(),
+        rect.top(),
+        Stroke::new(1.0_f32, THEME.hairline),
+    );
+    painter.rect_filled(bar, 2.0, THEME.inset);
+    if let (Some(inn), Some(out)) = (in_point, out_point) {
+        if end > 0 && out > inn {
+            let x0 = bar.min.x + inn as f32 / end as f32 * bar.width();
+            let x1 = bar.min.x + out as f32 / end as f32 * bar.width();
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(x0, bar.min.y),
+                    Pos2::new(x1.max(x0 + 2.0), bar.max.y),
+                ),
+                2.0,
+                THEME.accent_dim,
+            );
+        }
+    }
+    let playhead = app.source_marks_for(media_id).playhead;
+    let t = if end <= 0 {
+        0.0
+    } else {
+        (playhead as f32 / end as f32).clamp(0.0, 1.0)
+    };
+    let x = bar.min.x + t * bar.width();
+    painter.rect_filled(
+        Rect::from_min_max(bar.min, Pos2::new(x, bar.max.y)),
+        2.0,
+        Color32::from_white_alpha(28),
+    );
+    painter.vline(
+        x,
+        bar.y_range().expand(3.0),
+        Stroke::new(2.0_f32, THEME.playhead),
+    );
+    painter.circle_filled(Pos2::new(x, bar.center().y), 6.0, THEME.playhead);
+    if response.hovered() || response.dragged() {
+        response
+            .clone()
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        response.clone().on_hover_text("Drag to scrub the source");
+    }
+    let pointer = ui.input(|input| input.pointer.interact_pos());
+    let pointer_down = ui.input(|input| input.pointer.primary_down());
+    let over = pointer.is_some_and(|pos| rect.contains(pos)) && pointer_down;
+    if over || response.is_pointer_button_down_on() {
+        app.scrub = Some(ScrubSource::Source);
+        app.focus_monitor(MonitorFocus::Source);
+        if let Some(pos) = pointer.or(response.interact_pointer_pos()) {
+            let span = bar.width().max(1.0);
+            let local = ((pos.x - bar.min.x) / span).clamp(0.0, 1.0);
+            let frame = if end <= 0 {
+                0
+            } else {
+                (local * end as f32).round() as i64
+            };
+            app.set_source_playhead(frame);
+            app.preview_scrub = true;
+            app.halt_source_transport();
+        }
+    }
+}
 
 pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
     let Some(sequence) = app.session.project().active().cloned() else {
@@ -42,6 +506,7 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
         return;
     };
     follow_viewer_scrub(ui, app);
+    let focused = app.focused_monitor == MonitorFocus::Program;
     let playhead = app.playhead;
     let playing = app.playing;
     let scrubbing = app.preview_scrub;
@@ -186,6 +651,7 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
             }
             ui.add_space(6.0);
         }
+        focus_badge(ui, focused);
         ui.label(
             egui::RichText::new(&sequence.name)
                 .size(12.0)
@@ -224,10 +690,21 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
 
     let bank_h = if bank.is_some() { 44.0 } else { 0.0 };
     let monitor_h = (ui.available_height() - SCRUB_H - bank_h).max(48.0);
-    let (rect, _) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), monitor_h), Sense::hover());
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), monitor_h), Sense::click());
+    if response.clicked() {
+        app.focus_monitor(MonitorFocus::Program);
+    }
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, THEME.stage);
+    if focused {
+        painter.rect_stroke(
+            rect.shrink(1.0),
+            0.0,
+            Stroke::new(1.5_f32, THEME.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
     let well = rect.shrink(WELL_PAD);
     painter.rect_filled(well, THEME.radius as f32, THEME.inset);
     painter.rect_stroke(
@@ -489,6 +966,7 @@ fn follow_viewer_scrub(ui: &egui::Ui, app: &mut MeridianApp) {
         if let (Some(pos), Some(bar)) = (pos, app.viewer_bar) {
             if bar.contains(pos) {
                 app.scrub = Some(ScrubSource::Viewer);
+                app.focus_monitor(MonitorFocus::Program);
             }
         }
     }
@@ -609,6 +1087,7 @@ fn program_scrubber(ui: &mut egui::Ui, app: &mut MeridianApp, end: i64) {
     let over = pointer.is_some_and(|pos| rect.contains(pos)) && pointer_down;
     if over || response.is_pointer_button_down_on() {
         app.scrub = Some(ScrubSource::Viewer);
+        app.focus_monitor(MonitorFocus::Program);
         if let Some(pos) = pointer.or(response.interact_pointer_pos()) {
             let span = bar.width().max(1.0);
             let local = ((pos.x - bar.min.x) / span).clamp(0.0, 1.0);

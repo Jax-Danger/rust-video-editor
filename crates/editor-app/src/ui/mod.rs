@@ -21,7 +21,7 @@ pub use inspector::inspector_panel;
 pub use pool::media_pool;
 pub use scopes::scopes_panel;
 pub use timeline::timeline_panel;
-pub use viewer::viewer_panel;
+pub use viewer::{dual_monitor_panel, viewer_panel};
 
 pub(crate) fn media_missing(path: &str) -> bool {
     path.is_empty() || !editor_media::resolve_media_path(path).is_file()

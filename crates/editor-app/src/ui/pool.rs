@@ -104,7 +104,7 @@ pub fn media_pool(ui: &mut egui::Ui, app: &mut MeridianApp) {
         );
         widgets::empty_note(
             ui,
-            "File → Import, Ctrl+I, or drop video, audio, or stills here. Then double-click, drag onto the timeline, or press Overwrite / Insert.",
+            "File → Import, Ctrl+I, or drop video, audio, or stills here. Then double-click to open in source, or use Overwrite / Insert.",
         );
         return;
     }
@@ -386,10 +386,8 @@ fn media_row(
         }
     }
     if response.double_clicked() {
-        app.selected_media = Some(id);
-        app.pool_selection = vec![id];
         app.dragging_media = None;
-        app.place_selected_media(false);
+        app.open_in_source(id);
     }
     if missing {
         if let Some(path) = app

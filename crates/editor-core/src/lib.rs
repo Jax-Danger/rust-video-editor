@@ -33,7 +33,7 @@ pub use deliver_preset::{
 pub use demo::{demo_project, dense_project};
 pub use edit::{
     active_sequence_id, add_adjustment_layer, add_marker, add_title, add_transition, attach_proxies,
-    clip_from_media,
+    clip_from_media, resolve_source_marks,
     collect_snap_points, delete_cue, expand_linked, import_media, insert_clips, lift_delete,
     link_clips, move_clips, overwrite_clips, razor_at, razor_clip, relink_media, replace_captions,
     ripple_delete, ripple_trim, ripple_trim_next_to_playhead, ripple_trim_prev_to_playhead,
