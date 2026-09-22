@@ -8,12 +8,12 @@
 //! the next decoded chunk. The default build keeps the same meters and reports
 //! that output is compiled into the ffmpeg feature.
 
-#[cfg(feature = "ffmpeg")]
-use editor_core::mix_frame;
 use editor_core::{
     audio_topology, mix_regions, source_frame_at, update_hold, BusState, Frame, MediaAsset,
     Sequence, TrackKind,
 };
+#[cfg(feature = "ffmpeg")]
+use editor_core::{channel_clips, mix_frame};
 use editor_media::resolve_media_path;
 
 #[cfg(feature = "ffmpeg")]
@@ -48,6 +48,8 @@ pub struct MeterReadout {
     pub peak: [f32; 2],
     pub rms: [f32; 2],
     pub hold: [f32; 2],
+    /// Latched when a channel reaches full scale. Cleared from the strip.
+    pub clip: bool,
 }
 
 impl Default for MeterReadout {
@@ -56,6 +58,7 @@ impl Default for MeterReadout {
             peak: [0.0, 0.0],
             rms: [0.0, 0.0],
             hold: [0.0, 0.0],
+            clip: false,
         }
     }
 }
@@ -133,7 +136,8 @@ struct MeterPub {
     generation: u64,
     master_peak: [f32; 2],
     master_rms: [f32; 2],
-    tracks: Vec<(u64, [f32; 2], [f32; 2])>,
+    master_clip: bool,
+    tracks: Vec<(u64, [f32; 2], [f32; 2], bool)>,
 }
 
 #[cfg(feature = "ffmpeg")]
@@ -155,6 +159,7 @@ impl MixControl {
                 generation: 0,
                 master_peak: [0.0, 0.0],
                 master_rms: [0.0, 0.0],
+                master_clip: false,
                 tracks: Vec::new(),
             }),
         }
@@ -222,6 +227,16 @@ impl AudioEngine {
             .find(|(id, _)| *id == track_id)
             .map(|(_, meter)| *meter)
             .unwrap_or_default()
+    }
+
+    pub fn clear_track_clip(&mut self, track_id: u64) {
+        if let Some((_, meter)) = self.track_meters.iter_mut().find(|(id, _)| *id == track_id) {
+            meter.clip = false;
+        }
+    }
+
+    pub fn clear_master_clip(&mut self) {
+        self.master_meter.clip = false;
     }
 
     pub fn meters_hot(&self) -> bool {
@@ -361,26 +376,42 @@ impl AudioEngine {
                     meters.generation,
                     meters.master_peak,
                     meters.master_rms,
+                    meters.master_clip,
                     meters.tracks.clone(),
                 )
             })
         });
         #[cfg(not(feature = "ffmpeg"))]
-        let published: Option<(u64, [f32; 2], [f32; 2], Vec<(u64, [f32; 2], [f32; 2])>)> = None;
-        if let Some((generation, peak, rms, tracks)) = published {
+        let published: Option<(
+            u64,
+            [f32; 2],
+            [f32; 2],
+            bool,
+            Vec<(u64, [f32; 2], [f32; 2], bool)>,
+        )> = None;
+        if let Some((generation, peak, rms, master_clip, tracks)) = published {
             if generation != self.seen_generation && generation != 0 {
                 self.seen_generation = generation;
                 self.master_meter.peak = peak;
                 self.master_meter.rms = rms;
+                self.master_meter.clip |= master_clip;
                 let previous = std::mem::take(&mut self.track_meters);
-                for (id, peak, rms) in tracks {
-                    let hold = previous
+                for (id, peak, rms, clip) in tracks {
+                    let old = previous
                         .iter()
                         .find(|(old, _)| *old == id)
-                        .map(|(_, meter)| meter.hold)
-                        .unwrap_or([0.0, 0.0]);
-                    self.track_meters
-                        .push((id, MeterReadout { peak, rms, hold }));
+                        .map(|(_, meter)| *meter);
+                    let hold = old.map(|meter| meter.hold).unwrap_or([0.0, 0.0]);
+                    let clip = old.map(|meter| meter.clip).unwrap_or(false) || clip;
+                    self.track_meters.push((
+                        id,
+                        MeterReadout {
+                            peak,
+                            rms,
+                            hold,
+                            clip,
+                        },
+                    ));
                 }
             } else if !playing {
                 decay_readout(&mut self.master_meter, dt);
@@ -718,8 +749,10 @@ struct BusSource {
     expect_left: bool,
     peak: Vec<[f32; 2]>,
     sumsq: Vec<[f32; 2]>,
+    track_clip: Vec<bool>,
     master_peak: [f32; 2],
     master_sumsq: [f32; 2],
+    master_clip: bool,
     window: u32,
 }
 
@@ -763,8 +796,10 @@ impl BusSource {
             expect_left: true,
             peak: vec![[0.0, 0.0]; n],
             sumsq: vec![[0.0, 0.0]; n],
+            track_clip: vec![false; n],
             master_peak: [0.0, 0.0],
             master_sumsq: [0.0, 0.0],
+            master_clip: false,
             window: 0,
         }
     }
@@ -803,6 +838,7 @@ impl BusSource {
         }
         let mixed = mix_frame(&self.acc, &bus);
         self.window = self.window.saturating_add(1);
+        self.master_clip |= mixed.overload;
         self.master_peak[0] = self.master_peak[0].max(mixed.left.abs());
         self.master_peak[1] = self.master_peak[1].max(mixed.right.abs());
         self.master_sumsq[0] += mixed.left * mixed.left;
@@ -810,6 +846,7 @@ impl BusSource {
         for index in 0..mixed.track_count as usize {
             let (id, left, right) = mixed.tracks[index];
             if let Some(slot) = self.track_ids.iter().position(|track| *track == id) {
+                self.track_clip[slot] |= channel_clips(left, right);
                 self.peak[slot][0] = self.peak[slot][0].max(left.abs());
                 self.peak[slot][1] = self.peak[slot][1].max(right.abs());
                 self.sumsq[slot][0] += left * left;
@@ -827,12 +864,17 @@ impl BusSource {
         let rms = |sum: [f32; 2]| [(sum[0] / window).sqrt(), (sum[1] / window).sqrt()];
         let mut tracks = Vec::new();
         for (index, id) in self.track_ids.iter().enumerate() {
-            tracks.push((*id, self.peak[index], rms(self.sumsq[index])));
+            tracks.push((
+                *id,
+                self.peak[index],
+                rms(self.sumsq[index]),
+                self.track_clip[index],
+            ));
         }
         if let Ok(params) = self.control.params.try_lock() {
             for track in &params.tracks {
-                if !tracks.iter().any(|(id, _, _)| *id == track.id) {
-                    tracks.push((track.id, [0.0, 0.0], [0.0, 0.0]));
+                if !tracks.iter().any(|(id, _, _, _)| *id == track.id) {
+                    tracks.push((track.id, [0.0, 0.0], [0.0, 0.0], false));
                 }
             }
         }
@@ -840,16 +882,21 @@ impl BusSource {
             meters.generation = meters.generation.saturating_add(1);
             meters.master_peak = self.master_peak;
             meters.master_rms = rms(self.master_sumsq);
+            meters.master_clip = self.master_clip;
             meters.tracks = tracks;
         }
         self.window = 0;
         self.master_peak = [0.0, 0.0];
         self.master_sumsq = [0.0, 0.0];
+        self.master_clip = false;
         for peak in &mut self.peak {
             *peak = [0.0, 0.0];
         }
         for sum in &mut self.sumsq {
             *sum = [0.0, 0.0];
+        }
+        for clip in &mut self.track_clip {
+            *clip = false;
         }
     }
 }

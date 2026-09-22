@@ -34,11 +34,12 @@ pub use effects::{
     Effect, GradeParam, Interpolation, KeyframeF32, Transform, TransformParam,
 };
 pub use mix::{
-    accumulate_stereo, audio_solo_active, audio_topology, clamp_gain, clamp_pan, clip_gain_curve,
-    db_to_linear, fader_pos_to_linear, ffmpeg_pan_filter, ffmpeg_volume_arg, format_db, format_pan,
-    linear_to_db, linear_to_fader_pos, measure_stereo, meter_amount, mix_frame, mix_regions,
-    pan_gains, scaled_curve, stereo_frame, track_is_audible, update_hold, BusClip, BusState,
-    BusTrack, GainCurve, GainKey, Level, MixFrame, MixRegion, FADER_DB_MAX, FADER_DB_MIN, GAIN_MAX,
+    accumulate_stereo, audio_solo_active, audio_topology, channel_clips, clamp_gain, clamp_pan,
+    clip_gain_curve, db_to_linear, fader_pos_to_linear, ffmpeg_pan_filter, ffmpeg_volume_arg,
+    format_db, format_pan, linear_to_db, linear_to_fader_pos, measure_stereo, meter_amount,
+    mix_frame, mix_regions, pan_gains, scaled_curve, stereo_frame, track_is_audible, update_hold,
+    BusClip, BusState, BusTrack, GainCurve, GainKey, Level, MixFrame, MixRegion, FADER_DB_MAX,
+    FADER_DB_MIN, GAIN_MAX,
 };
 pub use model::*;
 pub use session::Session;

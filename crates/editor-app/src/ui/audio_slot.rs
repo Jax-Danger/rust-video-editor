@@ -4,7 +4,7 @@
 //! pass. The track bay is the mixer: one strip per audio track, plus master.
 
 use editor_core::meter_amount;
-use egui::{pos2, Align2, Rect, RichText, Sense, Vec2};
+use egui::{pos2, Align2, Id, Rect, RichText, Sense, Vec2};
 
 use crate::app::MeridianApp;
 use crate::theme::{self, THEME};
@@ -13,7 +13,6 @@ use crate::ui::mixer::mixer_bay;
 use crate::ui::widgets;
 
 pub fn audio_workspace(ui: &mut egui::Ui, app: &mut MeridianApp) {
-    let meter = app.audio.master_meter();
     let badge = app.audio.badge().to_string();
     let playhead = app.playhead;
     let timebase = app.timebase();
@@ -64,6 +63,18 @@ pub fn audio_workspace(ui: &mut egui::Ui, app: &mut MeridianApp) {
     }
     // The bay child can shrink this Ui's clip. Paint the program meter on the
     // panel layer so the column stays at the right edge of the page.
+    let lamp = Rect::from_center_size(
+        pos2(meter_rect.center().x, meter_rect.top() + 24.0),
+        Vec2::new((meter_rect.width() - 16.0).max(8.0), 8.0),
+    );
+    if ui
+        .interact(lamp, Id::new("program_clip"), Sense::click())
+        .on_hover_text("Full scale — click to clear")
+        .clicked()
+    {
+        app.audio.clear_master_clip();
+    }
+    let meter = app.audio.master_meter();
     let painter = ui
         .ctx()
         .layer_painter(ui.layer_id())
@@ -89,12 +100,21 @@ fn paint_program_meter(
         Align2::CENTER_CENTER,
         "PROGRAM",
         THEME.font(10.0),
-        THEME.text_mute,
+        if meter.clip {
+            THEME.danger
+        } else {
+            THEME.text_mute
+        },
     );
-    let column_h = (rect.height() - 64.0).max(40.0);
+    let lamp = Rect::from_center_size(
+        pos2(rect.center().x, rect.top() + 24.0),
+        Vec2::new((rect.width() - 16.0).max(8.0), 6.0),
+    );
+    painter.rect_filled(lamp, 1.0, if meter.clip { THEME.danger } else { THEME.bg });
+    let column_h = (rect.height() - 78.0).max(40.0);
     for index in 0..2 {
         let x = rect.center().x + (index as f32 - 0.5) * 22.0 - 5.0;
-        let column = Rect::from_min_size(pos2(x, rect.top() + 26.0), Vec2::new(10.0, column_h));
+        let column = Rect::from_min_size(pos2(x, rect.top() + 34.0), Vec2::new(10.0, column_h));
         painter.rect_filled(column, 1.0, THEME.bg);
         let level = meter_amount(meter.peak[index]);
         let fill_h = column.height() * level;

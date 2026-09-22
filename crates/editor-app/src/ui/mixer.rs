@@ -196,7 +196,16 @@ fn channel_strip(ui: &mut egui::Ui, app: &mut MeridianApp, strip: &StripSnap, he
         pos2(rect.left() + 78.0, gain_top - 8.0),
     );
     if meter_rect.height() > 24.0 {
-        paint_meter_pair(ui.painter(), meter_rect, strip.meter);
+        let columns = meter_columns(meter_rect);
+        if clip_lamp(
+            ui,
+            meter_rect,
+            Id::new(("mix_clip_lamp", strip.id.0)),
+            strip.meter.clip,
+        ) {
+            app.audio.clear_track_clip(strip.id.0);
+        }
+        paint_meter_pair(ui.painter(), columns, strip.meter);
         fader(
             ui,
             fader_rect,
@@ -291,7 +300,11 @@ fn master_strip(
         pos2(rect.left() + 78.0, meter_rect.bottom()),
     );
     if meter_rect.height() > 24.0 {
-        paint_meter_pair(ui.painter(), meter_rect, meter);
+        let columns = meter_columns(meter_rect);
+        if clip_lamp(ui, meter_rect, Id::new("mix_master_clip"), meter.clip) {
+            app.audio.clear_master_clip();
+        }
+        paint_meter_pair(ui.painter(), columns, meter);
         fader(
             ui,
             fader_rect,
@@ -529,6 +542,34 @@ fn clip_gain_row(ui: &mut egui::Ui, app: &mut MeridianApp, rect: Rect, strip: &S
     if response.drag_stopped() {
         app.session.end_interactive();
     }
+}
+
+fn meter_columns(meter_rect: Rect) -> Rect {
+    Rect::from_min_max(
+        pos2(meter_rect.left(), meter_rect.top() + 12.0),
+        meter_rect.right_bottom(),
+    )
+}
+
+/// Sticky full-scale lamp. Click clears it. Sits above the meter columns.
+fn clip_lamp(ui: &mut egui::Ui, meter_rect: Rect, id: Id, on: bool) -> bool {
+    let rect = Rect::from_min_size(meter_rect.min, Vec2::new(meter_rect.width(), 8.0));
+    let response = ui.interact(rect, id, Sense::click());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 1.0, if on { THEME.danger } else { THEME.inset });
+    painter.rect_stroke(
+        rect,
+        1.0,
+        Stroke::new(1.0_f32, if on { THEME.danger } else { THEME.hairline }),
+        egui::StrokeKind::Inside,
+    );
+    response
+        .on_hover_text(if on {
+            "Full scale — click to clear"
+        } else {
+            "Clip"
+        })
+        .clicked()
 }
 
 fn paint_meter_pair(painter: &egui::Painter, rect: Rect, meter: MeterReadout) {

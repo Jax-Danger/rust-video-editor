@@ -39,6 +39,11 @@ pub fn limit_sample(sample: f32) -> f32 {
     sample.clamp(-1.0, 1.0)
 }
 
+/// Either channel is at or past full scale. Checked before the master limiter.
+pub fn channel_clips(left: f32, right: f32) -> bool {
+    left.abs() >= 1.0 || right.abs() >= 1.0
+}
+
 /// Constant-power pan, normalized so center is unity (0 dB) on both channels.
 ///
 /// `pan` is −1 (hard left) … 0 (center) … +1 (hard right). Hard left is +3 dB
@@ -360,6 +365,8 @@ impl BusState {
 pub struct MixFrame {
     pub left: f32,
     pub right: f32,
+    /// True when the pre-limit master sum reached full scale on either side.
+    pub overload: bool,
     pub tracks: [(u64, f32, f32); MAX_MIX_TRACKS],
     pub track_count: u8,
 }
@@ -369,6 +376,7 @@ impl Default for MixFrame {
         Self {
             left: 0.0,
             right: 0.0,
+            overload: false,
             tracks: [(0, 0.0, 0.0); MAX_MIX_TRACKS],
             track_count: 0,
         }
@@ -399,8 +407,11 @@ pub fn mix_frame(track_audio: &[(u64, f32, f32)], bus: &BusState) -> MixFrame {
         left += out_left;
         right += out_right;
     }
-    out.left = limit_sample(left * master);
-    out.right = limit_sample(right * master);
+    let summed_left = left * master;
+    let summed_right = right * master;
+    out.overload = channel_clips(summed_left, summed_right);
+    out.left = limit_sample(summed_left);
+    out.right = limit_sample(summed_right);
     out
 }
 
@@ -719,9 +730,11 @@ mod tests {
             clips: Vec::new(),
         };
         let frame = mix_frame(&[(1, 0.6, -0.6), (2, 0.6, -0.6)], &bus);
+        assert!(frame.overload);
         assert!((frame.left - 1.0).abs() < 1.0e-5);
         assert!((frame.right + 1.0).abs() < 1.0e-5);
         let quiet = mix_frame(&[(1, 0.25, 0.25), (2, 0.25, 0.25)], &bus);
+        assert!(!quiet.overload);
         assert!((quiet.left - 0.5).abs() < 1.0e-5);
     }
 
