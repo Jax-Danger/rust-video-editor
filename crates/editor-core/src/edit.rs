@@ -1489,6 +1489,31 @@ pub fn import_media(project: &mut Project, mut asset: MediaAsset) -> MediaId {
     id
 }
 
+/// Resolve source-monitor in/out marks into a media range for insert/overwrite.
+///
+/// Missing marks fall back to the start or end of the file. Both marks may be
+/// unset (full file). Marks are media-timebase frames, the same unit as
+/// [`MediaAsset::duration`].
+pub fn resolve_source_marks(
+    duration: Frame,
+    in_point: Option<Frame>,
+    out_point: Option<Frame>,
+) -> Result<(Frame, Frame), EditError> {
+    if duration.0 < 1 {
+        return Err(EditError::InvalidDuration);
+    }
+    let source_in = in_point.unwrap_or(Frame::ZERO).0.max(0).min(duration.0);
+    let source_out = out_point
+        .unwrap_or(duration)
+        .0
+        .max(0)
+        .min(duration.0);
+    if source_out <= source_in {
+        return Err(EditError::InvalidDuration);
+    }
+    Ok((Frame(source_in), Frame(source_out)))
+}
+
 /// Build a timeline clip that uses `source_in..source_out` of `media`.
 pub fn clip_from_media(
     id: ClipId,
@@ -2449,6 +2474,70 @@ mod tests {
         project.next_id = 50_000;
         project.sequences.push(sequence);
         project
+    }
+
+    #[test]
+    fn resolve_source_marks_defaults_to_full_file() {
+        assert_eq!(
+            resolve_source_marks(Frame(120), None, None).unwrap(),
+            (Frame(0), Frame(120))
+        );
+        assert_eq!(
+            resolve_source_marks(Frame(120), Some(Frame(24)), None).unwrap(),
+            (Frame(24), Frame(120))
+        );
+        assert_eq!(
+            resolve_source_marks(Frame(120), None, Some(Frame(48))).unwrap(),
+            (Frame(0), Frame(48))
+        );
+        assert_eq!(
+            resolve_source_marks(Frame(120), Some(Frame(10)), Some(Frame(40))).unwrap(),
+            (Frame(10), Frame(40))
+        );
+        assert_eq!(
+            resolve_source_marks(Frame(120), Some(Frame(40)), Some(Frame(40))),
+            Err(EditError::InvalidDuration)
+        );
+        assert_eq!(
+            resolve_source_marks(Frame(120), Some(Frame(80)), Some(Frame(40))),
+            Err(EditError::InvalidDuration)
+        );
+    }
+
+    #[test]
+    fn clip_from_media_uses_source_marks_for_timeline_span() {
+        let media = MediaAsset {
+            id: MediaId(1),
+            bin_id: crate::model::BinId(0),
+            name: "clip".into(),
+            path: "clip.mp4".into(),
+            duration: Frame(96),
+            timebase: Timebase::fps_24(),
+            width: Some(1920),
+            height: Some(1080),
+            video_codec: None,
+            audio_codec: None,
+            audio_channels: None,
+            sample_rate: None,
+            has_video: true,
+            has_audio: false,
+            offline: false,
+            proxy_path: None,
+        };
+        let clip = clip_from_media(
+            ClipId(1),
+            &media,
+            Timebase::fps_24(),
+            Frame(10),
+            Frame(24),
+            Frame(72),
+            "clip",
+        )
+        .unwrap();
+        assert_eq!(clip.timeline_in.0, 10);
+        assert_eq!(clip.timeline_out.0, 58);
+        assert_eq!(clip.source_in.0, 24);
+        assert_eq!(clip.source_out.0, 72);
     }
 
     #[test]

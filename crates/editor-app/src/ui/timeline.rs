@@ -324,10 +324,10 @@ fn transport(ui: &mut egui::Ui, app: &mut MeridianApp) {
         None => "Mark Out".into(),
     };
     if widgets::chip(&mut bar, &in_label, inn.is_some()) {
-        app.mark_in();
+        app.mark_program_in();
     }
     if widgets::chip(&mut bar, &out_label, out.is_some()) {
-        app.mark_out();
+        app.mark_program_out();
     }
     bar.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         if widgets::ghost_button(ui, "Fit") {

@@ -56,7 +56,7 @@ The first launch loads an in-memory example: three picture tracks, a lower-third
 
 **File → Import** (Ctrl+I) opens a native file picker for video, audio, and stills. Dropping files onto the media pool does the same. The app probes each file (`ffprobe` when built with `--features ffmpeg`), stores the canonical path on the asset, and adds it to the first bin. Project `.json` files are rejected here; use **File → Open**. **File → Import from Path…** is the typed-path fallback.
 
-Drag a pool item onto the timeline to overwrite at the drop frame. Hold Shift while dropping to insert and ripple. Double-click, or the Overwrite / Insert buttons, place the selected item at the playhead. One import batch is a single undo step. Paths round-trip in the project JSON. An empty pool says to import. A missing file is marked offline in the pool and on the clip, and the tooltip shows the path.
+Drag a pool item onto the timeline to overwrite at the drop frame. Hold Shift while dropping to insert and ripple. Double-click opens the clip in the **source monitor**. Overwrite / Insert (or `,` / `.`) place the source in–out range at the program playhead. One import batch is a single undo step. Paths round-trip in the project JSON. An empty pool says to import. A missing file is marked offline in the pool and on the clip, and the tooltip shows the path.
 
 Stills shorter than five seconds are held for five seconds at 24 fps so they can be cut.
 
@@ -66,7 +66,7 @@ The toolbar exposes Select, Razor, Ripple, Roll, Slip, and Slide, plus Overwrite
 
 | Gesture | Result |
 | --- | --- |
-| Overwrite | Places the selected pool item at the playhead, trimming or splitting what it covers |
+| Overwrite | Places the source in–out range of the selected pool item at the program playhead, trimming or splitting what it covers |
 | Insert | Same, then ripples later clips on sync-locked tracks |
 | `C` or Ctrl+K | Razor at the playhead (linked partners split together) |
 | Razor tool + click | Splits the clip under the pointer; transitions follow the right half |
@@ -74,11 +74,13 @@ The toolbar exposes Select, Razor, Ripple, Roll, Slip, and Slide, plus Overwrite
 | Click a clip | Select it. Shift-click adds, Ctrl-click toggles. Esc clears the selection |
 | Drag body | Move (lift, then overwrite) |
 | Drag edge | Trim. Ripple, roll, slip, and slide follow the active tool |
-| Double-click pool item | Overwrite at the playhead |
+| Double-click pool item | Open in the source monitor |
 
 Linked selection is on by default so picture and sound move together. Inserting a linked pair is one ripple, not two.
 
-Click or drag the timeline ruler, or the bar under the program monitor, to scrub. The decoded preview follows the playhead. Playback and scrubbing reuse one ffmpeg job for a short burst of frames, then a memory cache and a disk cache (see [Long projects](#long-projects)) so a second pass over the same frames does not spawn ffmpeg again. The timeline scrolls horizontally by a frame origin, so an hour zoomed to single frames stays a viewport-sized strip instead of a multi-million-pixel layout. Scroll pans; Ctrl+scroll, Alt+scroll, a pinch, or a vertical middle-drag zooms around the cursor. `+` / `−` and the slider zoom around the center of the panel. The zoom slider is logarithmic, from single frames (64 px/frame) out to about 12 px per minute at 24 fps, which fits an hour in the panel. `F` or Shift+Z fits the sequence and scrolls back to the start. Double-click empty timeline space or the ruler to play or pause. Off-screen clips are not drawn. The clip under the pointer is a binary search on the sorted track, plus any clip that runs underneath later shots.
+The Edit workspace shows a **source monitor** and a **program monitor** side by side. Source plays the selected pool clip with its own playhead and in/out marks. Program stays on the active sequence. Click a monitor (or press `\`) to focus it; Space / JKL / I / O then apply to that monitor. Overwrite and Insert always edit the sequence at the program playhead using the source marks (full file when unmarked).
+
+Click or drag the timeline ruler, or the bar under either monitor, to scrub. The decoded preview follows that playhead. Playback and scrubbing reuse one ffmpeg job for a short burst of frames, then a memory cache and a disk cache (see [Long projects](#long-projects)) so a second pass over the same frames does not spawn ffmpeg again. The timeline scrolls horizontally by a frame origin, so an hour zoomed to single frames stays a viewport-sized strip instead of a multi-million-pixel layout. Scroll pans; Ctrl+scroll, Alt+scroll, a pinch, or a vertical middle-drag zooms around the cursor. `+` / `−` and the slider zoom around the center of the panel. The zoom slider is logarithmic, from single frames (64 px/frame) out to about 12 px per minute at 24 fps, which fits an hour in the panel. `F` or Shift+Z fits the sequence and scrolls back to the start. Double-click empty timeline space or the ruler to play or pause. Off-screen clips are not drawn. The clip under the pointer is a binary search on the sorted track, plus any clip that runs underneath later shots.
 
 Track headers show a **T** target toggle on video and audio lanes. Armed tracks receive overwrite, insert, and Q/W ripple trims. Keys `1`–`9` toggle V1–V9; Shift+`1`–`9` toggle A1–A9.
 
@@ -118,14 +120,15 @@ Shortcuts are global while you are not typing in a text field. The same list is 
 | Shift+Left / Right | Jump 10 frames |
 | Ctrl+Left / Right | Jump one second |
 | Up / Down | Previous / next edit |
-| Home / End | Go to start / end |
-| I / O | Mark in / out |
+| Home / End | Go to start / end of the focused monitor |
+| I / O | Mark in / out on the focused monitor (source or program) |
+| \ | Toggle focus between source and program monitors |
 | M | Add marker |
 | V | Select tool |
 | C or Ctrl+K | Razor at the playhead (also selects the razor tool) |
 | / | Razor at the playhead (keeps the active tool) |
 | Q / W | Ripple trim previous / next edit to the playhead (targeted tracks) |
-| , / . | Overwrite / insert selected pool item at the playhead |
+| , / . | Overwrite / insert source in–out at the program playhead |
 | 1–9 | Toggle video track target (V1–V9) |
 | Shift+1–9 | Toggle audio track target (A1–A9) |
 | Alt+1–9 | Switch multicam angle at the playhead |
@@ -205,12 +208,12 @@ Northline opens with **NORTHLINE** on V3 for the first five seconds.
 
 ## Workspaces
 
-- **Edit** — media pool, program viewer, inspector, captions, timeline
+- **Edit** — media pool, dual source/program viewers, inspector, captions, timeline
 - **Colour** — scopes, viewer, lift/gamma/gain wheels, luma curve, white balance, and grade sliders
 - **Audio** — the mixer docks in this page: faders, pan, mute, solo, and meters in the track bay, with the program meter on the right and the timeline still underneath
 - **Deliver** — export presets (YouTube, Shorts, Instagram, ProRes master, H.265, audio WAV), codec/container, in/out, and **Export**. With `--features ffmpeg` this encodes a real file. Without that feature, Export still writes the JSON manifest and says the encoder is compiled out.
 
-The program monitor draws mute/solo, grade, transform, dissolve, wipe, push, and caption burn-in as proxy cards when decode is off. Title generators are the exception: proxy and decode both stamp the shared bitmap. With `--features ffmpeg` it decodes every visible video layer under the playhead and runs the same CPU compositor Deliver uses, titles included. Play, keyboard stepping, and mouse scrubbing all follow the sequence timebase. If ffmpeg is missing or every layer is offline, the proxy stays up and the viewer says why. Active caption cues are burned into that decoded picture; on the proxy they are drawn with the UI font in the same bottom safe area.
+The **source monitor** decodes the selected pool clip through the same ffmpeg preview path (proxy when preferred). It does not composite grades, titles, or captions — those stay on the program side. The **program monitor** draws mute/solo, grade, transform, dissolve, wipe, push, and caption burn-in as proxy cards when decode is off. Title generators are the exception: proxy and decode both stamp the shared bitmap. With `--features ffmpeg` it decodes every visible video layer under the playhead and runs the same CPU compositor Deliver uses, titles included. Play, keyboard stepping, and mouse scrubbing follow the focused monitor's timebase. If ffmpeg is missing or every layer is offline, the proxy stays up and the viewer says why. Active caption cues are burned into the decoded program picture; on the proxy they are drawn with the UI font in the same bottom safe area.
 
 ### What matches, and what is still approximate
 
@@ -262,7 +265,7 @@ The same JSON is embedded with `include_str!`, so the app does not depend on the
 
 ## Media probe and preview
 
-`editor_media::probe` returns duration, resolution, codecs, and whether the file is offline. `editor_media::decode_frames` turns a timestamp into RGBA for the program viewer.
+`editor_media::probe` returns duration, resolution, codecs, and whether the file is offline. `editor_media::decode_frames` turns a timestamp into RGBA for the source and program viewers.
 
 The default build never links or spawns ffmpeg. Probe classifies the extension, invents a stable duration from the file name (stills become a five-second hold), and marks missing files offline. Decode returns `FeatureDisabled`. Drop a `<file>.probe.json` sidecar next to the media if you want the stub to return exact values.
 
