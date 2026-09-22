@@ -9,8 +9,8 @@
 //! that output is compiled into the ffmpeg feature.
 
 use editor_core::{
-    audio_topology, mix_regions, source_frame_at, update_hold, BusState, Frame, MediaAsset,
-    Sequence, TrackKind,
+    audio_topology, mix_regions, multicam_audio_spans, source_frame_at, update_hold, BusState,
+    Frame, MediaAsset, MulticamGroup, Sequence, TrackKind,
 };
 #[cfg(feature = "ffmpeg")]
 use editor_core::{channel_clips, mix_frame};
@@ -460,10 +460,11 @@ impl Drop for AudioEngine {
 pub fn collect_pieces(
     sequence: &Sequence,
     media: &[MediaAsset],
+    groups: &[MulticamGroup],
     from: i64,
     to: i64,
 ) -> Vec<AudioPiece> {
-    collect_filtered(sequence, media, from, to, false)
+    collect_filtered(sequence, media, groups, from, to, false)
 }
 
 /// Every audio clip with a file, including muted and non-solo tracks.
@@ -472,10 +473,11 @@ pub fn collect_pieces(
 pub fn collect_bus_pieces(
     sequence: &Sequence,
     media: &[MediaAsset],
+    groups: &[MulticamGroup],
     from: i64,
     to: i64,
 ) -> Vec<AudioPiece> {
-    collect_filtered(sequence, media, from, to, true)
+    collect_filtered(sequence, media, groups, from, to, true)
 }
 
 pub fn topology_of(sequence: &Sequence) -> u64 {
@@ -485,18 +487,13 @@ pub fn topology_of(sequence: &Sequence) -> u64 {
 fn collect_filtered(
     sequence: &Sequence,
     media: &[MediaAsset],
+    groups: &[MulticamGroup],
     from: i64,
     to: i64,
     include_silent: bool,
 ) -> Vec<AudioPiece> {
     let mut pieces = Vec::new();
     for region in mix_regions(sequence, from, to, include_silent) {
-        let Some(asset) = media.iter().find(|item| item.id == region.media_id) else {
-            continue;
-        };
-        if !asset.has_audio {
-            continue;
-        }
         let Some(clip) = sequence
             .tracks
             .iter()
@@ -506,6 +503,39 @@ fn collect_filtered(
         else {
             continue;
         };
+        if let Some(spans) = multicam_audio_spans(clip, groups, media, sequence.timebase) {
+            for span in spans {
+                let Some(asset) = media.iter().find(|item| item.id == span.media_id) else {
+                    continue;
+                };
+                if !asset.has_audio {
+                    continue;
+                }
+                let resolved = resolve_media_path(&asset.path);
+                if !resolved.is_file() {
+                    continue;
+                }
+                pieces.push(AudioPiece {
+                    path: resolved.to_string_lossy().into_owned(),
+                    timeline_in: span.timeline_in,
+                    timeline_out: span.timeline_out,
+                    source_at_in: span.source_at_in,
+                    seconds_per_frame: span.seconds_per_frame,
+                    gain: region.gain,
+                    pan: region.pan,
+                    gain_keys: region.gain_keys.clone(),
+                    track_id: region.track_id,
+                    clip_id: region.clip_id,
+                });
+            }
+            continue;
+        }
+        let Some(asset) = media.iter().find(|item| item.id == region.media_id) else {
+            continue;
+        };
+        if !asset.has_audio {
+            continue;
+        }
         let resolved = resolve_media_path(&asset.path);
         if !resolved.is_file() {
             continue;
@@ -984,9 +1014,9 @@ mod tests {
             offline: true,
             proxy_path: None,
         }];
-        assert!(collect_pieces(&sequence, &media, 0, 48).is_empty());
+        assert!(collect_pieces(&sequence, &media, &[], 0, 48).is_empty());
         sequence.tracks[0].muted = false;
-        assert!(collect_pieces(&sequence, &media, 0, 48).is_empty());
+        assert!(collect_pieces(&sequence, &media, &[], 0, 48).is_empty());
     }
 
     #[test]
@@ -1010,11 +1040,11 @@ mod tests {
         sequence.tracks[0].clips = vec![quiet];
         sequence.tracks[1].clips = vec![loud];
         let media = vec![tone(MediaId(1), &keep), tone(MediaId(2), &other)];
-        let mixed = collect_pieces(&sequence, &media, 0, 24);
+        let mixed = collect_pieces(&sequence, &media, &[], 0, 24);
         assert_eq!(mixed.len(), 2);
         assert!((mixed[0].gain - 0.35).abs() < 1.0e-5);
         sequence.tracks[1].solo = true;
-        let solo = collect_pieces(&sequence, &media, 0, 24);
+        let solo = collect_pieces(&sequence, &media, &[], 0, 24);
         assert_eq!(solo.len(), 1);
         assert!((solo[0].gain - 1.5).abs() < 1.0e-5);
         assert!(solo[0].path.ends_with("other.wav"));
@@ -1022,11 +1052,11 @@ mod tests {
         sequence.tracks[0].fader = 2.0;
         sequence.tracks[0].pan = -0.5;
         sequence.tracks[0].muted = true;
-        let bus = collect_bus_pieces(&sequence, &media, 0, 24);
+        let bus = collect_bus_pieces(&sequence, &media, &[], 0, 24);
         assert_eq!(bus.len(), 2);
         assert!((bus[0].gain - 0.7).abs() < 1.0e-4);
         assert!((bus[0].pan + 0.5).abs() < 1.0e-5);
-        assert!(collect_pieces(&sequence, &media, 0, 24)
+        assert!(collect_pieces(&sequence, &media, &[], 0, 24)
             .iter()
             .all(|piece| piece.track_id == 3));
         let _ = std::fs::remove_dir_all(&dir);

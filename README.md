@@ -14,7 +14,7 @@ Meridian is a desktop non-linear editor written in Rust. The timeline is frame-a
 
 `editor-core` never stores an edit in floating-point seconds. A [`Timebase`](crates/editor-core/src/time.rs) is a rational frame rate. A [`Frame`](crates/editor-core/src/time.rs) is an `i64` index on that rate. Media time is an integer tick count (`MediaTime`) and converts onto the sequence with rounded rational arithmetic. Drop-frame timecode is used for 29.97 and 59.94.
 
-A project holds bins, media, and sequences. A sequence has video, audio, and caption tracks. Clips can be linked (picture and sound stay selected and split together). Markers, in/out, transitions, and title generators sit on the sequence.
+A project holds bins, media, multicam groups, and sequences. A sequence has video, audio, and caption tracks. Clips can be linked (picture and sound stay selected and split together). Markers, in/out, transitions, and title generators sit on the sequence.
 
 Edits are transactional. `Session` clones the project, runs the operation, and pushes the previous project onto the undo stack only when the edit succeeds. Interactive slider drags snapshot once at drag start.
 
@@ -82,6 +82,18 @@ Click or drag the timeline ruler, or the bar under the program monitor, to scrub
 
 Track headers show a **T** target toggle on video and audio lanes. Armed tracks receive overwrite, insert, and Q/W ripple trims. Keys `1`–`9` toggle V1–V9; Shift+`1`–`9` toggle A1–A9.
 
+## Multicam
+
+A multicam group ties two or more video angles to one sync origin. Each angle has a video asset, an optional separate audio file, and a sync offset: the source frame that lines up with group time 0. Offset 0 means the file starts with the group. A camera that rolled early gets a positive offset so its clap lands on the same group frame as the other angles.
+
+**Create.** In the media pool, Shift-click to add clips or Ctrl-click to toggle them. Pick at least two video items. Audio-only items in that selection attach, in order, as dedicated audio for those angles. **Create Multicam** (or **Edit → Create Multicam from Pool**) overwrites a clip at the playhead on the first unlocked video track and links an audio clip when any angle has sound. The timeline length is the overlap of the angles. A longer angle is left as a tail handle. The first selected video is angle 1.
+
+**Switch.** When a multicam clip is the picture under the playhead, the program monitor grows an angle bank. Click an angle, use the same buttons in the inspector, or press Alt+`1`–`9`. Plain `1`–`9` still toggle track targets. If the playhead is inside the clip, Meridian razors there and the right-hand piece takes the new angle, picture and linked multicam audio together. On the first frame of the clip the whole clip retargets and nothing is split. Interior cuts that were written without a razor are drawn as ticks on the clip. Preview and Deliver both resolve the active angle through the shared compositor, so the exported frame is the angle on screen. Playback and export audio follow the same cuts.
+
+**Sync.** The inspector lists each angle's sync offset in source frames. Dragging it slips that camera against the group without moving the timeline clip. The offset lives on the group, so every clip that uses the group stays in step.
+
+Groups, offsets, and angle cuts are stored in the project JSON (`multicam_groups` on the project, `multicam` on the clip, cuts in group time). Projects saved before this field still load; an empty group list is omitted.
+
 ## Keyboard
 
 Shortcuts are global while you are not typing in a text field. The same list is under **Help → Keyboard Shortcuts**. On macOS, Command replaces Ctrl.
@@ -104,6 +116,7 @@ Shortcuts are global while you are not typing in a text field. The same list is 
 | , / . | Overwrite / insert selected pool item at the playhead |
 | 1–9 | Toggle video track target (V1–V9) |
 | Shift+1–9 | Toggle audio track target (A1–A9) |
+| Alt+1–9 | Switch multicam angle at the playhead |
 | B / N / Y / U | Ripple, roll, slip, slide tools |
 | S | Toggle snapping |
 | Delete / Backspace | Lift delete |
@@ -394,7 +407,7 @@ A progress bar follows ffmpeg's `out_time`. **Cancel** sends `SIGTERM`. A failed
 
 ## Tests
 
-`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, deliver presets (apply, custom JSON, last-settings round-trip), the sample project round-trip, imported media paths in JSON, proxy attach and relink, timeline culling on an 800-clip sequence, ruler spacing across an hour, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, proxy argument planning and preview fallback, the disk frame cache, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, pan, fader, burned captions, deliver bitrate hints, audio-only WAV planning, retimed source frames, muted retimed audio), the mix bus (pan law, mute, solo, keyframed gain, peak and RMS), clip speed (constant 25–400%, reverse, a linear ramp, JSON round-trip, and duration ripple), adjustment layers (JSON round-trip, track placement, composite stacking), and the shared composite (luma curve, lift/gamma/gain wheels, grade split, dissolve mix, wipe angle, push, dip, slide, blur dissolve, iris, clip filters, anchor, caption burn-in, adjustment grade-below). It does not spawn ffmpeg or whisper.
+`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, deliver presets (apply, custom JSON, last-settings round-trip), the sample project round-trip, imported media paths in JSON, proxy attach and relink, timeline culling on an 800-clip sequence, ruler spacing across an hour, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, proxy argument planning and preview fallback, the disk frame cache, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, pan, fader, burned captions, deliver bitrate hints, audio-only WAV planning, retimed source frames, muted retimed audio), multicam sync offsets, razor angle switches, group-time cuts, JSON round-trip, and raster frames that follow the active angle, the mix bus (pan law, mute, solo, keyframed gain, peak and RMS), clip speed (constant 25–400%, reverse, a linear ramp, JSON round-trip, and duration ripple), adjustment layers (JSON round-trip, track placement, composite stacking), and the shared composite (luma curve, lift/gamma/gain wheels, grade split, dissolve mix, wipe angle, push, dip, slide, blur dissolve, iris, clip filters, anchor, caption burn-in, adjustment grade-below). It does not spawn ffmpeg or whisper.
 
 `cargo test -p editor-media --features ffmpeg` also encodes a short H.264/AAC mp4 when `ffmpeg` is on `PATH`. `cargo test -p editor-app --features whisper` builds the local speech-to-text path; the binary and model are resolved at runtime, not at compile time.
 
@@ -405,7 +418,6 @@ A progress bar follows ffmpeg's `out_time`. **Cancel** sends `SIGTERM`. A failed
 - Fairlight-class dynamics, EQ, and track sends. The mixer already has faders, pan, mute, solo, meters, and keyframed clip gain
 - OFX-style plugins for third-party effects
 - Scene-linear grading and a hinted caption font. Preview and export already share the display-space formula and the bitmap burn-in
-- Multi-cam: sync groups and angle switching
 - Gang edits and a command palette
 
 ## License

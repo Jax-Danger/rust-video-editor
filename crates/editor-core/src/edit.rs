@@ -56,6 +56,14 @@ pub enum EditError {
     NoCaptionTrack,
     #[error("clips must share an in-point and duration")]
     MismatchedSpan,
+    #[error("select at least two video angles")]
+    NotEnoughAngles,
+    #[error("clip is not a multicam clip")]
+    NotMulticam,
+    #[error("angle is out of range")]
+    AngleOutOfRange,
+    #[error("multicam group not found")]
+    GroupNotFound,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1514,6 +1522,7 @@ pub fn clip_from_media(
         title: None,
         adjustment: false,
         speed: ClipSpeed::normal(),
+        multicam: None,
     })
 }
 
@@ -1700,6 +1709,73 @@ pub fn source_frame_at(clip: &Clip, timeline_frame: Frame, sequence_timebase: Ti
     }
     let delta = timeline_frame.0 - clip.timeline_in.0;
     Frame(clip.source_in.0 + source_delta(clip, delta, sequence_timebase))
+}
+
+/// Sequence frame where `clip` shows `source_frame`. Inverse of [`source_frame_at`]
+/// for the clip's current mapping. Rounding can drift when the rates are not equal.
+/// A retimed clip is inverted by searching [`source_frame_at`], so speed math stays
+/// in the speed module.
+pub fn timeline_frame_at_source(
+    clip: &Clip,
+    source_frame: Frame,
+    sequence_timebase: Timebase,
+) -> Frame {
+    if !clip.speed.is_identity() {
+        return timeline_frame_for_retimed_source(clip, source_frame, sequence_timebase);
+    }
+    let delta = source_frame.0 - clip.source_in.0;
+    Frame(clip.timeline_in.0 + inverse_source_delta(clip, delta, sequence_timebase))
+}
+
+fn inverse_source_delta(clip: &Clip, source_delta_frames: i64, sequence_timebase: Timebase) -> i64 {
+    let timeline_span = clip.duration();
+    let source_span = clip.source_duration();
+    if timeline_span > 0 && source_span > 0 {
+        let mapped = convert_frames(timeline_span, sequence_timebase, clip.media_timebase);
+        if mapped == source_span {
+            return convert_frames(source_delta_frames, clip.media_timebase, sequence_timebase);
+        }
+        return mul_div_round(source_delta_frames, timeline_span, source_span);
+    }
+    convert_frames(source_delta_frames, clip.media_timebase, sequence_timebase)
+}
+
+fn timeline_frame_for_retimed_source(
+    clip: &Clip,
+    source_frame: Frame,
+    sequence_timebase: Timebase,
+) -> Frame {
+    let start = clip.timeline_in.0;
+    let end = clip.timeline_out.0.max(start);
+    if end <= start {
+        return clip.timeline_in;
+    }
+    let mut lo = start;
+    let mut hi = end;
+    let reverse = clip.speed.reverse;
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        let mapped = source_frame_at(clip, Frame(mid), sequence_timebase).0;
+        let before = if reverse {
+            mapped > source_frame.0
+        } else {
+            mapped < source_frame.0
+        };
+        if before {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let at_lo = source_frame_at(clip, Frame(lo), sequence_timebase).0;
+    let hi_frame = hi.saturating_sub(1).max(lo);
+    let at_hi = source_frame_at(clip, Frame(hi_frame), sequence_timebase).0;
+    let pick = if (at_hi - source_frame.0).abs() < (at_lo - source_frame.0).abs() {
+        hi_frame
+    } else {
+        lo
+    };
+    Frame(pick)
 }
 
 /// Set playback speed on `clip_id` and every clip linked to it.

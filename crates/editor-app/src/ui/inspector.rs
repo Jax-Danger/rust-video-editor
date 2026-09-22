@@ -88,6 +88,8 @@ fn inspector_body(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId, sna
         });
     });
 
+    multicam_controls(ui, app, clip_id);
+
     if snapshot.is_title {
         title_controls(ui, app, clip_id);
     } else if !snapshot.is_adjustment {
@@ -468,6 +470,117 @@ fn playhead_source_line(app: &MeridianApp, id: ClipId) -> Option<String> {
         "Playhead source {}",
         format_tc(frame.0, clip.media_timebase)
     ))
+}
+
+fn multicam_controls(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId) {
+    let Some(info) = multicam_info(app, clip_id) else {
+        return;
+    };
+    ui.add_space(8.0);
+    widgets::section_label(ui, "Multicam");
+    ui.label(
+        RichText::new(format!(
+            "{}    angle {} · {}",
+            info.group_name,
+            info.active + 1,
+            info.angles
+                .get(info.active as usize)
+                .map(|a| a.0.as_str())
+                .unwrap_or("—")
+        ))
+        .size(12.0)
+        .color(THEME.text),
+    );
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        for (index, (name, _)) in info.angles.iter().enumerate() {
+            let active = info.active == index as u32;
+            if ui
+                .selectable_label(active, format!("{}  {name}", index + 1))
+                .clicked()
+                && !active
+            {
+                app.switch_multicam_angle(index as u32);
+            }
+        }
+    });
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new("Sync is the source frame that lines up with the start of the group.")
+            .size(11.0)
+            .color(THEME.text_mute),
+    );
+    for (index, (name, sync)) in info.angles.iter().enumerate() {
+        let mut offset = *sync;
+        let limit = info.limits.get(index).copied().unwrap_or(10_000).max(0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(name).size(12.0).color(THEME.text));
+            let response = ui.add(
+                egui::DragValue::new(&mut offset)
+                    .range(0..=limit)
+                    .speed(0.25)
+                    .suffix(" fr"),
+            );
+            app.note_text_focus(&response);
+            if response.drag_started() {
+                app.session.begin_interactive("Angle sync");
+            }
+            if response.changed() {
+                app.set_multicam_sync(info.group, index as u32, offset);
+            }
+            if response.drag_stopped() || response.lost_focus() {
+                app.session.end_interactive();
+            }
+        });
+    }
+}
+
+struct McInfo {
+    group: editor_core::MulticamId,
+    group_name: String,
+    active: u32,
+    angles: Vec<(String, i64)>,
+    limits: Vec<i64>,
+}
+
+fn multicam_info(app: &MeridianApp, clip_id: ClipId) -> Option<McInfo> {
+    let project = app.session.project();
+    let sequence = project.active()?;
+    let clip = sequence.clip(clip_id)?;
+    let binding = clip.multicam.as_ref()?;
+    let group = project.multicam_group(binding.group)?;
+    let group_time =
+        editor_core::source_frame_at(clip, editor_core::Frame(app.playhead), sequence.timebase).0;
+    let active = if clip.covers(editor_core::Frame(app.playhead)) {
+        editor_core::active_angle(&binding.cuts, group_time)
+    } else {
+        editor_core::active_angle(&binding.cuts, clip.source_in.0)
+    };
+    let active = if (active as usize) < group.angles.len() {
+        active
+    } else {
+        0
+    };
+    let mut limits = Vec::new();
+    let angles = group
+        .angles
+        .iter()
+        .map(|angle| {
+            let limit = project
+                .media(angle.video)
+                .map(|media| media.duration.0.saturating_sub(1))
+                .unwrap_or(0);
+            limits.push(limit);
+            (angle.name.clone(), angle.sync_offset.0)
+        })
+        .collect();
+    Some(McInfo {
+        group: group.id,
+        group_name: group.name.clone(),
+        active,
+        angles,
+        limits,
+    })
 }
 
 fn title_controls(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId) {

@@ -4,10 +4,10 @@ use std::collections::HashSet;
 
 use editor_core::{
     add_adjustment_layer, add_title, add_transition, builtin_templates, clip_from_media,
-    expand_linked, link_clips,
-    plan_export, replace_captions, Bin, BinId, BusState, CaptionTranscriber, ClipId, CueId,
-    Direction, EditError, ExportRange, Frame, MediaAsset, MediaId, Project, Session, Timebase,
-    Track, TrackFlag, TrackId, TrackKind, TransitionKind, TrimEdge,
+    create_multicam, expand_linked, link_clips, multicam_target, plan_export, replace_captions,
+    set_angle_sync, switch_angle, Bin, BinId, BusState, CaptionTranscriber, ClipId, CueId,
+    Direction, EditError, ExportRange, Frame, MediaAsset, MediaId, MulticamId, Project, Session,
+    Timebase, Track, TrackFlag, TrackId, TrackKind, TransitionKind, TrimEdge,
 };
 use editor_media::{duration_frames, probe, resolve_media_path};
 use egui::{Event, Key, Modifiers, RichText, ViewportCommand};
@@ -190,6 +190,9 @@ pub struct MeridianApp {
     pub playhead: i64,
     pub selected: Vec<ClipId>,
     pub selected_media: Option<MediaId>,
+    /// Pool items chosen for a multicam. Plain click replaces this; Shift adds;
+    /// Ctrl toggles. [`Self::selected_media`] stays the primary item.
+    pub pool_selection: Vec<MediaId>,
     pub selected_cue: Option<CueId>,
     pub tool: Tool,
     pub linked_selection: bool,
@@ -242,6 +245,7 @@ impl MeridianApp {
             playhead: 24,
             selected: vec![ClipId(301)],
             selected_media: Some(MediaId(10)),
+            pool_selection: vec![MediaId(10)],
             selected_cue: None,
             tool: Tool::Select,
             linked_selection: true,
@@ -627,7 +631,13 @@ impl MeridianApp {
             let project = self.session.project();
             match project.active() {
                 Some(sequence) => (
-                    collect_bus_pieces(sequence, &project.media, playhead, end),
+                    collect_bus_pieces(
+                        sequence,
+                        &project.media,
+                        &project.multicam_groups,
+                        playhead,
+                        end,
+                    ),
                     topology_of(sequence),
                     BusState::from_sequence(sequence),
                 ),
@@ -709,6 +719,8 @@ impl MeridianApp {
             } else if !mods.command && !mods.alt {
                 self.toggle_video_target(digit);
             }
+        } else if let Some(angle) = angle_hotkey(ctx) {
+            self.switch_multicam_angle(angle);
         } else if held_cmd(Key::ArrowLeft) {
             self.step_playhead(-second);
         } else if held_cmd(Key::ArrowRight) {
@@ -927,6 +939,115 @@ impl MeridianApp {
         };
     }
 
+    pub fn create_multicam_from_pool(&mut self) {
+        let ids = if self.pool_selection.len() >= 2 {
+            self.pool_selection.clone()
+        } else if let Some(id) = self.selected_media {
+            vec![id]
+        } else {
+            self.status = "Shift-click at least two video clips in the pool.".into();
+            return;
+        };
+        let playhead = self.playhead.max(0);
+        let mut created = None;
+        self.halt_transport();
+        let result = self.session.edit("Create multicam", |project| {
+            let sequence = project.active_sequence.ok_or(EditError::NoActiveSequence)?;
+            created = Some(create_multicam(project, sequence, &ids, Frame(playhead))?);
+            Ok(())
+        });
+        self.status = match result {
+            Ok(()) => {
+                if let Some(id) = created {
+                    if let Some(sequence) = self.session.project().active() {
+                        self.selected = if self.linked_selection {
+                            expand_linked(sequence, &[id])
+                        } else {
+                            vec![id]
+                        };
+                    }
+                }
+                let (name, count) = self
+                    .session
+                    .project()
+                    .multicam_groups
+                    .last()
+                    .map(|group| (group.name.clone(), group.angles.len()))
+                    .unwrap_or_else(|| ("Multicam".into(), 0));
+                format!(
+                    "{name} · {count} angles at {}. Alt+1–9 or the angle bank switches.",
+                    format_tc(playhead, self.timebase())
+                )
+            }
+            Err(err) => err.to_string(),
+        };
+    }
+
+    pub fn switch_multicam_angle(&mut self, angle: u32) {
+        let playhead = self.playhead.max(0);
+        let selected = self.selected.clone();
+        let prepared = {
+            let project = self.session.project();
+            let Some(sequence) = project.active() else {
+                return;
+            };
+            let Some(clip_id) = multicam_target(sequence, &selected, playhead) else {
+                return;
+            };
+            let Some(binding) = sequence
+                .clip(clip_id)
+                .and_then(|clip| clip.multicam.clone())
+            else {
+                return;
+            };
+            let Some(group) = project.multicam_group(binding.group) else {
+                return;
+            };
+            if angle as usize >= group.angles.len() {
+                return;
+            }
+            let name = group.angles[angle as usize].name.clone();
+            (sequence.id, clip_id, name)
+        };
+        let (sequence_id, clip_id, angle_name) = prepared;
+        self.halt_transport();
+        let mut switched = None;
+        let result = self.session.edit("Switch angle", |project| {
+            switched = Some(switch_angle(
+                project,
+                sequence_id,
+                clip_id,
+                Frame(playhead),
+                angle,
+            )?);
+            Ok(())
+        });
+        match result {
+            Ok(()) => {
+                if let Some(id) = switched {
+                    if let Some(sequence) = self.session.project().active() {
+                        self.selected = if self.linked_selection {
+                            expand_linked(sequence, &[id])
+                        } else {
+                            vec![id]
+                        };
+                    }
+                }
+                self.status = format!("Angle {} · {angle_name}.", angle + 1);
+            }
+            Err(err) => self.status = err.to_string(),
+        }
+    }
+
+    pub fn set_multicam_sync(&mut self, group: MulticamId, angle: u32, offset: i64) {
+        let result = self.session.edit("Angle sync", |project| {
+            set_angle_sync(project, group, angle, offset)
+        });
+        if let Err(err) = result {
+            self.status = err.to_string();
+        }
+    }
+
     pub fn place_selected_media(&mut self, insert: bool) {
         let Some(media_id) = self.selected_media else {
             self.status = "Select a clip in the media pool.".into();
@@ -1023,7 +1144,8 @@ impl MeridianApp {
             return None;
         }
         let media = self.session.project().media.clone();
-        let pieces = collect_pieces(sequence, &media, start, end);
+        let groups = self.session.project().multicam_groups.clone();
+        let pieces = collect_pieces(sequence, &media, &groups, start, end);
         Some(CaptionRequest {
             name,
             start,
@@ -1357,6 +1479,7 @@ impl MeridianApp {
         self.playhead = 0;
         self.selected.clear();
         self.selected_media = Some(MediaId(10));
+        self.pool_selection = vec![MediaId(10)];
         self.pixels_per_frame = editor_core::clamp_timeline_zoom(0.05);
         self.timeline_origin = 0.0;
         self.halt_transport();
@@ -1431,6 +1554,7 @@ impl MeridianApp {
         match result {
             Ok(()) => {
                 self.selected_media = self.session.project().media.last().map(|media| media.id);
+                self.pool_selection = self.selected_media.into_iter().collect();
                 let extra = if errors.is_empty() {
                     String::new()
                 } else {
@@ -1475,6 +1599,7 @@ impl MeridianApp {
                 match self.session.import_media(asset) {
                     Ok(id) => {
                         self.selected_media = Some(id);
+                        self.pool_selection = vec![id];
                         self.status = format!("Imported {path} — {note}.");
                         self.modal = Modal::None;
                     }
@@ -1514,6 +1639,7 @@ impl MeridianApp {
                 self.playhead = 0;
                 self.selected.clear();
                 self.selected_media = None;
+                self.pool_selection.clear();
                 self.halt_transport();
                 self.reset_track_targets();
                 self.status = format!("Opened {path}.");
@@ -1540,6 +1666,7 @@ impl MeridianApp {
                 self.playhead = 0;
                 self.selected.clear();
                 self.selected_media = None;
+                self.pool_selection.clear();
                 self.halt_transport();
                 self.workspace = Workspace::Edit;
                 self.reset_track_targets();
@@ -1556,6 +1683,7 @@ impl MeridianApp {
         self.playhead = 24;
         self.selected = vec![ClipId(301)];
         self.selected_media = Some(MediaId(10));
+        self.pool_selection = vec![MediaId(10)];
         self.halt_transport();
         self.workspace = Workspace::Edit;
         self.reset_track_targets();
@@ -1631,8 +1759,7 @@ impl MeridianApp {
             audio_only: self.deliver.audio_only,
         };
         let path = editor_core::custom_deliver_preset_dir().join(format!("{id}.json"));
-        editor_core::save_deliver_preset(&path, &preset)
-            .map_err(|err| err.to_string())?;
+        editor_core::save_deliver_preset(&path, &preset).map_err(|err| err.to_string())?;
         self.deliver.preset_id = id;
         self.deliver.report = format!("Saved custom preset to {}.", path.display());
         Ok(())
@@ -1653,6 +1780,7 @@ impl MeridianApp {
             return;
         };
         let media = self.session.project().media.clone();
+        let groups = self.session.project().multicam_groups.clone();
         let range = if self.deliver.use_in_out {
             ExportRange::InOut
         } else {
@@ -1662,9 +1790,10 @@ impl MeridianApp {
         let _ = editor_core::save_last_deliver_settings(&self.deliver.to_settings());
         #[cfg(feature = "ffmpeg")]
         {
-            match editor_media::plan_encode(
+            match editor_media::plan_encode_with(
                 &sequence,
                 &media,
+                &groups,
                 range,
                 &self.deliver.codec,
                 &self.deliver.container,
@@ -1691,7 +1820,7 @@ impl MeridianApp {
         }
         #[cfg(not(feature = "ffmpeg"))]
         {
-            let _ = (sequence, media, range, output);
+            let _ = (sequence, media, groups, range, output);
             self.deliver.report = "Picture encoding needs the ffmpeg feature. Rebuild with --features ffmpeg, then Export writes an H.264/AAC mp4.".into();
             self.export_manifest();
         }
@@ -2180,6 +2309,10 @@ impl MeridianApp {
                         }
                         if ui.button("Split at Playhead").clicked() {
                             self.split_at_playhead();
+                            ui.close_menu();
+                        }
+                        if ui.button("Create Multicam from Pool").clicked() {
+                            self.create_multicam_from_pool();
                             ui.close_menu();
                         }
                     });
@@ -2689,6 +2822,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     (", / .", "Overwrite / insert selected pool item at the playhead"),
     ("1–9", "Toggle video track target (V1–V9)"),
     ("Shift+1–9", "Toggle audio track target (A1–A9)"),
+    ("Alt+1–9", "Switch multicam angle at the playhead"),
     ("B  N  Y  U", "Ripple, roll, slip, slide tools"),
     ("S", "Toggle snapping"),
     ("Delete / Backspace", "Lift delete"),
@@ -2707,6 +2841,26 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Scroll", "Pan timeline"),
     ("Double-click empty timeline", "Play / pause"),
 ];
+
+fn angle_hotkey(ctx: &egui::Context) -> Option<u32> {
+    const KEYS: [Key; 9] = [
+        Key::Num1,
+        Key::Num2,
+        Key::Num3,
+        Key::Num4,
+        Key::Num5,
+        Key::Num6,
+        Key::Num7,
+        Key::Num8,
+        Key::Num9,
+    ];
+    for (index, key) in KEYS.into_iter().enumerate() {
+        if consume_key(ctx, Modifiers::ALT, key, false) {
+            return Some(index as u32);
+        }
+    }
+    None
+}
 
 fn brand_mark(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());

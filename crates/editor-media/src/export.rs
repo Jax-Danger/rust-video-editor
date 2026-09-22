@@ -12,11 +12,11 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use editor_core::{
-    ffmpeg_pan_filter, ffmpeg_volume_arg, mix_regions, source_frame_at, ExportRange, Frame,
-    GainCurve, MediaAsset, Sequence, Timebase, TrackKind,
+    ffmpeg_pan_filter, ffmpeg_volume_arg, mix_regions, multicam_audio_spans, source_frame_at,
+    ExportRange, Frame, GainCurve, MediaAsset, MulticamGroup, Sequence, Timebase, TrackKind,
 };
 
-use crate::composite::{active_captions, program_stack, ProgramLayer};
+use crate::composite::{active_captions, program_stack_with, ProgramLayer};
 #[cfg(feature = "ffmpeg")]
 use crate::composite::{compose_layers, LayerSource};
 
@@ -97,6 +97,29 @@ pub fn plan_encode(
     burn_captions: bool,
     hints: EncodeHints,
 ) -> Result<FfmpegScript, String> {
+    plan_encode_with(
+        sequence,
+        media,
+        &[],
+        range,
+        codec,
+        container,
+        burn_captions,
+        hints,
+    )
+}
+
+/// Like [`plan_encode`], resolving multicam angle cuts onto the shared raster.
+pub fn plan_encode_with(
+    sequence: &Sequence,
+    media: &[MediaAsset],
+    groups: &[MulticamGroup],
+    range: ExportRange,
+    codec: &str,
+    container: &str,
+    burn_captions: bool,
+    hints: EncodeHints,
+) -> Result<FfmpegScript, String> {
     let (range_in, range_out) = export_bounds(sequence, range)?;
     let mut warnings = Vec::new();
     let audio_only = hints.audio_only || is_audio_only_codec(codec, container);
@@ -108,7 +131,7 @@ pub fn plan_encode(
     let width = even_dim(sequence.width);
     let height = even_dim(sequence.height);
     let fps = fps_token(sequence.timebase);
-    let pieces = audible_pieces(sequence, media, range_in, range_out, &mut warnings);
+    let pieces = audible_pieces(sequence, media, groups, range_in, range_out, &mut warnings);
     let dur = frames_secs(range_out - range_in, sequence.timebase);
     let mut graph = Graph::default();
     let audio = slice_audio(
@@ -125,7 +148,15 @@ pub fn plan_encode(
     let mut frames = Vec::with_capacity((range_out - range_in) as usize);
     if !audio_only {
         for frame in range_in..range_out {
-            let stack = program_stack(sequence, media, frame, width, height);
+            let stack = program_stack_with(
+                sequence,
+                media,
+                frame,
+                width,
+                height,
+                crate::PreviewSource::Full,
+                groups,
+            );
             if let Some(error) = stack.errors.first() {
                 return Err(error.clone());
             }
@@ -842,18 +873,13 @@ fn slice_audio(
 fn audible_pieces(
     sequence: &Sequence,
     media: &[MediaAsset],
+    groups: &[MulticamGroup],
     from: i64,
     to: i64,
     warnings: &mut Vec<String>,
 ) -> Vec<WavPiece> {
     let mut pieces = Vec::new();
     for region in mix_regions(sequence, from, to, false) {
-        let Some(asset) = media.iter().find(|item| item.id == region.media_id) else {
-            continue;
-        };
-        if !asset.has_audio {
-            continue;
-        }
         let Some(clip) = sequence
             .tracks
             .iter()
@@ -862,6 +888,30 @@ fn audible_pieces(
         else {
             continue;
         };
+        if let Some(spans) = multicam_audio_spans(clip, groups, media, sequence.timebase) {
+            for span in spans {
+                push_wav(
+                    &mut pieces,
+                    warnings,
+                    media,
+                    span.media_id,
+                    span.timeline_in,
+                    span.timeline_out,
+                    span.source_at_in,
+                    span.seconds_per_frame,
+                    region.gain,
+                    region.pan,
+                    &region.gain_keys,
+                );
+            }
+            continue;
+        }
+        let Some(asset) = media.iter().find(|item| item.id == region.media_id) else {
+            continue;
+        };
+        if !asset.has_audio {
+            continue;
+        }
         let resolved = crate::resolve_media_path(&asset.path);
         if !resolved.is_file() {
             warnings.push(format!("Skipped offline audio {}", asset.name));
@@ -893,6 +943,42 @@ fn audible_pieces(
         });
     }
     pieces
+}
+
+fn push_wav(
+    pieces: &mut Vec<WavPiece>,
+    warnings: &mut Vec<String>,
+    media: &[MediaAsset],
+    media_id: editor_core::MediaId,
+    timeline_in: i64,
+    timeline_out: i64,
+    source_at_in: f64,
+    seconds_per_frame: f64,
+    gain: f32,
+    pan: f32,
+    gain_keys: &[editor_core::GainKey],
+) {
+    let Some(asset) = media.iter().find(|item| item.id == media_id) else {
+        return;
+    };
+    if !asset.has_audio {
+        return;
+    }
+    let resolved = crate::resolve_media_path(&asset.path);
+    if !resolved.is_file() {
+        warnings.push(format!("Skipped offline audio {}", asset.name));
+        return;
+    }
+    pieces.push(WavPiece {
+        path: resolved.to_string_lossy().into_owned(),
+        timeline_in,
+        timeline_out,
+        source_at_in: source_at_in.max(0.0),
+        seconds_per_frame,
+        gain,
+        pan,
+        gain_keys: gain_keys.to_vec(),
+    });
 }
 
 fn caption_cues(sequence: &Sequence, range_in: i64, range_out: i64) -> Vec<(f64, f64, String)> {
@@ -1948,6 +2034,96 @@ mod tests {
             burned_dev > 35.0,
             "caption band is flat (mean {burned}, stddev {burned_dev}); cues: {joined}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multicam_raster_follows_the_active_angle() {
+        use editor_core::{
+            AngleCut, Frame, MulticamAngle, MulticamBinding, MulticamGroup, MulticamId, Timebase,
+            TrackKind,
+        };
+        let dir = std::env::temp_dir().join(format!("meridian-mc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let wide = touch(&dir, "wide.mp4");
+        let tight = touch(&dir, "tight.mp4");
+        let mut sequence = Sequence::new(SequenceId(1), "MC", 64, 36, Timebase::fps_24());
+        sequence.add_track(TrackId(2), TrackKind::Video, "V1");
+        sequence.add_track(TrackId(3), TrackKind::Audio, "A1");
+        let group = MulticamGroup {
+            id: MulticamId(9),
+            name: "Multicam".into(),
+            timebase: Timebase::fps_24(),
+            angles: vec![
+                MulticamAngle {
+                    name: "wide".into(),
+                    video: MediaId(1),
+                    audio: None,
+                    sync_offset: Frame(0),
+                },
+                MulticamAngle {
+                    name: "tight".into(),
+                    video: MediaId(2),
+                    audio: None,
+                    sync_offset: Frame(5),
+                },
+            ],
+        };
+        let binding = MulticamBinding {
+            group: MulticamId(9),
+            cuts: vec![
+                AngleCut {
+                    at: Frame(0),
+                    angle: 0,
+                },
+                AngleCut {
+                    at: Frame(4),
+                    angle: 1,
+                },
+            ],
+        };
+        let mut video = Clip::basic(10, 0, 8);
+        video.media_id = Some(MediaId(1));
+        video.name = "Multicam".into();
+        video.multicam = Some(binding.clone());
+        let mut audio = Clip::basic(11, 0, 8);
+        audio.media_id = Some(MediaId(1));
+        audio.multicam = Some(binding);
+        sequence.tracks[0].clips = vec![video];
+        sequence.tracks[1].clips = vec![audio];
+        let media = vec![asset(1, &wide, true, true), asset(2, &tight, true, true)];
+        let script = plan_encode_with(
+            &sequence,
+            &media,
+            &[group],
+            ExportRange::WholeSequence,
+            "H.264",
+            "mp4",
+            false,
+            EncodeHints::default(),
+        )
+        .unwrap();
+        assert_eq!(script.raster.frames.len(), 8);
+        match &script.raster.frames[0].layers[0].source {
+            crate::LayerSource::Media {
+                path, source_frame, ..
+            } => {
+                assert!(path.ends_with("wide.mp4"), "{path}");
+                assert_eq!(*source_frame, 0);
+            }
+            other => panic!("frame 0 was {other:?}"),
+        }
+        match &script.raster.frames[4].layers[0].source {
+            crate::LayerSource::Media {
+                path, source_frame, ..
+            } => {
+                assert!(path.ends_with("tight.mp4"), "{path}");
+                assert_eq!(*source_frame, 9);
+            }
+            other => panic!("frame 4 was {other:?}"),
+        }
+        assert!(script.inputs.iter().any(|path| path.ends_with("wide.mp4")));
+        assert!(script.inputs.iter().any(|path| path.ends_with("tight.mp4")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

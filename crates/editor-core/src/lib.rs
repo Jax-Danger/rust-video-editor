@@ -11,6 +11,7 @@ pub mod edit;
 pub mod effects;
 pub mod mix;
 pub mod model;
+pub mod multicam;
 pub mod scale;
 pub mod session;
 mod speed;
@@ -58,6 +59,11 @@ pub use mix::{
     FADER_DB_MIN, GAIN_MAX,
 };
 pub use model::*;
+pub use multicam::{
+    active_angle, angle_audio_media, angle_marks, angle_source_frame, create_multicam,
+    multicam_audio_spans, multicam_target, opening_angle_name, picture_at, set_angle_sync,
+    switch_angle, AnglePicture, AudibleSpan,
+};
 pub use scale::{
     align_frame, clamp_timeline_zoom, clip_index_at, frame_at_x, ruler_mark_count, ruler_step,
     stacked_clip_indices, stacked_hits, timeline_scale_label, timeline_x, visible_clip_span,
