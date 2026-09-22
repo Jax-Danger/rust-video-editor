@@ -264,10 +264,11 @@ Preview (`--features ffmpeg`) and Deliver call one compositor in `editor-media`.
 | Slide | Yes | Outgoing is stationary; incoming slides from off-screen |
 | Blur dissolve | Yes | Cross dissolve plus a shared blur radius that peaks at the cut |
 | Iris | Yes | Circular mask from the frame centre |
-| Blur, vignette, crop, sharpen, chroma key, stabilize | Yes | Per-clip filters applied before the layer is composited. Chroma key writes real alpha; stabilize applies a 2D shift before the layer is composited |
+| Blur, vignette, crop, sharpen, chroma key, shape mask, stabilize | Yes | Per-clip filters applied before the layer is composited. Chroma key and shape mask write real alpha; stabilize applies a 2D shift before the layer is composited |
+| Track matte | Yes | Optional alpha or luma matte from another visible video track, applied during `compose_layers` before the layer is stacked |
 | Captions | Placement yes, glyphs mostly | Both burn the same 8×8 bitmap into the picture (about 32px at 1080p, 48px bottom margin). The proxy uses the UI font instead. Soft `mov_text` subtitles are still written. H.264 then quantizes the burn-in |
 | Titles | Yes | Generator clips on a video track. Text, size, colour, alignment, position, and plate are rasterized in `compose_layers` for the monitor and for Deliver. The proxy draws that same bitmap in track order |
-| Stacking | Yes | Simple alpha over only. No blend modes, no motion blur, no track mattes |
+| Stacking | Yes | Straight alpha over. Track mattes multiply layer alpha before the over. No blend modes or motion blur |
 | Program display | Preview only | The monitor uploads the CPU composite to one GPU texture (glow by default, wgpu with `--features wgpu`). **CPU** in the program header means that upload fell back to a reused egui texture. Deliver ignores the display texture |
 
 A source is stretched to fill the clip's quad. It is not letterboxed when its aspect differs from the sequence. The monitor fits the sequence inside 960×540 before compositing; export composites at sequence size, with a decoded edge capped at 1920px. On the Northline picture-in-picture frame, a 16×16 block average of the H.264 export sits within about 1.3 levels of the CPU composite. That is the same picture through a codec, not a bit-identical file. Keyframes are evaluated on every frame in both paths.
@@ -283,6 +284,37 @@ Changing the speed or the ramp ripples the clip's timeline duration so the same 
 Preview and Deliver sample picture through one function, `source_frame_at`. A 200% clip steps two source frames per timeline frame. A 50% clip holds each source frame for two timeline frames. A ramp follows the integral of the line. Once the integral leaves the source in/out, the picture holds the first or last included frame.
 
 Audio on a retimed clip is muted during playback and left out of the Deliver graph. Deliver names the clip in its report. A constant 100% forward clip, and a ramp that sits on 100% at both ends, still play. Reverse is muted too. The picture stays on the timeline clock; the sound does not play at the wrong rate and drift. Pitch-preserving resample is a follow-up.
+
+## Clip mask and track matte
+
+Select a video clip. The inspector **Mask** section adds a rectangular or elliptical soft mask in layer UV space. **Center X/Y**, **Width**, **Height**, and **Feather** are keyframeable through the usual diamond controls. **Invert mask** swaps inside and outside. A default full-frame mask with zero feather is omitted from the composite path.
+
+The mask is stored as a tagged effect on the clip:
+
+```json
+{
+  "type": "shape_mask",
+  "shape": "ellipse",
+  "center_x": 0.5,
+  "center_y": 0.45,
+  "width": 0.6,
+  "height": 0.4,
+  "feather": 0.08,
+  "invert": false
+}
+```
+
+**Track Matte** uses another visible video track as a matte source. Pick **Source track** (0 = bottom video track), **Alpha** or **Luma**, and optional **Invert matte**. The matte track is rasterized at the playhead through the same `compose_layers` path; layer alpha is multiplied by the matte sample in sequence space before the over. Matte bindings live on the clip:
+
+```json
+"track_matte": {
+  "source_track": 1,
+  "mode": "alpha",
+  "invert": false
+}
+```
+
+Preview and Deliver both read these fields through the shared compositor in `editor-media`.
 
 ## Templates
 
@@ -457,14 +489,14 @@ A progress bar follows ffmpeg's `out_time`. **Cancel** sends `SIGTERM`. A failed
 
 ## Tests
 
-`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, deliver presets (apply, custom JSON, last-settings round-trip), the sample project round-trip, imported media paths in JSON, media-pool bins (create, rename, move, delete, JSON round-trip), sequence markers (add, edit, delete, JSON round-trip), proxy attach and relink, timeline culling on an 800-clip sequence, ruler spacing across an hour, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, proxy argument planning and preview fallback, the disk frame cache, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, pan, fader, burned captions, deliver bitrate hints, audio-only WAV planning, retimed source frames, muted retimed audio), multicam sync offsets, razor angle switches, group-time cuts, JSON round-trip, and raster frames that follow the active angle, nested sequence create/frame mapping/JSON round-trip/export raster, the mix bus (pan law, mute, solo, keyframed gain, 3-band EQ, peak and RMS), clip speed (constant 25–400%, reverse, a linear ramp, JSON round-trip, and duration ripple), adjustment layers (JSON round-trip, track placement, composite stacking), and the shared composite (luma curve, lift/gamma/gain wheels, grade split, dissolve mix, wipe angle, push, dip, slide, blur dissolve, iris, clip filters, stabilize on synthetic shake, anchor, caption burn-in, adjustment grade-below). It does not spawn ffmpeg or whisper.
+`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, deliver presets (apply, custom JSON, last-settings round-trip), the sample project round-trip, imported media paths in JSON, media-pool bins (create, rename, move, delete, JSON round-trip), sequence markers (add, edit, delete, JSON round-trip), proxy attach and relink, timeline culling on an 800-clip sequence, ruler spacing across an hour, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, proxy argument planning and preview fallback, the disk frame cache, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, pan, fader, burned captions, deliver bitrate hints, audio-only WAV planning, retimed source frames, muted retimed audio), multicam sync offsets, razor angle switches, group-time cuts, JSON round-trip, and raster frames that follow the active angle, nested sequence create/frame mapping/JSON round-trip/export raster, the mix bus (pan law, mute, solo, keyframed gain, 3-band EQ, peak and RMS), clip speed (constant 25–400%, reverse, a linear ramp, JSON round-trip, and duration ripple), adjustment layers (JSON round-trip, track placement, composite stacking), shape mask and track matte JSON round-trip, and the shared composite (luma curve, lift/gamma/gain wheels, grade split, dissolve mix, wipe angle, push, dip, slide, blur dissolve, iris, clip filters including shape mask alpha, track matte alpha multiply, stabilize on synthetic shake, anchor, caption burn-in, adjustment grade-below). It does not spawn ffmpeg or whisper.
 
 `cargo test -p editor-media --features ffmpeg` also encodes a short H.264/AAC mp4 when `ffmpeg` is on `PATH`. `cargo test -p editor-app --features whisper` builds the local speech-to-text path; the binary and model are resolved at runtime, not at compile time.
 
 ## Roadmap
 
 - Pitch-preserving audio resample for retimed clips. Picture speed is sampled in preview and export; retimed audio is muted so it does not drift
-- GPU viewer. The CPU composite already stacks tracks, grades, transforms, eight transitions, and six clip filters (including chroma key and block-match stabilize); it is not a full optical-flow or blend-mode engine
+- GPU viewer. The CPU composite already stacks tracks, grades, transforms, eight transitions, clip shape masks, track mattes, and six other clip filters (including chroma key and block-match stabilize); it is not a full optical-flow or blend-mode engine
 - Track sends and sidechain routing. The mixer already has faders, pan, 3-band EQ, per-track compressor, mute, solo, meters, and keyframed clip gain
 - OFX-style plugins for third-party effects
 - Scene-linear grading and a hinted caption font. Preview and export already share the display-space formula and the bitmap burn-in

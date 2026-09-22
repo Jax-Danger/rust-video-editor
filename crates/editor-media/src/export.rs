@@ -70,6 +70,7 @@ pub struct FfmpegScript {
 /// One output frame. Layers are bottom to top, already graded in their `place`.
 #[derive(Clone, Debug)]
 pub struct RasterFrame {
+    pub playhead: i64,
     pub layers: Vec<ProgramLayer>,
     pub captions: Vec<String>,
 }
@@ -179,6 +180,7 @@ pub fn plan_encode_with(
                 Vec::new()
             };
             frames.push(RasterFrame {
+                playhead: frame,
                 layers: stack.layers,
                 captions,
             });
@@ -724,6 +726,8 @@ fn render_frame(
         groups,
         preview_source: crate::PreviewSource::Full,
         depth: 0,
+        sequence: plan.compose_sequences.first(),
+        playhead: frame.playhead,
     };
     let mut rgba = compose_layers_env(
         plan.width,

@@ -343,6 +343,7 @@ fn nested_parent_clip(
         speed: crate::model::ClipSpeed::normal(),
         multicam: None,
         nested: Some(binding),
+        track_matte: None,
     }
 }
 

@@ -42,18 +42,21 @@ pub use edit::{
     ripple_delete, ripple_trim, ripple_trim_next_to_playhead, ripple_trim_prev_to_playhead,
     roll_cut, set_clip_gain_at, set_clip_speed, set_clip_title,
     set_clip_volume, set_filter_at, set_grade_at, set_in_point, set_luma_curve_point,
-    set_master_fader, set_out_point, set_track_compressor, set_track_eq, set_track_eq_low_cut,
-    set_track_fader, set_track_flag, set_track_pan,
+    set_master_fader, set_out_point, set_shape_mask_invert, set_shape_mask_shape,
+    set_track_compressor, set_track_eq, set_track_eq_low_cut,
+    set_track_fader, set_track_flag, set_track_matte, set_track_pan,
     set_transform_at, set_wheel_offsets_at, slide, slip, snap_span, snap_to_targets, update_marker,
     source_frame_at, toggle_filter_key, toggle_grade_key, toggle_transform_key, toggle_volume_key,
     trim, update_cue_text,     CompressorParam, EditError, EqBand, SnapHit, SnapKind, SnapPoint, TrackFlag, TrimEdge,
 };
 pub use effects::{
     blur, blur_mut, chroma_key, chroma_key_mut, clip_relative, color_grade, color_grade_mut, crop,
-    crop_mut, has_filter, sharpen, sharpen_mut, stabilize, stabilize_mut, transform,
+    crop_mut, has_filter, shape_mask, shape_mask_mut, sharpen, sharpen_mut, stabilize,
+    stabilize_mut, transform,
     transform_mut, vignette, vignette_mut, AnimatedF32, BlurFilter, ChromaKeyFilter, ColorGrade,
     CropFilter, Effect, FilterKind, FilterParam, GradeParam, Interpolation, KeyframeF32, RgbWheel,
-    SharpenFilter, StabilizeFilter, StabilizeKeyframe, ToneCurve, Transform, TransformParam,
+    ShapeMaskFilter, ShapeMaskKind, SharpenFilter, StabilizeFilter, StabilizeKeyframe, ToneCurve,
+    Transform, TransformParam,
     VignetteFilter, WheelChannel, WheelKind,
 };
 pub use compressor::{

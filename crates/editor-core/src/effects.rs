@@ -532,6 +532,57 @@ impl ChromaKeyFilter {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ShapeMaskKind {
+    #[default]
+    Rectangle,
+    Ellipse,
+}
+
+/// Rectangular or elliptical soft mask in layer UV space (0…1). Feather softens
+/// the edge; invert swaps inside and outside.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ShapeMaskFilter {
+    #[serde(default)]
+    pub shape: ShapeMaskKind,
+    pub center_x: AnimatedF32,
+    pub center_y: AnimatedF32,
+    pub width: AnimatedF32,
+    pub height: AnimatedF32,
+    pub feather: AnimatedF32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub invert: bool,
+}
+
+impl ShapeMaskFilter {
+    pub fn off() -> Self {
+        Self {
+            shape: ShapeMaskKind::Rectangle,
+            center_x: AnimatedF32::constant(0.5),
+            center_y: AnimatedF32::constant(0.5),
+            width: AnimatedF32::constant(1.0),
+            height: AnimatedF32::constant(1.0),
+            feather: AnimatedF32::constant(0.0),
+            invert: false,
+        }
+    }
+
+    pub fn is_active(&self, rel: i64) -> bool {
+        if self.invert {
+            return true;
+        }
+        let w = self.width.value_at(rel);
+        let h = self.height.value_at(rel);
+        let feather = self.feather.value_at(rel);
+        w < 0.999 || h < 0.999 || feather > 1.0e-4
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Baked motion sample for stabilization (cumulative offset from clip start).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StabilizeKeyframe {
@@ -582,6 +633,11 @@ pub enum FilterParam {
     ChromaKeySpillSuppression,
     StabilizeStrength,
     StabilizeSmoothing,
+    ShapeMaskCenterX,
+    ShapeMaskCenterY,
+    ShapeMaskWidth,
+    ShapeMaskHeight,
+    ShapeMaskFeather,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -595,6 +651,7 @@ pub enum Effect {
     Sharpen(SharpenFilter),
     ChromaKey(ChromaKeyFilter),
     Stabilize(StabilizeFilter),
+    ShapeMask(ShapeMaskFilter),
 }
 
 pub fn color_grade_mut(effects: &mut Vec<Effect>) -> &mut ColorGrade {
@@ -700,6 +757,19 @@ pub fn stabilize_mut(effects: &mut Vec<Effect>) -> &mut StabilizeFilter {
     }
 }
 
+pub fn shape_mask_mut(effects: &mut Vec<Effect>) -> &mut ShapeMaskFilter {
+    if !effects.iter().any(|e| matches!(e, Effect::ShapeMask(_))) {
+        effects.push(Effect::ShapeMask(ShapeMaskFilter::off()));
+    }
+    match effects
+        .iter_mut()
+        .find(|e| matches!(e, Effect::ShapeMask(_)))
+    {
+        Some(Effect::ShapeMask(filter)) => filter,
+        _ => unreachable!("shape mask filter just inserted"),
+    }
+}
+
 pub fn blur(effects: &[Effect]) -> Option<&BlurFilter> {
     effects.iter().find_map(|e| match e {
         Effect::Blur(filter) => Some(filter),
@@ -742,6 +812,13 @@ pub fn stabilize(effects: &[Effect]) -> Option<&StabilizeFilter> {
     })
 }
 
+pub fn shape_mask(effects: &[Effect]) -> Option<&ShapeMaskFilter> {
+    effects.iter().find_map(|e| match e {
+        Effect::ShapeMask(filter) => Some(filter),
+        _ => None,
+    })
+}
+
 pub fn has_filter(effects: &[Effect], kind: FilterKind) -> bool {
     effects.iter().any(|e| match (kind, e) {
         (FilterKind::Blur, Effect::Blur(f)) => f.radius.base > 1.0e-4 || !f.radius.keys.is_empty(),
@@ -767,6 +844,15 @@ pub fn has_filter(effects: &[Effect], kind: FilterKind) -> bool {
         (FilterKind::Stabilize, Effect::Stabilize(f)) => {
             f.strength.base > 1.0e-4 || !f.strength.keys.is_empty()
         }
+        (FilterKind::ShapeMask, Effect::ShapeMask(f)) => {
+            f.invert
+                || f.width.base < 0.999
+                || f.height.base < 0.999
+                || f.feather.base > 1.0e-4
+                || !f.width.keys.is_empty()
+                || !f.height.keys.is_empty()
+                || !f.feather.keys.is_empty()
+        }
         _ => false,
     })
 }
@@ -779,6 +865,7 @@ pub enum FilterKind {
     Sharpen,
     ChromaKey,
     Stabilize,
+    ShapeMask,
 }
 
 impl FilterKind {
@@ -790,6 +877,7 @@ impl FilterKind {
             Self::Sharpen => "Sharpen",
             Self::ChromaKey => "Chroma Key",
             Self::Stabilize => "Stabilize",
+            Self::ShapeMask => "Shape Mask",
         }
     }
 }
@@ -865,6 +953,15 @@ mod tests {
                     rotation_deg: 0.0,
                 }],
             }),
+            Effect::ShapeMask(ShapeMaskFilter {
+                shape: ShapeMaskKind::Ellipse,
+                center_x: AnimatedF32::constant(0.5),
+                center_y: AnimatedF32::constant(0.45),
+                width: AnimatedF32::constant(0.6),
+                height: AnimatedF32::constant(0.4),
+                feather: AnimatedF32::constant(0.08),
+                invert: false,
+            }),
         ];
         let json = serde_json::to_string(&effects).unwrap();
         let parsed: Vec<Effect> = serde_json::from_str(&json).unwrap();
@@ -873,6 +970,29 @@ mod tests {
         assert!(has_filter(&effects, FilterKind::Vignette));
         assert!(has_filter(&effects, FilterKind::ChromaKey));
         assert!(has_filter(&effects, FilterKind::Stabilize));
+        assert!(has_filter(&effects, FilterKind::ShapeMask));
+    }
+
+    #[test]
+    fn shape_mask_defaults_are_full_frame() {
+        let mask = ShapeMaskFilter::off();
+        assert!(!mask.is_active(0));
+        let mut inverted = mask.clone();
+        inverted.invert = true;
+        assert!(inverted.is_active(0));
+    }
+
+    #[test]
+    fn track_matte_binding_round_trip_in_json() {
+        use crate::model::{TrackMatteBinding, TrackMatteMode};
+        let binding = TrackMatteBinding {
+            source_track: 1,
+            mode: TrackMatteMode::Luma,
+            invert: true,
+        };
+        let json = serde_json::to_string(&binding).unwrap();
+        let parsed: TrackMatteBinding = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, binding);
     }
 
     #[test]

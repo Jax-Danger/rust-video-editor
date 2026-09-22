@@ -481,6 +481,25 @@ impl ClipSpeed {
     }
 }
 
+/// Use another video track's composite as a matte for this clip.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TrackMatteBinding {
+    /// 0-based index among visible video tracks, bottom to top.
+    pub source_track: u32,
+    #[serde(default)]
+    pub mode: TrackMatteMode,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub invert: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackMatteMode {
+    #[default]
+    Alpha,
+    Luma,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Clip {
     pub id: ClipId,
@@ -540,6 +559,9 @@ pub struct Clip {
     /// decoding [`Self::media_id`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nested: Option<NestedBinding>,
+    /// Optional track matte: alpha or luma from another video track.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track_matte: Option<TrackMatteBinding>,
 }
 
 impl Clip {
@@ -591,6 +613,7 @@ impl Clip {
             speed: ClipSpeed::normal(),
             multicam: None,
             nested: None,
+            track_matte: None,
         }
     }
 
@@ -621,6 +644,7 @@ impl Clip {
             speed: ClipSpeed::normal(),
             multicam: None,
             nested: None,
+            track_matte: None,
         }
     }
 
@@ -656,6 +680,7 @@ impl Clip {
             speed: ClipSpeed::normal(),
             multicam: None,
             nested: None,
+            track_matte: None,
         }
     }
 

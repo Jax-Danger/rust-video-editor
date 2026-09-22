@@ -12,8 +12,8 @@ use thiserror::Error;
 
 use crate::caption::CaptionDraft;
 use crate::effects::{
-    blur_mut, chroma_key_mut, color_grade_mut, crop_mut, sharpen_mut, stabilize_mut,
-    transform_mut, vignette_mut, GradeParam, TransformParam,
+    blur_mut, chroma_key_mut, color_grade_mut, crop_mut, shape_mask_mut, sharpen_mut,
+    stabilize_mut, transform_mut, vignette_mut, GradeParam, TransformParam,
 };
 use crate::model::{
     Bin, BinId, CaptionCue, Clip, ClipId, ClipSpeed, CueId, LabelColor, Marker, MarkerId,
@@ -1130,7 +1130,77 @@ pub fn set_filter_at(
                     .smoothing
                     .write_at(clip_relative_frame, value.clamp(0.05, 1.0));
             }
+            crate::effects::FilterParam::ShapeMaskCenterX => {
+                shape_mask_mut(effects)
+                    .center_x
+                    .write_at(clip_relative_frame, value.clamp(0.0, 1.0));
+            }
+            crate::effects::FilterParam::ShapeMaskCenterY => {
+                shape_mask_mut(effects)
+                    .center_y
+                    .write_at(clip_relative_frame, value.clamp(0.0, 1.0));
+            }
+            crate::effects::FilterParam::ShapeMaskWidth => {
+                shape_mask_mut(effects)
+                    .width
+                    .write_at(clip_relative_frame, value.clamp(0.01, 1.0));
+            }
+            crate::effects::FilterParam::ShapeMaskHeight => {
+                shape_mask_mut(effects)
+                    .height
+                    .write_at(clip_relative_frame, value.clamp(0.01, 1.0));
+            }
+            crate::effects::FilterParam::ShapeMaskFeather => {
+                shape_mask_mut(effects)
+                    .feather
+                    .write_at(clip_relative_frame, value.clamp(0.0, 0.5));
+            }
         }
+        Ok(())
+    })
+}
+
+pub fn set_shape_mask_shape(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    clip_id: ClipId,
+    shape: crate::effects::ShapeMaskKind,
+) -> Result<(), EditError> {
+    map_sequence(project, sequence_id, |sequence, _alloc| {
+        let (ti, ci) = sequence
+            .locate_clip(clip_id)
+            .ok_or(EditError::ClipNotFound)?;
+        shape_mask_mut(&mut sequence.tracks[ti].clips[ci].effects).shape = shape;
+        Ok(())
+    })
+}
+
+pub fn set_shape_mask_invert(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    clip_id: ClipId,
+    invert: bool,
+) -> Result<(), EditError> {
+    map_sequence(project, sequence_id, |sequence, _alloc| {
+        let (ti, ci) = sequence
+            .locate_clip(clip_id)
+            .ok_or(EditError::ClipNotFound)?;
+        shape_mask_mut(&mut sequence.tracks[ti].clips[ci].effects).invert = invert;
+        Ok(())
+    })
+}
+
+pub fn set_track_matte(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    clip_id: ClipId,
+    matte: Option<crate::model::TrackMatteBinding>,
+) -> Result<(), EditError> {
+    map_sequence(project, sequence_id, |sequence, _alloc| {
+        let (ti, ci) = sequence
+            .locate_clip(clip_id)
+            .ok_or(EditError::ClipNotFound)?;
+        sequence.tracks[ti].clips[ci].track_matte = matte;
         Ok(())
     })
 }
@@ -1168,6 +1238,11 @@ pub fn toggle_filter_key(
             crate::effects::FilterParam::StabilizeSmoothing => {
                 &mut stabilize_mut(effects).smoothing
             }
+            crate::effects::FilterParam::ShapeMaskCenterX => &mut shape_mask_mut(effects).center_x,
+            crate::effects::FilterParam::ShapeMaskCenterY => &mut shape_mask_mut(effects).center_y,
+            crate::effects::FilterParam::ShapeMaskWidth => &mut shape_mask_mut(effects).width,
+            crate::effects::FilterParam::ShapeMaskHeight => &mut shape_mask_mut(effects).height,
+            crate::effects::FilterParam::ShapeMaskFeather => &mut shape_mask_mut(effects).feather,
         };
         if anim.has_key(clip_relative_frame) {
             anim.remove_key(clip_relative_frame);
@@ -1851,6 +1926,7 @@ pub fn clip_from_media(
         speed: ClipSpeed::normal(),
         multicam: None,
         nested: None,
+        track_matte: None,
     })
 }
 
