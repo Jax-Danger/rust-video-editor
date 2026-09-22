@@ -1116,9 +1116,15 @@ impl MeridianApp {
             self.status = "Media not found.".into();
             return;
         };
+        let end = media.duration.0.max(0);
         let marks = self.source_marks.entry(media_id).or_default();
-        marks.in_point = Some(marks.playhead.clamp(0, media.duration.0.max(0)));
-        if marks.out_point.is_some_and(|out| out <= marks.in_point.unwrap_or(0)) {
+        let frame = marks.playhead.clamp(0, end);
+        // Keep at least one frame of room for out when marking near the end.
+        marks.in_point = Some(frame.min(end.saturating_sub(1)));
+        if marks
+            .out_point
+            .is_some_and(|out| out <= marks.in_point.unwrap_or(0))
+        {
             marks.out_point = None;
         }
         self.status = format!(
@@ -1136,11 +1142,17 @@ impl MeridianApp {
             self.status = "Media not found.".into();
             return;
         };
+        let end = media.duration.0.max(0);
         let marks = self.source_marks.entry(media_id).or_default();
-        marks.out_point = Some(marks.playhead.clamp(0, media.duration.0.max(0)));
-        if marks.in_point.is_some_and(|inn| inn >= marks.out_point.unwrap_or(0)) {
-            marks.in_point = None;
+        let mut frame = marks.playhead.clamp(0, end);
+        if let Some(inn) = marks.in_point {
+            if frame <= inn {
+                frame = (inn + 1).min(end);
+            }
+        } else if frame < 1 {
+            frame = 1.min(end);
         }
+        marks.out_point = Some(frame);
         self.status = format!(
             "Source out {}",
             format_tc(marks.out_point.unwrap_or(0), media.timebase)
