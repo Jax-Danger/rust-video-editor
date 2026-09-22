@@ -1,6 +1,7 @@
 use editor_core::{
-    clip_relative, color_grade, set_clip_gain_at, set_clip_title, set_grade_at, set_transform_at,
-    toggle_grade_key, toggle_transform_key, toggle_volume_key, transform, ClipId, GradeParam,
+    blur, clip_relative, color_grade, crop, set_clip_gain_at, set_clip_title, set_filter_at,
+    set_grade_at, set_transform_at, sharpen, toggle_filter_key, toggle_grade_key,
+    toggle_transform_key, toggle_volume_key, transform, vignette, ClipId, FilterParam, GradeParam,
     TextAlign, Title, TrackKind, TransformParam,
 };
 use egui::RichText;
@@ -271,6 +272,10 @@ fn inspector_body(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId, sna
         "Opacity",
         0.0..=1.0,
     );
+
+    if snapshot.kind == TrackKind::Video {
+        effects_controls(ui, app, clip_id, rel);
+    }
 
     ui.add_space(8.0);
     ui.horizontal(|ui| {
@@ -613,6 +618,112 @@ fn xform_value(app: &MeridianApp, clip: ClipId, rel: i64, param: TransformParam)
     } else {
         (neutral, false)
     }
+}
+
+fn effects_controls(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId, rel: i64) {
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add_space(2.0);
+        ui.vertical(|ui| {
+            widgets::section_label(ui, "Effects");
+        });
+    });
+    filter_slider(ui, app, clip_id, rel, FilterParam::BlurRadius, "Blur", 0.0..=48.0);
+    filter_slider(
+        ui,
+        app,
+        clip_id,
+        rel,
+        FilterParam::VignetteAmount,
+        "Vignette",
+        0.0..=1.0,
+    );
+    filter_slider(
+        ui,
+        app,
+        clip_id,
+        rel,
+        FilterParam::VignetteSoftness,
+        "Vignette softness",
+        0.05..=1.0,
+    );
+    filter_slider(ui, app, clip_id, rel, FilterParam::CropLeft, "Crop left", 0.0..=0.4);
+    filter_slider(ui, app, clip_id, rel, FilterParam::CropRight, "Crop right", 0.0..=0.4);
+    filter_slider(ui, app, clip_id, rel, FilterParam::CropTop, "Crop top", 0.0..=0.4);
+    filter_slider(ui, app, clip_id, rel, FilterParam::CropBottom, "Crop bottom", 0.0..=0.4);
+    filter_slider(ui, app, clip_id, rel, FilterParam::SharpenAmount, "Sharpen", 0.0..=2.0);
+}
+
+fn filter_value(app: &MeridianApp, clip: ClipId, rel: i64, param: FilterParam) -> (f32, bool) {
+    let neutral = match param {
+        FilterParam::VignetteSoftness => 0.5,
+        _ => 0.0,
+    };
+    let Some(sequence) = app.session.project().active() else {
+        return (neutral, false);
+    };
+    let Some(clip) = sequence.clip(clip) else {
+        return (neutral, false);
+    };
+    let anim = match param {
+        FilterParam::BlurRadius => blur(&clip.effects).map(|f| &f.radius),
+        FilterParam::VignetteAmount => vignette(&clip.effects).map(|f| &f.amount),
+        FilterParam::VignetteSoftness => vignette(&clip.effects).map(|f| &f.softness),
+        FilterParam::CropLeft => crop(&clip.effects).map(|f| &f.left),
+        FilterParam::CropRight => crop(&clip.effects).map(|f| &f.right),
+        FilterParam::CropTop => crop(&clip.effects).map(|f| &f.top),
+        FilterParam::CropBottom => crop(&clip.effects).map(|f| &f.bottom),
+        FilterParam::SharpenAmount => sharpen(&clip.effects).map(|f| &f.amount),
+    };
+    if let Some(anim) = anim {
+        (anim.value_at(rel), anim.has_key(rel))
+    } else {
+        (neutral, false)
+    }
+}
+
+fn filter_slider(
+    ui: &mut egui::Ui,
+    app: &mut MeridianApp,
+    clip: ClipId,
+    rel: i64,
+    param: FilterParam,
+    label: &str,
+    range: std::ops::RangeInclusive<f32>,
+) {
+    let (current, keyed) = filter_value(app, clip, rel, param);
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        ui.vertical(|ui| {
+            let edit = widgets::param_slider(ui, label, current, range, keyed);
+            if edit.started {
+                app.session.begin_interactive(label);
+            }
+            if edit.changed {
+                let Ok(seq) = app.session.active_id() else {
+                    return;
+                };
+                if let Err(err) = app.session.edit("Effect", |project| {
+                    set_filter_at(project, seq, clip, param, rel, edit.value)
+                }) {
+                    app.status = err.to_string();
+                }
+            }
+            if edit.stopped {
+                app.session.end_interactive();
+            }
+            if edit.key_clicked {
+                let Ok(seq) = app.session.active_id() else {
+                    return;
+                };
+                if let Err(err) = app.session.edit("Effect key", |project| {
+                    toggle_filter_key(project, seq, clip, param, rel)
+                }) {
+                    app.status = err.to_string();
+                }
+            }
+        });
+    });
 }
 
 fn xform_slider(

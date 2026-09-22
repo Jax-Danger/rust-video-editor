@@ -443,11 +443,92 @@ impl Default for Transform {
     }
 }
 
+/// Gaussian-style blur radius in sequence pixels.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BlurFilter {
+    pub radius: AnimatedF32,
+}
+
+impl BlurFilter {
+    pub fn off() -> Self {
+        Self {
+            radius: AnimatedF32::constant(0.0),
+        }
+    }
+}
+
+/// Darken the frame edges. `amount` is strength (0…1); `softness` widens the falloff.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VignetteFilter {
+    pub amount: AnimatedF32,
+    pub softness: AnimatedF32,
+}
+
+impl VignetteFilter {
+    pub fn off() -> Self {
+        Self {
+            amount: AnimatedF32::constant(0.0),
+            softness: AnimatedF32::constant(0.5),
+        }
+    }
+}
+
+/// Crop insets as fractions of width/height (0…0.45 each). Transparent outside the rect.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CropFilter {
+    pub left: AnimatedF32,
+    pub right: AnimatedF32,
+    pub top: AnimatedF32,
+    pub bottom: AnimatedF32,
+}
+
+impl CropFilter {
+    pub fn off() -> Self {
+        Self {
+            left: AnimatedF32::constant(0.0),
+            right: AnimatedF32::constant(0.0),
+            top: AnimatedF32::constant(0.0),
+            bottom: AnimatedF32::constant(0.0),
+        }
+    }
+}
+
+/// Unsharp mask strength (0…2).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SharpenFilter {
+    pub amount: AnimatedF32,
+}
+
+impl SharpenFilter {
+    pub fn off() -> Self {
+        Self {
+            amount: AnimatedF32::constant(0.0),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilterParam {
+    BlurRadius,
+    VignetteAmount,
+    VignetteSoftness,
+    CropLeft,
+    CropRight,
+    CropTop,
+    CropBottom,
+    SharpenAmount,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Effect {
     Color(ColorGrade),
     Transform(Transform),
+    Blur(BlurFilter),
+    Vignette(VignetteFilter),
+    Crop(CropFilter),
+    Sharpen(SharpenFilter),
 }
 
 pub fn color_grade_mut(effects: &mut Vec<Effect>) -> &mut ColorGrade {
@@ -487,6 +568,116 @@ pub fn transform(effects: &[Effect]) -> Option<&Transform> {
     })
 }
 
+pub fn blur_mut(effects: &mut Vec<Effect>) -> &mut BlurFilter {
+    if !effects.iter().any(|e| matches!(e, Effect::Blur(_))) {
+        effects.push(Effect::Blur(BlurFilter::off()));
+    }
+    match effects.iter_mut().find(|e| matches!(e, Effect::Blur(_))) {
+        Some(Effect::Blur(filter)) => filter,
+        _ => unreachable!("blur filter just inserted"),
+    }
+}
+
+pub fn vignette_mut(effects: &mut Vec<Effect>) -> &mut VignetteFilter {
+    if !effects.iter().any(|e| matches!(e, Effect::Vignette(_))) {
+        effects.push(Effect::Vignette(VignetteFilter::off()));
+    }
+    match effects.iter_mut().find(|e| matches!(e, Effect::Vignette(_))) {
+        Some(Effect::Vignette(filter)) => filter,
+        _ => unreachable!("vignette filter just inserted"),
+    }
+}
+
+pub fn crop_mut(effects: &mut Vec<Effect>) -> &mut CropFilter {
+    if !effects.iter().any(|e| matches!(e, Effect::Crop(_))) {
+        effects.push(Effect::Crop(CropFilter::off()));
+    }
+    match effects.iter_mut().find(|e| matches!(e, Effect::Crop(_))) {
+        Some(Effect::Crop(filter)) => filter,
+        _ => unreachable!("crop filter just inserted"),
+    }
+}
+
+pub fn sharpen_mut(effects: &mut Vec<Effect>) -> &mut SharpenFilter {
+    if !effects.iter().any(|e| matches!(e, Effect::Sharpen(_))) {
+        effects.push(Effect::Sharpen(SharpenFilter::off()));
+    }
+    match effects.iter_mut().find(|e| matches!(e, Effect::Sharpen(_))) {
+        Some(Effect::Sharpen(filter)) => filter,
+        _ => unreachable!("sharpen filter just inserted"),
+    }
+}
+
+pub fn blur(effects: &[Effect]) -> Option<&BlurFilter> {
+    effects.iter().find_map(|e| match e {
+        Effect::Blur(filter) => Some(filter),
+        _ => None,
+    })
+}
+
+pub fn vignette(effects: &[Effect]) -> Option<&VignetteFilter> {
+    effects.iter().find_map(|e| match e {
+        Effect::Vignette(filter) => Some(filter),
+        _ => None,
+    })
+}
+
+pub fn crop(effects: &[Effect]) -> Option<&CropFilter> {
+    effects.iter().find_map(|e| match e {
+        Effect::Crop(filter) => Some(filter),
+        _ => None,
+    })
+}
+
+pub fn sharpen(effects: &[Effect]) -> Option<&SharpenFilter> {
+    effects.iter().find_map(|e| match e {
+        Effect::Sharpen(filter) => Some(filter),
+        _ => None,
+    })
+}
+
+pub fn has_filter(effects: &[Effect], kind: FilterKind) -> bool {
+    effects.iter().any(|e| match (kind, e) {
+        (FilterKind::Blur, Effect::Blur(f)) => f.radius.base > 1.0e-4 || !f.radius.keys.is_empty(),
+        (FilterKind::Vignette, Effect::Vignette(f)) => {
+            f.amount.base > 1.0e-4 || !f.amount.keys.is_empty()
+        }
+        (FilterKind::Crop, Effect::Crop(f)) => {
+            f.left.base > 1.0e-4
+                || f.right.base > 1.0e-4
+                || f.top.base > 1.0e-4
+                || f.bottom.base > 1.0e-4
+                || !f.left.keys.is_empty()
+                || !f.right.keys.is_empty()
+                || !f.top.keys.is_empty()
+                || !f.bottom.keys.is_empty()
+        }
+        (FilterKind::Sharpen, Effect::Sharpen(f)) => {
+            f.amount.base > 1.0e-4 || !f.amount.keys.is_empty()
+        }
+        _ => false,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterKind {
+    Blur,
+    Vignette,
+    Crop,
+    Sharpen,
+}
+
+impl FilterKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Blur => "Blur",
+            Self::Vignette => "Vignette",
+            Self::Crop => "Crop",
+            Self::Sharpen => "Sharpen",
+        }
+    }
+}
+
 /// Clip-relative frame for keyframes. `playhead` and `timeline_in` are sequence frames.
 pub fn clip_relative(playhead: Frame, timeline_in: Frame) -> i64 {
     playhead.0 - timeline_in.0
@@ -519,6 +710,33 @@ mod tests {
         anim.write_at(8, 4.0);
         assert!(anim.has_key(8));
         assert!((anim.value_at(8) - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn clip_filters_round_trip_in_json() {
+        let effects = vec![
+            Effect::Blur(BlurFilter {
+                radius: AnimatedF32::constant(6.0),
+            }),
+            Effect::Vignette(VignetteFilter {
+                amount: AnimatedF32::constant(0.4),
+                softness: AnimatedF32::constant(0.6),
+            }),
+            Effect::Crop(CropFilter {
+                left: AnimatedF32::constant(0.1),
+                right: AnimatedF32::constant(0.05),
+                top: AnimatedF32::constant(0.0),
+                bottom: AnimatedF32::constant(0.15),
+            }),
+            Effect::Sharpen(SharpenFilter {
+                amount: AnimatedF32::constant(0.8),
+            }),
+        ];
+        let json = serde_json::to_string(&effects).unwrap();
+        let parsed: Vec<Effect> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, effects);
+        assert!(has_filter(&effects, FilterKind::Blur));
+        assert!(has_filter(&effects, FilterKind::Vignette));
     }
 
     #[test]

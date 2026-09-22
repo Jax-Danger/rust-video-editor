@@ -13,8 +13,9 @@
 //! is the same, so the pictures agree up to that scale and the codec.
 
 use editor_core::{
-    clip_relative, color_grade, source_frame_at, transform, Clip, ColorGrade, Direction, Frame,
-    MediaAsset, Sequence, Title, ToneCurve, Track, TrackKind, Transform, TransitionKind,
+    blur, clip_relative, color_grade, crop, sharpen, source_frame_at, transform, vignette, Clip,
+    ColorGrade, Direction, Frame, MediaAsset, Sequence, Title, ToneCurve, Track, TrackKind,
+    Transform, TransitionKind,
 };
 use font8x8::UnicodeFonts;
 
@@ -155,6 +156,64 @@ impl GradeSample {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct FilterSample {
+    pub blur_radius: f32,
+    pub vignette_amount: f32,
+    pub vignette_softness: f32,
+    pub crop: [f32; 4],
+    pub sharpen: f32,
+}
+
+impl FilterSample {
+    pub fn neutral() -> Self {
+        Self {
+            blur_radius: 0.0,
+            vignette_amount: 0.0,
+            vignette_softness: 0.5,
+            crop: [0.0, 0.0, 0.0, 0.0],
+            sharpen: 0.0,
+        }
+    }
+
+    pub fn from_effects(effects: &[editor_core::Effect], rel: i64) -> Self {
+        Self {
+            blur_radius: blur(effects)
+                .map(|f| f.radius.value_at(rel))
+                .unwrap_or(0.0)
+                .max(0.0),
+            vignette_amount: vignette(effects)
+                .map(|f| f.amount.value_at(rel))
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0),
+            vignette_softness: vignette(effects)
+                .map(|f| f.softness.value_at(rel))
+                .unwrap_or(0.5)
+                .clamp(0.05, 1.0),
+            crop: {
+                let c = crop(effects);
+                [
+                    c.map(|f| f.left.value_at(rel)).unwrap_or(0.0).clamp(0.0, 0.45),
+                    c.map(|f| f.right.value_at(rel)).unwrap_or(0.0).clamp(0.0, 0.45),
+                    c.map(|f| f.top.value_at(rel)).unwrap_or(0.0).clamp(0.0, 0.45),
+                    c.map(|f| f.bottom.value_at(rel)).unwrap_or(0.0).clamp(0.0, 0.45),
+                ]
+            },
+            sharpen: sharpen(effects)
+                .map(|f| f.amount.value_at(rel))
+                .unwrap_or(0.0)
+                .clamp(0.0, 2.0),
+        }
+    }
+
+    pub fn is_neutral(&self) -> bool {
+        self.blur_radius < 0.5
+            && self.vignette_amount < 1.0e-4
+            && self.crop.iter().all(|v| *v < 1.0e-4)
+            && self.sharpen < 1.0e-4
+    }
+}
+
 fn rec709_luma(rgb: [f32; 3]) -> f32 {
     0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
 }
@@ -172,6 +231,10 @@ pub struct TransitionMotion {
     pub shift_x: f32,
     pub shift_y: f32,
     pub mask: CanvasMask,
+    /// Extra blur radius in sequence pixels (blur dissolve).
+    pub blur_radius: f32,
+    /// Solid plate colour and opacity for dip-to-white (and similar).
+    pub dip_plate: Option<([f32; 3], f32)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -185,6 +248,8 @@ pub enum CanvasMask {
         edge: f32,
         keep_below: bool,
     },
+    /// Circular iris. `edge` is the reveal radius from the centre (0…1).
+    Iris { edge: f32, keep_below: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -218,6 +283,8 @@ pub fn transition_motion(
             shift_x: 0.0,
             shift_y: 0.0,
             mask: CanvasMask::None,
+            blur_radius: 0.0,
+            dip_plate: None,
         },
         TransitionKind::Wipe { angle_deg } => TransitionMotion {
             opacity_scale: 1.0,
@@ -228,6 +295,8 @@ pub fn transition_motion(
                 edge: p,
                 keep_below: !outgoing,
             },
+            blur_radius: 0.0,
+            dip_plate: None,
         },
         TransitionKind::PushSlide { direction } => {
             let (shift_x, shift_y) = push_shift(*direction, outgoing, p, seq_w, seq_h);
@@ -236,8 +305,96 @@ pub fn transition_motion(
                 shift_x,
                 shift_y,
                 mask: CanvasMask::None,
+                blur_radius: 0.0,
+                dip_plate: None,
             }
         }
+        TransitionKind::DipToBlack => TransitionMotion {
+            opacity_scale: if outgoing {
+                if p <= 0.5 { 1.0 - 2.0 * p } else { 0.0 }
+            } else if p <= 0.5 {
+                0.0
+            } else {
+                2.0 * p - 1.0
+            },
+            shift_x: 0.0,
+            shift_y: 0.0,
+            mask: CanvasMask::None,
+            blur_radius: 0.0,
+            dip_plate: None,
+        },
+        TransitionKind::DipToWhite => {
+            let plate_opacity = if p <= 0.5 {
+                2.0 * p
+            } else {
+                2.0 * (1.0 - p)
+            };
+            TransitionMotion {
+                opacity_scale: if outgoing {
+                    if p <= 0.5 { 1.0 - 2.0 * p } else { 0.0 }
+                } else if p <= 0.5 {
+                    0.0
+                } else {
+                    2.0 * p - 1.0
+                },
+                shift_x: 0.0,
+                shift_y: 0.0,
+                mask: CanvasMask::None,
+                blur_radius: 0.0,
+                dip_plate: Some(([1.0, 1.0, 1.0], plate_opacity)),
+            }
+        }
+        TransitionKind::Slide { direction } => {
+            let (shift_x, shift_y) = if outgoing {
+                (0.0, 0.0)
+            } else {
+                slide_shift(*direction, p, seq_w, seq_h)
+            };
+            TransitionMotion {
+                opacity_scale: 1.0,
+                shift_x,
+                shift_y,
+                mask: CanvasMask::None,
+                blur_radius: 0.0,
+                dip_plate: None,
+            }
+        }
+        TransitionKind::BlurDissolve => {
+            let peak = 24.0;
+            let blur = if outgoing {
+                peak * (1.0 - (2.0 * p - 1.0).abs())
+            } else {
+                peak * (1.0 - (2.0 * p - 1.0).abs())
+            };
+            TransitionMotion {
+                opacity_scale: if outgoing { 1.0 } else { p },
+                shift_x: 0.0,
+                shift_y: 0.0,
+                mask: CanvasMask::None,
+                blur_radius: blur,
+                dip_plate: None,
+            }
+        }
+        TransitionKind::Iris => TransitionMotion {
+            opacity_scale: 1.0,
+            shift_x: 0.0,
+            shift_y: 0.0,
+            mask: CanvasMask::Iris {
+                edge: p,
+                keep_below: !outgoing,
+            },
+            blur_radius: 0.0,
+            dip_plate: None,
+        },
+    }
+}
+
+fn slide_shift(direction: Direction, p: f32, seq_w: f32, seq_h: f32) -> (f32, f32) {
+    match direction {
+        Direction::Left => (seq_w * (1.0 - p), 0.0),
+        Direction::Right => (-seq_w * (1.0 - p), 0.0),
+        Direction::Up => (0.0, -seq_h * (1.0 - p)),
+        Direction::Down => (0.0, seq_h * (1.0 - p)),
     }
 }
 
@@ -281,24 +438,25 @@ pub fn apply_transition(
     outgoing: bool,
     seq_w: f32,
     seq_h: f32,
-) -> Place {
+) -> (Place, TransitionMotion) {
     let motion = transition_motion(kind, progress, outgoing, seq_w, seq_h);
     place.opacity = (place.opacity * motion.opacity_scale).clamp(0.0, 1.0);
     place.shift_x += motion.shift_x;
     place.shift_y += motion.shift_y;
     place.mask = motion.mask;
-    place
+    place.blur_radius = motion.blur_radius;
+    (place, motion)
 }
 
 pub fn mask_window(mask: CanvasMask) -> MaskWindow {
-    let CanvasMask::Wipe {
-        angle_deg,
-        edge,
-        keep_below,
-    } = mask
-    else {
-        return MaskWindow::All;
-    };
+    match mask {
+        CanvasMask::None => return MaskWindow::All,
+        CanvasMask::Iris { .. } => return MaskWindow::PerPixel,
+        CanvasMask::Wipe {
+            angle_deg,
+            edge,
+            keep_below,
+        } => {
     let edge = edge.clamp(0.0, 1.0);
     if keep_below && edge <= 1.0e-4 {
         return MaskWindow::Empty;
@@ -350,23 +508,36 @@ pub fn mask_window(mask: CanvasMask) -> MaskWindow {
             v1: rect.3,
         }
     }
+        }
+    }
 }
 
 pub fn mask_allows(mask: CanvasMask, u: f32, v: f32) -> bool {
-    let CanvasMask::Wipe {
-        angle_deg,
-        edge,
-        keep_below,
-    } = mask
-    else {
-        return true;
-    };
-    let (sin, cos) = angle_deg.to_radians().sin_cos();
-    let t = wipe_t(cos, sin, u, v);
-    if keep_below {
-        t <= edge
-    } else {
-        t > edge
+    match mask {
+        CanvasMask::None => true,
+        CanvasMask::Iris { edge, keep_below } => {
+            let dx = u - 0.5;
+            let dy = v - 0.5;
+            let dist = (dx * dx + dy * dy).sqrt() * 2.0_f32.sqrt();
+            if keep_below {
+                dist <= edge
+            } else {
+                dist > edge
+            }
+        }
+        CanvasMask::Wipe {
+            angle_deg,
+            edge,
+            keep_below,
+        } => {
+            let (sin, cos) = angle_deg.to_radians().sin_cos();
+            let t = wipe_t(cos, sin, u, v);
+            if keep_below {
+                t <= edge
+            } else {
+                t > edge
+            }
+        }
     }
 }
 
@@ -390,6 +561,7 @@ pub fn place_from_transform(xform: &Transform, rel: i64, mix: f32) -> Place {
         shift_x: 0.0,
         shift_y: 0.0,
         mask: CanvasMask::None,
+        blur_radius: 0.0,
     }
 }
 
@@ -407,6 +579,8 @@ pub struct Place {
     pub shift_x: f32,
     pub shift_y: f32,
     pub mask: CanvasMask,
+    /// Extra blur from blur dissolve or clip filters.
+    pub blur_radius: f32,
 }
 
 impl Place {
@@ -423,6 +597,7 @@ impl Place {
             shift_x: 0.0,
             shift_y: 0.0,
             mask: CanvasMask::None,
+            blur_radius: 0.0,
         }
     }
 
@@ -451,6 +626,8 @@ pub enum LayerSource {
         last_source_frame: i64,
     },
     Title(Title),
+    /// Solid colour plate (dip-to-white and similar).
+    Solid { rgb: [f32; 3] },
 }
 
 /// One layer, bottom to top. Higher timeline tracks are later.
@@ -460,6 +637,7 @@ pub struct ProgramLayer {
     pub width: u32,
     pub height: u32,
     pub grade: GradeSample,
+    pub filters: FilterSample,
     pub place: Place,
     pub label: String,
     /// True when the decoded file is the proxy rather than the camera original.
@@ -519,12 +697,14 @@ pub fn program_stack_with(
         track.kind == TrackKind::Video && video_track_visible(track, &sequence.tracks)
     }) {
         if let Some(hit) = transition_hit(track, playhead) {
+            let mut transition_layers = Vec::new();
+            let mut dip_plate: Option<([f32; 3], f32)> = None;
             for (clip, outgoing) in [(hit.left, true), (hit.right, false)] {
                 match layer_from_clip(
                     sequence, track, clip, media, playhead, canvas_w, canvas_h, source,
                 ) {
                     Ok(Some(mut layer)) => {
-                        layer.place = apply_transition(
+                        let (place, motion) = apply_transition(
                             layer.place,
                             &hit.kind,
                             hit.progress,
@@ -532,17 +712,42 @@ pub fn program_stack_with(
                             seq_w,
                             seq_h,
                         );
+                        layer.place = place;
+                        if let Some(plate) = motion.dip_plate {
+                            dip_plate = Some(plate);
+                        }
                         // The transition can change scale-1 geometry into a slide,
                         // so the decode size has to follow the final place.
                         let (width, height) = layer_pixel_size(canvas_w, canvas_h, &layer.place);
                         layer.width = width;
                         layer.height = height;
-                        layers.push(layer);
+                        transition_layers.push(layer);
                     }
                     Ok(None) => {}
                     Err(message) => errors.push(message),
                 }
             }
+            if let Some((rgb, opacity)) = dip_plate {
+                if opacity > 0.001 && !transition_layers.is_empty() {
+                    let plate = ProgramLayer {
+                        source: LayerSource::Solid { rgb },
+                        width: canvas_w,
+                        height: canvas_h,
+                        grade: GradeSample::neutral(),
+                        filters: FilterSample::neutral(),
+                        place: Place {
+                            opacity,
+                            ..Place::identity()
+                        },
+                        label: "Dip plate".into(),
+                        clip_id: 0,
+                        using_proxy: false,
+                    };
+                    let insert_at = transition_layers.len().min(1);
+                    transition_layers.insert(insert_at, plate);
+                }
+            }
+            layers.extend(transition_layers);
         } else if let Some(clip) = track
             .clips
             .iter()
@@ -638,6 +843,7 @@ fn layer_from_clip(
             width,
             height,
             grade: GradeSample::from_effects(&clip.effects, rel),
+            filters: FilterSample::from_effects(&clip.effects, rel),
             place,
             label: format!("{}  {}", track.name, clip.name),
             using_proxy: false,
@@ -680,6 +886,7 @@ fn layer_from_clip(
         width,
         height,
         grade: GradeSample::from_effects(&clip.effects, rel),
+        filters: FilterSample::from_effects(&clip.effects, rel),
         place,
         label: format!("{}  {}", track.name, clip.name),
         using_proxy,
@@ -761,6 +968,146 @@ pub fn composite(
     dst
 }
 
+fn solid_rgba(width: u32, height: u32, rgb: [f32; 3]) -> Vec<u8> {
+    let mut rgba = vec![0u8; width as usize * height as usize * 4];
+    let r = (rgb[0].clamp(0.0, 1.0) * 255.0).round() as u8;
+    let g = (rgb[1].clamp(0.0, 1.0) * 255.0).round() as u8;
+    let b = (rgb[2].clamp(0.0, 1.0) * 255.0).round() as u8;
+    for px in rgba.chunks_exact_mut(4) {
+        px[0] = r;
+        px[1] = g;
+        px[2] = b;
+        px[3] = 255;
+    }
+    rgba
+}
+
+fn apply_filters(rgba: &mut [u8], width: u32, height: u32, filters: &FilterSample, extra_blur: f32) {
+    let blur_radius = filters.blur_radius.max(extra_blur);
+    if blur_radius >= 0.5 {
+        box_blur(rgba, width, height, blur_radius);
+    }
+    if filters.sharpen > 1.0e-4 {
+        sharpen_rgba(rgba, width, height, filters.sharpen);
+    }
+    if filters.crop.iter().any(|v| *v > 1.0e-4) {
+        apply_crop(rgba, width, height, filters.crop);
+    }
+    if filters.vignette_amount > 1.0e-4 {
+        apply_vignette(rgba, width, height, filters.vignette_amount, filters.vignette_softness);
+    }
+}
+
+fn box_blur(rgba: &mut [u8], width: u32, height: u32, radius: f32) {
+    let radius = radius.round().clamp(1.0, 48.0) as i32;
+    let w = width as i32;
+    let h = height as i32;
+    if w < 2 || h < 2 {
+        return;
+    }
+    let mut tmp = rgba.to_vec();
+    for _ in 0..2 {
+        for y in 0..h {
+            for x in 0..w {
+                let mut acc = [0.0f32; 4];
+                let mut n = 0.0f32;
+                for dx in -radius..=radius {
+                    let sx = (x + dx).clamp(0, w - 1);
+                    let idx = (y as usize * w as usize + sx as usize) * 4;
+                    for c in 0..4 {
+                        acc[c] += rgba[idx + c] as f32;
+                    }
+                    n += 1.0;
+                }
+                let idx = (y as usize * w as usize + x as usize) * 4;
+                for c in 0..4 {
+                    tmp[idx + c] = (acc[c] / n).round() as u8;
+                }
+            }
+        }
+        for y in 0..h {
+            for x in 0..w {
+                let mut acc = [0.0f32; 4];
+                let mut n = 0.0f32;
+                for dy in -radius..=radius {
+                    let sy = (y + dy).clamp(0, h - 1);
+                    let idx = (sy as usize * w as usize + x as usize) * 4;
+                    for c in 0..4 {
+                        acc[c] += tmp[idx + c] as f32;
+                    }
+                    n += 1.0;
+                }
+                let idx = (y as usize * w as usize + x as usize) * 4;
+                for c in 0..4 {
+                    rgba[idx + c] = (acc[c] / n).round() as u8;
+                }
+            }
+        }
+    }
+}
+
+fn sharpen_rgba(rgba: &mut [u8], width: u32, height: u32, amount: f32) {
+    let w = width as i32;
+    let h = height as i32;
+    if w < 3 || h < 3 {
+        return;
+    }
+    let src = rgba.to_vec();
+    for y in 1..h - 1 {
+        for x in 1..w - 1 {
+            let idx = (y as usize * w as usize + x as usize) * 4;
+            for c in 0..3 {
+                let center = src[idx + c] as f32;
+                let blur = (src[idx - 4 + c] as f32
+                    + src[idx + 4 + c] as f32
+                    + src[idx - w as usize * 4 + c] as f32
+                    + src[idx + w as usize * 4 + c] as f32)
+                    * 0.25;
+                let sharp = center + amount * (center - blur);
+                rgba[idx + c] = sharp.clamp(0.0, 255.0).round() as u8;
+            }
+        }
+    }
+}
+
+fn apply_crop(rgba: &mut [u8], width: u32, height: u32, crop: [f32; 4]) {
+    let w = width as i32;
+    let h = height as i32;
+    let left = (crop[0] * w as f32).round() as i32;
+    let right = (crop[1] * w as f32).round() as i32;
+    let top = (crop[2] * h as f32).round() as i32;
+    let bottom = (crop[3] * h as f32).round() as i32;
+    for y in 0..h {
+        for x in 0..w {
+            if x < left || x >= w - right || y < top || y >= h - bottom {
+                let idx = (y as usize * w as usize + x as usize) * 4;
+                rgba[idx..idx + 4].fill(0);
+            }
+        }
+    }
+}
+
+fn apply_vignette(rgba: &mut [u8], width: u32, height: u32, amount: f32, softness: f32) {
+    let w = width as f32;
+    let h = height as f32;
+    let inner = 1.0 - amount * (0.35 + 0.35 * softness);
+    for y in 0..height {
+        for x in 0..width {
+            let u = (x as f32 + 0.5) / w;
+            let v = (y as f32 + 0.5) / h;
+            let dx = u - 0.5;
+            let dy = v - 0.5;
+            let dist = (dx * dx + dy * dy).sqrt() * 2.0_f32.sqrt();
+            let falloff = smoothstep(inner, 1.0, dist);
+            let idx = (y as usize * width as usize + x as usize) * 4;
+            for c in 0..3 {
+                let v = rgba[idx + c] as f32;
+                rgba[idx + c] = (v * (1.0 - falloff * amount)).round() as u8;
+            }
+        }
+    }
+}
+
 /// Rasterize title generators and composite every layer. `media_rgba` is only
 /// called for decoded picture; titles never go through it.
 pub fn compose_layers(
@@ -776,12 +1123,16 @@ pub fn compose_layers(
         if !layer.place.contributes() || layer.width == 0 || layer.height == 0 {
             continue;
         }
-        let rgba = match &layer.source {
+        let mut rgba = match &layer.source {
             LayerSource::Title(title) => render_title(title, layer.width, layer.height),
             LayerSource::Media { .. } => media_rgba(layer)?,
+            LayerSource::Solid { rgb } => solid_rgba(layer.width, layer.height, *rgb),
         };
         if rgba.len() < 4 {
             continue;
+        }
+        if !layer.filters.is_neutral() || layer.place.blur_radius >= 0.5 {
+            apply_filters(&mut rgba, layer.width, layer.height, &layer.filters, layer.place.blur_radius);
         }
         owned.push((
             rgba,
@@ -1490,6 +1841,145 @@ mod tests {
     }
 
     #[test]
+    fn dip_to_black_fades_through_empty_at_midpoint() {
+        let outgoing = transition_motion(&TransitionKind::DipToBlack, 0.25, true, 100.0, 40.0);
+        let incoming = transition_motion(&TransitionKind::DipToBlack, 0.75, false, 100.0, 40.0);
+        assert!((outgoing.opacity_scale - 0.5).abs() < 1.0e-3);
+        assert!((incoming.opacity_scale - 0.5).abs() < 1.0e-3);
+        let mid_out = transition_motion(&TransitionKind::DipToBlack, 0.5, true, 100.0, 40.0);
+        let mid_in = transition_motion(&TransitionKind::DipToBlack, 0.5, false, 100.0, 40.0);
+        assert!(mid_out.opacity_scale < 1.0e-3);
+        assert!(mid_in.opacity_scale < 1.0e-3);
+    }
+
+    #[test]
+    fn dip_to_white_inserts_a_white_plate_at_midpoint() {
+        let motion = transition_motion(&TransitionKind::DipToWhite, 0.5, true, 100.0, 40.0);
+        let (rgb, opacity) = motion.dip_plate.unwrap();
+        assert!((opacity - 1.0).abs() < 1.0e-3);
+        assert!(rgb.iter().all(|c| *c > 0.99));
+    }
+
+    #[test]
+    fn slide_left_keeps_outgoing_stationary_and_moves_incoming() {
+        let out = transition_motion(
+            &TransitionKind::Slide {
+                direction: Direction::Left,
+            },
+            0.5,
+            true,
+            100.0,
+            40.0,
+        );
+        let incoming = transition_motion(
+            &TransitionKind::Slide {
+                direction: Direction::Left,
+            },
+            0.5,
+            false,
+            100.0,
+            40.0,
+        );
+        assert!(out.shift_x.abs() < 1.0e-3);
+        assert!((incoming.shift_x - 50.0).abs() < 1.0e-3);
+    }
+
+    #[test]
+    fn blur_dissolve_peaks_blur_at_the_midpoint() {
+        let mid = transition_motion(&TransitionKind::BlurDissolve, 0.5, true, 100.0, 40.0);
+        let ends = transition_motion(&TransitionKind::BlurDissolve, 0.0, true, 100.0, 40.0);
+        assert!(mid.blur_radius > ends.blur_radius + 10.0);
+    }
+
+    #[test]
+    fn iris_mask_reveals_from_the_centre() {
+        let mask = CanvasMask::Iris {
+            edge: 0.5,
+            keep_below: true,
+        };
+        assert!(mask_allows(mask, 0.5, 0.5));
+        assert!(!mask_allows(mask, 0.05, 0.05));
+        let src = solid(8, 8, [0, 200, 0, 255]);
+        let out = composite(
+            8,
+            8,
+            8.0,
+            8.0,
+            &[layer(
+                &src,
+                8,
+                8,
+                Place {
+                    mask,
+                    ..Place::identity()
+                },
+                GradeSample::neutral(),
+            )],
+        );
+        let centre = (4 * 8 + 4) * 4;
+        assert_eq!(out[centre + 3], 255, "centre pixel");
+        assert_eq!(out[3], 0, "corner pixel");
+    }
+
+    #[test]
+    fn blur_vignette_and_crop_filters_change_pixels() {
+        let mut src = vec![0u8; 16 * 16 * 4];
+        for y in 0..16 {
+            for x in 0..16 {
+                let idx = (y * 16 + x) * 4;
+                src[idx] = if x < 8 { 255 } else { 0 };
+                src[idx + 1] = 128;
+                src[idx + 2] = 64;
+                src[idx + 3] = 255;
+            }
+        }
+        let mut blurred = src.clone();
+        apply_filters(
+            &mut blurred,
+            16,
+            16,
+            &FilterSample {
+                blur_radius: 4.0,
+                ..FilterSample::neutral()
+            },
+            0.0,
+        );
+        let edge = (8 * 16 + 7) * 4;
+        assert_ne!(blurred[edge], src[edge], "blur softens the vertical edge");
+
+        let solid = solid(16, 16, [200, 100, 50, 255]);
+        let mut vignetted = solid.clone();
+        apply_filters(
+            &mut vignetted,
+            16,
+            16,
+            &FilterSample {
+                vignette_amount: 0.8,
+                vignette_softness: 0.5,
+                ..FilterSample::neutral()
+            },
+            0.0,
+        );
+        let corner = (15 * 16 + 15) * 4;
+        assert!(vignetted[corner] < solid[corner]);
+
+        let mut cropped = solid.clone();
+        apply_filters(
+            &mut cropped,
+            16,
+            16,
+            &FilterSample {
+                crop: [0.25, 0.25, 0.25, 0.25],
+                ..FilterSample::neutral()
+            },
+            0.0,
+        );
+        assert_eq!(cropped[3], 0, "cropped corner is transparent");
+        let centre = (8 * 16 + 8) * 4;
+        assert_eq!(cropped[centre + 3], 255);
+    }
+
+    #[test]
     fn anchor_moves_the_opaque_centroid() {
         let src = solid(4, 4, [255, 255, 255, 255]);
         let centered = composite(
@@ -1820,7 +2310,7 @@ mod tests {
     fn media_path(layer: &ProgramLayer) -> &str {
         match &layer.source {
             LayerSource::Media { path, .. } => path,
-            LayerSource::Title(_) => "",
+            LayerSource::Title(_) | LayerSource::Solid { .. } => "",
         }
     }
 

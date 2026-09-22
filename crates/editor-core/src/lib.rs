@@ -26,15 +26,17 @@ pub use edit::{
     collect_snap_points, delete_cue, expand_linked, import_media, insert_clips, lift_delete,
     link_clips, move_clips, overwrite_clips, razor_at, razor_clip, relink_media, replace_captions,
     ripple_delete, ripple_trim, roll_cut, set_clip_gain_at, set_clip_title, set_clip_volume,
-    set_grade_at, set_in_point, set_luma_curve_point, set_master_fader, set_out_point,
+    set_filter_at, set_grade_at, set_in_point, set_luma_curve_point, set_master_fader, set_out_point,
     set_track_fader, set_track_flag, set_track_pan, set_transform_at, set_wheel_offsets_at, slide,
-    slip, snap_span, snap_to_targets, source_frame_at, toggle_grade_key, toggle_transform_key,
-    toggle_volume_key, trim, update_cue_text, EditError, SnapHit, SnapKind, SnapPoint, TrackFlag,
-    TrimEdge,
+    slip, snap_span, snap_to_targets, source_frame_at, toggle_filter_key, toggle_grade_key,
+    toggle_transform_key, toggle_volume_key, trim, update_cue_text, EditError, SnapHit, SnapKind,
+    SnapPoint, TrackFlag, TrimEdge,
 };
 pub use effects::{
-    clip_relative, color_grade, color_grade_mut, transform, transform_mut, AnimatedF32, ColorGrade,
-    Effect, GradeParam, Interpolation, KeyframeF32, RgbWheel, ToneCurve, Transform, TransformParam,
+    blur, blur_mut, clip_relative, color_grade, color_grade_mut, crop, crop_mut, has_filter,
+    sharpen, sharpen_mut, transform, transform_mut, vignette, vignette_mut, AnimatedF32,
+    BlurFilter, ColorGrade, CropFilter, Effect, FilterKind, FilterParam, GradeParam, Interpolation,
+    KeyframeF32, RgbWheel, SharpenFilter, ToneCurve, Transform, TransformParam, VignetteFilter,
     WheelChannel, WheelKind,
 };
 pub use mix::{

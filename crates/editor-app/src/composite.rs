@@ -3,7 +3,7 @@
 
 pub use editor_media::{
     active_captions, burn_captions, compose_layers, mask_window, transition_motion, CanvasMask,
-    GradeSample, LayerSource, MaskWindow, Place, ProgramLayer,
+    FilterSample, GradeSample, LayerSource, MaskWindow, Place, ProgramLayer,
 };
 
 pub struct PictureCache {
