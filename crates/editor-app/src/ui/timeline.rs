@@ -13,13 +13,13 @@ use crate::theme::{self, THEME};
 use crate::ui::format_tc;
 use crate::ui::widgets;
 
-const HEADER_W: f32 = 156.0;
-const RULER_H: f32 = 28.0;
-const ROW_H: f32 = 36.0;
+const HEADER_W: f32 = theme::HEADER_COL_W;
+const RULER_H: f32 = theme::RULER_H;
+const ROW_H: f32 = theme::LANE_H;
+const CLIP_PAD_Y: f32 = 2.0;
 
 pub fn timeline_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
     transport(ui, app);
-    ui.separator();
     let Some(sequence) = app.session.project().active().cloned() else {
         ui.label("No sequence.");
         return;
@@ -170,8 +170,8 @@ fn follow_ruler_scrub(ui: &egui::Ui, app: &mut MeridianApp) {
 
 fn transport_scrub(ui: &mut egui::Ui, playhead: i64, end: i64) -> Option<i64> {
     let width = ui.available_width().max(80.0);
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 22.0), Sense::click_and_drag());
-    let track = Rect::from_center_size(rect.center(), Vec2::new(rect.width(), 6.0));
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 14.0), Sense::click_and_drag());
+    let track = Rect::from_center_size(rect.center(), Vec2::new(rect.width(), 4.0));
     let painter = ui.painter();
     painter.rect_filled(track, 3.0, THEME.inset);
     let span = end.max(1) as f32;
@@ -198,21 +198,21 @@ fn transport_scrub(ui: &mut egui::Ui, playhead: i64, end: i64) -> Option<i64> {
 fn transport(ui: &mut egui::Ui, app: &mut MeridianApp) {
     let timebase = app.timebase();
     let end = app.sequence_end();
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 64.0), Sense::hover());
-    ui.painter().rect_filled(rect, 0.0, THEME.header);
-    ui.painter().hline(
-        rect.x_range(),
-        rect.bottom(),
-        Stroke::new(1.0_f32, THEME.hairline),
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), theme::TRANSPORT_H),
+        Sense::hover(),
     );
-    let controls = Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + 38.0));
-    let scrub_row = Rect::from_min_max(pos2(rect.left(), rect.top() + 38.0), rect.max);
+    ui.painter().rect_filled(rect, 0.0, THEME.header);
+    ui.painter()
+        .hline(rect.x_range(), rect.bottom(), theme::hairline_stroke());
+    let controls = Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + 36.0));
+    let scrub_row = Rect::from_min_max(pos2(rect.left(), rect.top() + 36.0), rect.max);
     let mut bar = ui.new_child(
         egui::UiBuilder::new()
-            .max_rect(controls.shrink2(Vec2::new(8.0, 4.0)))
+            .max_rect(controls.shrink2(Vec2::new(theme::SPACE_MD, 2.0)))
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
-    bar.spacing_mut().item_spacing.x = 4.0;
+    bar.spacing_mut().item_spacing.x = theme::SPACE_XS;
     if widgets::transport_glyph(&mut bar, "Go to start", widgets::bar_left) {
         app.playhead = 0;
         app.halt_transport();
@@ -232,11 +232,16 @@ fn transport(ui: &mut egui::Ui, app: &mut MeridianApp) {
         app.halt_transport();
         app.reveal_playhead = true;
     }
-    bar.add_space(10.0);
-    widgets::readout(&mut bar, &format_tc(app.playhead, timebase), 118.0, true);
-    bar.add_space(4.0);
-    widgets::readout(&mut bar, &format_tc(end, timebase), 118.0, false);
-    bar.add_space(8.0);
+    bar.add_space(theme::SPACE_SM);
+    widgets::timecode_well(
+        &mut bar,
+        "TIMECODE",
+        &format_tc(app.playhead, timebase),
+        true,
+    );
+    bar.add_space(theme::SPACE_XS);
+    widgets::timecode_well(&mut bar, "DURATION", &format_tc(end, timebase), false);
+    bar.add_space(theme::SPACE_SM);
     let (inn, out) = app
         .session
         .project()
@@ -251,10 +256,10 @@ fn transport(ui: &mut egui::Ui, app: &mut MeridianApp) {
         Some(frame) => format!("Out {}", format_tc(frame, timebase)),
         None => "Mark Out".into(),
     };
-    if widgets::ghost_button(&mut bar, &in_label) {
+    if widgets::chip(&mut bar, &in_label, inn.is_some()) {
         app.mark_in();
     }
-    if widgets::ghost_button(&mut bar, &out_label) {
+    if widgets::chip(&mut bar, &out_label, out.is_some()) {
         app.mark_out();
     }
     bar.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -277,8 +282,7 @@ fn transport(ui: &mut egui::Ui, app: &mut MeridianApp) {
         };
         ui.label(
             egui::RichText::new(rate)
-                .size(11.0)
-                .monospace()
+                .font(THEME.mono(11.0))
                 .color(if app.playing {
                     THEME.accent
                 } else {
@@ -288,7 +292,7 @@ fn transport(ui: &mut egui::Ui, app: &mut MeridianApp) {
     });
     let mut scrub_ui = ui.new_child(
         egui::UiBuilder::new()
-            .max_rect(scrub_row.shrink2(Vec2::new(8.0, 2.0)))
+            .max_rect(scrub_row.shrink2(Vec2::new(theme::SPACE_MD, 0.0)))
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     if let Some(frame) = transport_scrub(&mut scrub_ui, app.playhead, end) {
@@ -308,21 +312,18 @@ fn header_row(
     let (rect, _) = ui.allocate_exact_size(Vec2::new(HEADER_W, ROW_H), Sense::hover());
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, THEME.header);
-    painter.hline(
-        rect.x_range(),
-        rect.bottom(),
-        Stroke::new(1.0_f32, THEME.hairline),
-    );
+    painter.hline(rect.x_range(), rect.bottom(), theme::hairline_stroke());
     painter.rect_filled(
         Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height())),
         0.0,
         theme::track_color(track.kind),
     );
-    painter.text(
-        pos2(rect.left() + 12.0, rect.center().y),
+    let name_clip = Rect::from_min_max(rect.min, pos2(rect.right() - 62.0, rect.bottom()));
+    painter.with_clip_rect(name_clip).text(
+        pos2(rect.left() + 10.0, rect.center().y),
         Align2::LEFT_CENTER,
         &track.name,
-        FontId::new(12.0, egui::FontFamily::Proportional),
+        THEME.font(11.0),
         THEME.text,
     );
     let mut child = ui.new_child(
@@ -354,14 +355,28 @@ fn ruler(
     app.ruler_rect = Some(rect);
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, theme::RULER);
-    painter.hline(
-        rect.x_range(),
-        rect.bottom(),
-        Stroke::new(1.0_f32, THEME.hairline),
-    );
+    painter.hline(rect.x_range(), rect.bottom(), theme::hairline_stroke());
     let ppf = app.pixels_per_frame;
     let fps = sequence.timebase.timecode_fps().max(1);
     let major = fps;
+    if ppf >= 3.0 {
+        let minor = if ppf >= 10.0 { 1 } else { (fps / 2).max(1) };
+        let mut tick = 0_i64;
+        while tick <= end {
+            if tick % major != 0 {
+                let x = rect.min.x + tick as f32 * ppf;
+                if x > rect.max.x + 8.0 {
+                    break;
+                }
+                painter.vline(
+                    x,
+                    (rect.bottom() - 4.0)..=rect.bottom(),
+                    Stroke::new(1.0_f32, THEME.hairline),
+                );
+            }
+            tick += minor;
+        }
+    }
     if let (Some(inn), Some(out)) = (sequence.in_point, sequence.out_point) {
         let x0 = rect.min.x + inn.0 as f32 * ppf;
         let x1 = rect.min.x + out.0 as f32 * ppf;
@@ -397,10 +412,10 @@ fn ruler(
         }
         if frame % step == 0 && ppf > 0.8 {
             painter.text(
-                pos2(x + 4.0, rect.top() + 3.0),
+                pos2(x + 3.0, rect.top() + 2.0),
                 Align2::LEFT_TOP,
                 format_tc(frame, sequence.timebase),
-                FontId::monospace(10.0),
+                THEME.mono(9.0),
                 THEME.text_mute,
             );
         }
@@ -461,15 +476,15 @@ fn lane(
             let x0 = rect.min.x + cue.timeline_in.0 as f32 * ppf;
             let x1 = rect.min.x + cue.timeline_out.0 as f32 * ppf;
             let crect = Rect::from_min_max(
-                pos2(x0, rect.min.y + 4.0),
-                pos2(x1.max(x0 + 4.0), rect.max.y - 4.0),
+                pos2(x0, rect.min.y + CLIP_PAD_Y),
+                pos2(x1.max(x0 + 4.0), rect.max.y - CLIP_PAD_Y),
             );
             paint_clip_body(&painter, crect, theme::CAPTION, false, false);
-            painter.with_clip_rect(crect.shrink(4.0)).text(
-                crect.left_center() + Vec2::new(6.0, 0.0),
+            painter.with_clip_rect(crect.shrink(3.0)).text(
+                crect.left_center() + Vec2::new(5.0, 0.0),
                 Align2::LEFT_CENTER,
                 &cue.text,
-                FontId::new(11.0, egui::FontFamily::Proportional),
+                THEME.font(10.5),
                 Color32::WHITE,
             );
         }
@@ -480,8 +495,8 @@ fn lane(
         let x0 = rect.min.x + start as f32 * ppf;
         let x1 = rect.min.x + end as f32 * ppf;
         let crect = Rect::from_min_max(
-            pos2(x0, rect.min.y + 3.0),
-            pos2(x1.max(x0 + 3.0), rect.max.y - 3.0),
+            pos2(x0, rect.min.y + CLIP_PAD_Y),
+            pos2(x1.max(x0 + 3.0), rect.max.y - CLIP_PAD_Y),
         );
         let selected = app.selected.contains(&clip.id);
         let fill = theme::label_fill(clip.label, track.kind);
@@ -503,11 +518,11 @@ fn lane(
                 THEME.amber,
             );
         }
-        painter.with_clip_rect(crect.shrink(4.0)).text(
-            crect.left_center() + Vec2::new(7.0, 0.0),
+        painter.with_clip_rect(crect.shrink(3.0)).text(
+            crect.left_center() + Vec2::new(5.0, 0.0),
             Align2::LEFT_CENTER,
             &clip.name,
-            FontId::new(11.0, egui::FontFamily::Proportional),
+            THEME.font(10.5),
             Color32::WHITE,
         );
     }
@@ -708,8 +723,8 @@ fn hit_test(track: &editor_core::Track, rect: Rect, pos: egui::Pos2, ppf: f32) -
         let x0 = rect.min.x + clip.timeline_in.0 as f32 * ppf;
         let x1 = rect.min.x + clip.timeline_out.0 as f32 * ppf;
         let crect = Rect::from_min_max(
-            pos2(x0, rect.min.y + 3.0),
-            pos2(x1.max(x0 + 4.0), rect.max.y - 3.0),
+            pos2(x0, rect.min.y + CLIP_PAD_Y),
+            pos2(x1.max(x0 + 4.0), rect.max.y - CLIP_PAD_Y),
         );
         if crect.contains(pos) {
             let edge = if (pos.x - crect.min.x).abs() <= 6.0 {
@@ -856,7 +871,7 @@ fn kind_name(kind: DragKind) -> &'static str {
 
 fn paint_playhead(painter: &egui::Painter, rect: Rect, frame: i64, ppf: f32) {
     let x = rect.min.x + frame as f32 * ppf;
-    painter.vline(x, rect.y_range(), Stroke::new(1.5_f32, THEME.playhead));
+    painter.vline(x, rect.y_range(), Stroke::new(1.25_f32, THEME.playhead));
     if rect.height() <= RULER_H + 2.0 {
         painter.add(Shape::convex_polygon(
             vec![
@@ -880,16 +895,17 @@ fn paint_clip_body(
     if rect.width() < 1.0 {
         return;
     }
-    painter.rect_filled(rect, 3.0, fill);
+    let radius = THEME.radius as f32;
+    painter.rect_filled(rect, radius, fill);
     let sheen = Rect::from_min_max(
         rect.min,
-        pos2(rect.right(), rect.top() + rect.height() * 0.42),
+        pos2(rect.right(), rect.top() + rect.height() * 0.34),
     );
-    painter.rect_filled(sheen, 3.0, Color32::from_white_alpha(28));
+    painter.rect_filled(sheen, radius, Color32::from_white_alpha(18));
     painter.rect_filled(
-        Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height())),
+        Rect::from_min_size(rect.min, Vec2::new(2.0, rect.height())),
         0.0,
-        Color32::from_white_alpha(50),
+        Color32::from_white_alpha(46),
     );
     if waveform {
         let mut x = rect.left() + 8.0;
@@ -898,20 +914,20 @@ fn paint_clip_body(
             .wrapping_add(1013904223);
         while x < rect.right() - 4.0 {
             seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-            let h = 3.0 + ((seed >> 16) % 100) as f32 / 100.0 * (rect.height() * 0.28);
+            let h = 2.0 + ((seed >> 16) % 100) as f32 / 100.0 * (rect.height() * 0.32);
             painter.vline(
                 x,
                 (rect.center().y - h)..=(rect.center().y + h),
-                Stroke::new(1.0_f32, Color32::from_white_alpha(70)),
+                Stroke::new(1.0_f32, Color32::from_white_alpha(90)),
             );
-            x += 3.5;
+            x += 3.0;
         }
     }
     if selected {
         painter.rect_stroke(
             rect,
-            3.0,
-            Stroke::new(1.6_f32, THEME.selection),
+            radius,
+            Stroke::new(1.5_f32, THEME.selection),
             egui::StrokeKind::Inside,
         );
     }

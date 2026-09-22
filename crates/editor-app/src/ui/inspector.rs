@@ -25,11 +25,15 @@ pub fn inspector_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
         return;
     };
 
-    egui::ScrollArea::vertical()
-        .id_salt("inspector_scroll")
-        .auto_shrink([false, false])
+    egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(8, 2))
         .show(ui, |ui| {
-            inspector_body(ui, app, clip_id, &snapshot);
+            egui::ScrollArea::vertical()
+                .id_salt("inspector_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    inspector_body(ui, app, clip_id, &snapshot);
+                });
         });
 }
 

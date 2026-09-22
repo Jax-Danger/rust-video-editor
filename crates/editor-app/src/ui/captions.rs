@@ -21,6 +21,7 @@ pub fn captions_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
                 .color(THEME.text_mute),
         );
     });
+    widgets::hairline(ui);
 
     let timebase = app.timebase();
     let cues: Vec<_> = app
