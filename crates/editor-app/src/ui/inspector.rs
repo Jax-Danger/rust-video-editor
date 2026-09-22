@@ -3,7 +3,7 @@ use editor_core::{
     toggle_transform_key, toggle_volume_key, transform, ClipId, GradeParam, TrackKind,
     TransformParam,
 };
-use egui::{Color32, RichText, Sense, Shape, Stroke, Vec2};
+use egui::RichText;
 
 use crate::app::MeridianApp;
 use crate::theme::THEME;
@@ -114,7 +114,7 @@ fn inspector_body(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId, sna
     }
 
     if matches!(app.workspace, crate::app::Workspace::Colour) {
-        colour_wheel(ui, app, clip_id, rel);
+        crate::ui::colour::colour_controls(ui, app, clip_id, rel);
     }
 
     ui.add_space(4.0);
@@ -480,82 +480,4 @@ fn xform_slider(
             }
         });
     });
-}
-
-fn colour_wheel(ui: &mut egui::Ui, app: &mut MeridianApp, clip: ClipId, rel: i64) {
-    ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        ui.add_space(12.0);
-        ui.label(RichText::new("Offset").size(11.0).color(THEME.text_dim));
-    });
-    let (temp, _) = grade_value(app, clip, rel, GradeParam::Temperature);
-    let (tint, _) = grade_value(app, clip, rel, GradeParam::Tint);
-    let size = egui::vec2(176.0, 176.0);
-    ui.horizontal(|ui| {
-        let spare = (ui.available_width() - size.x).max(0.0) * 0.5;
-        ui.add_space(spare);
-        let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
-        let painter = ui.painter_at(rect);
-        let center = rect.center();
-        let radius = 72.0;
-        for step in 0..64 {
-            let a0 = step as f32 / 64.0 * std::f32::consts::TAU;
-            let a1 = (step + 1) as f32 / 64.0 * std::f32::consts::TAU;
-            let p0 = center + Vec2::new(a0.cos(), a0.sin()) * radius;
-            let p1 = center + Vec2::new(a1.cos(), a1.sin()) * radius;
-            painter.add(Shape::convex_polygon(
-                vec![center, p0, p1],
-                wheel_color(a0),
-                Stroke::NONE,
-            ));
-        }
-        painter.circle_filled(center, 28.0, THEME.inset);
-        painter.circle_stroke(center, radius, Stroke::new(1.0_f32, THEME.border));
-        painter.hline(
-            (center.x - radius)..=(center.x + radius),
-            center.y,
-            Stroke::new(1.0_f32, Color32::from_white_alpha(28)),
-        );
-        painter.vline(
-            center.x,
-            (center.y - radius)..=(center.y + radius),
-            Stroke::new(1.0_f32, Color32::from_white_alpha(28)),
-        );
-        let point = center + egui::vec2(temp * radius, -tint * radius);
-        painter.circle_filled(point, 6.0, Color32::WHITE);
-        painter.circle_stroke(point, 6.0, Stroke::new(2.0_f32, THEME.bg));
-        if response.drag_started() {
-            app.session.begin_interactive("Colour offset");
-        }
-        if response.dragged() || response.clicked() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                let next_temp = ((pos.x - center.x) / radius).clamp(-1.0, 1.0);
-                let next_tint = (-(pos.y - center.y) / radius).clamp(-1.0, 1.0);
-                apply_grade(app, clip, rel, GradeParam::Temperature, next_temp);
-                apply_grade(app, clip, rel, GradeParam::Tint, next_tint);
-            }
-        }
-        if response.drag_stopped() {
-            app.session.end_interactive();
-        }
-    });
-    ui.horizontal(|ui| {
-        ui.add_space(12.0);
-        ui.label(
-            RichText::new(format!("Temp {temp:+.2}     Tint {tint:+.2}"))
-                .size(11.0)
-                .monospace()
-                .color(THEME.text_dim),
-        );
-    });
-}
-
-fn wheel_color(angle: f32) -> Color32 {
-    let warm = (angle.cos() * 0.5 + 0.5).clamp(0.0, 1.0);
-    let magenta = (angle.sin() * 0.5 + 0.5).clamp(0.0, 1.0);
-    Color32::from_rgb(
-        (40.0 + warm * 180.0) as u8,
-        (70.0 + (1.0 - magenta) * 90.0) as u8,
-        (50.0 + (1.0 - warm) * 140.0 + magenta * 40.0) as u8,
-    )
 }

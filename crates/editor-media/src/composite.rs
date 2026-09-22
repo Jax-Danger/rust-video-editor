@@ -14,11 +14,11 @@
 
 use editor_core::{
     clip_relative, color_grade, source_frame_at, transform, Clip, ColorGrade, Direction, Frame,
-    MediaAsset, Sequence, Track, TrackKind, Transform, TransitionKind,
+    MediaAsset, Sequence, ToneCurve, Track, TrackKind, Transform, TransitionKind,
 };
 use font8x8::UnicodeFonts;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct GradeSample {
     pub exposure: f32,
     pub contrast: f32,
@@ -27,6 +27,10 @@ pub struct GradeSample {
     pub temperature: f32,
     pub tint: f32,
     pub saturation: f32,
+    pub lift: [f32; 3],
+    pub gamma: [f32; 3],
+    pub gain: [f32; 3],
+    pub luma_curve: ToneCurve,
 }
 
 impl GradeSample {
@@ -39,6 +43,10 @@ impl GradeSample {
             temperature: 0.0,
             tint: 0.0,
             saturation: 1.0,
+            lift: [0.0, 0.0, 0.0],
+            gamma: [0.0, 0.0, 0.0],
+            gain: [0.0, 0.0, 0.0],
+            luma_curve: ToneCurve::identity(),
         }
     }
 
@@ -51,6 +59,10 @@ impl GradeSample {
             temperature: grade.temperature.value_at(rel),
             tint: grade.tint.value_at(rel),
             saturation: grade.saturation.value_at(rel),
+            lift: grade.lift.values_at(rel),
+            gamma: grade.gamma.values_at(rel),
+            gain: grade.gain.values_at(rel),
+            luma_curve: grade.luma_curve.clone(),
         }
     }
 
@@ -60,7 +72,7 @@ impl GradeSample {
             .unwrap_or_else(Self::neutral)
     }
 
-    pub fn is_neutral(self) -> bool {
+    pub fn is_neutral(&self) -> bool {
         self.exposure.abs() < 1.0e-4
             && (self.contrast - 1.0).abs() < 1.0e-4
             && self.highlights.abs() < 1.0e-4
@@ -68,6 +80,48 @@ impl GradeSample {
             && self.temperature.abs() < 1.0e-4
             && self.tint.abs() < 1.0e-4
             && (self.saturation - 1.0).abs() < 1.0e-4
+            && self.lift.iter().all(|v| v.abs() < 1.0e-4)
+            && self.gamma.iter().all(|v| v.abs() < 1.0e-4)
+            && self.gain.iter().all(|v| v.abs() < 1.0e-4)
+            && self.luma_curve == ToneCurve::identity()
+    }
+
+    fn apply_luma_curve(rgb: [f32; 3], curve: &ToneCurve) -> [f32; 3] {
+        if curve == &ToneCurve::identity() {
+            return rgb;
+        }
+        let luma = rec709_luma(rgb);
+        let mapped = curve.eval(luma);
+        if luma < 1.0e-4 {
+            return rgb.map(|_| mapped.clamp(0.0, 1.5));
+        }
+        let scale = mapped / luma;
+        rgb.map(|channel| (channel * scale).clamp(0.0, 1.5))
+    }
+
+    fn apply_wheel_offsets(rgb: [f32; 3], lift: [f32; 3], gamma: [f32; 3], gain: [f32; 3]) -> [f32; 3] {
+        let luma = rec709_luma(rgb);
+        let lift_w = 1.0 - smoothstep(0.08, 0.40, luma);
+        let gamma_w = smoothstep(0.20, 0.45, luma) * (1.0 - smoothstep(0.55, 0.80, luma));
+        let gain_w = smoothstep(0.60, 0.95, luma);
+        let strength = 0.35;
+        [
+            (rgb[0]
+                + lift[0] * strength * lift_w
+                + gamma[0] * strength * gamma_w
+                + gain[0] * strength * gain_w)
+                .clamp(0.0, 1.5),
+            (rgb[1]
+                + lift[1] * strength * lift_w
+                + gamma[1] * strength * gamma_w
+                + gain[1] * strength * gain_w)
+                .clamp(0.0, 1.5),
+            (rgb[2]
+                + lift[2] * strength * lift_w
+                + gamma[2] * strength * gamma_w
+                + gain[2] * strength * gain_w)
+                .clamp(0.0, 1.5),
+        ]
     }
 
     /// Shared grade. `rgb` channels are 0…1 display values.
@@ -75,9 +129,11 @@ impl GradeSample {
     /// Shadows and highlights use a smooth split: shadows fall off by mid grey,
     /// highlights start there, so a shadow lift does not also brighten the
     /// whites. Coefficients are 0.45 of the parameter at full weight.
-    pub fn apply(self, rgb: [f32; 3]) -> [f32; 3] {
-        let mut c = rgb.map(|channel| channel * 2.0_f32.powf(self.exposure));
+    pub fn apply(&self, rgb: [f32; 3]) -> [f32; 3] {
+        let mut c = Self::apply_luma_curve(rgb, &self.luma_curve);
+        c = c.map(|channel| channel * 2.0_f32.powf(self.exposure));
         c = c.map(|channel| ((channel - 0.5) * self.contrast + 0.5).clamp(0.0, 1.5));
+        c = Self::apply_wheel_offsets(c, self.lift, self.gamma, self.gain);
         c = c.map(|channel| {
             let shadow_w = 1.0 - smoothstep(0.10, 0.55, channel);
             let high_w = smoothstep(0.45, 0.90, channel);
@@ -89,9 +145,13 @@ impl GradeSample {
         c[1] = (c[1] - self.tint * 0.14).clamp(0.0, 1.5);
         c[0] = (c[0] + self.tint * 0.06).clamp(0.0, 1.5);
         c[2] = (c[2] + self.tint * 0.06).clamp(0.0, 1.5);
-        let luma = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        let luma = rec709_luma(c);
         c.map(|channel| (luma + (channel - luma) * self.saturation).clamp(0.0, 1.0))
     }
+}
+
+fn rec709_luma(rgb: [f32; 3]) -> f32 {
+    0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
 }
 
 fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
@@ -1050,6 +1110,29 @@ mod tests {
         assert!(lifted[0] > 0.9, "{lifted:?}");
         let neutral = GradeSample::neutral().apply([0.25, 0.5, 0.75]);
         assert!((neutral[1] - 0.5).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn lift_wheel_adds_red_to_shadows_more_than_highlights() {
+        let grade = GradeSample {
+            lift: [0.5, 0.0, 0.0],
+            ..GradeSample::neutral()
+        };
+        let dark = grade.apply([0.05, 0.05, 0.05]);
+        let bright = grade.apply([0.9, 0.9, 0.9]);
+        assert!(dark[0] - 0.05 > bright[0] - 0.9 + 0.02);
+    }
+
+    #[test]
+    fn luma_curve_lifts_mid_grey() {
+        let mut curve = ToneCurve::identity();
+        curve.set_point_y(2, 0.65);
+        let grade = GradeSample {
+            luma_curve: curve,
+            ..GradeSample::neutral()
+        };
+        let out = grade.apply([0.5, 0.5, 0.5]);
+        assert!(out[0] > 0.55, "{out:?}");
     }
 
     #[test]

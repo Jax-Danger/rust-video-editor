@@ -117,14 +117,24 @@ Reverse shuttle and rates other than 1× play the picture and stay silent. At 1�
 
 The **Audio** workspace is the mixer. Each audio track has a fader (−∞ to +12 dB, unity at 0 dB), a constant-power pan (center is unity, so an unpanned clip is unchanged), mute, solo, and peak / RMS / peak-hold meters. A red clip lamp latches when that strip, or the master, reaches full scale; click it to clear. The master fader sits on the bus after the tracks. Fader, pan, mute, solo, master, and clip gain are applied while the chunk plays, so a move is heard without waiting for the next decode. Clip gain is an `AnimatedF32`: the inspector diamond (and the one on the strip) keys it at the playhead. The slider is 0 to 2; the value is stored up to 4. Playback, the meters, caption extraction, and export all use the same rules: audible tracks only, clip gain × track fader × pan, then the master fader, then a hard limit at full scale.
 
-Colour and transform parameters are `AnimatedF32`: a constant until you add a keyframe, then linear or hold interpolation in clip-relative frames. The inspector diamond toggles a key at the playhead. The Colour workspace adds an offset pad for temperature and tint.
+Colour and transform parameters are `AnimatedF32`: a constant until you add a keyframe, then linear or hold interpolation in clip-relative frames. The inspector diamond toggles a key at the playhead.
+
+The **Colour** workspace is Resolve-leaning without decorative chrome:
+
+- **Scopes** (left column) — waveform luma and a vectorscope fed from the composited program frame
+- **Wheels** — Lift, Gamma, and Gain offset wheels with keyframeable RGB offsets per channel
+- **Luma curve** — drag the interior control points; endpoints stay fixed at black and white
+- **White balance** — temperature / tint offset pad (same as before, now grouped with the wheels)
+- **Lighting** sliders — exposure, contrast, highlights, shadows, temperature, tint, saturation
+
+Wheels, curve, and sliders all run through the shared `GradeSample` compositor, so preview and Deliver match.
 
 Transitions (cross dissolve, wipe, push) are centered on a cut and consume head and tail handles. Duration is in sequence frames.
 
 ## Workspaces
 
 - **Edit** — media pool, program viewer, inspector, captions, timeline
-- **Colour** — viewer plus grade, wheels, and transform
+- **Colour** — scopes, viewer, lift/gamma/gain wheels, luma curve, white balance, and grade sliders
 - **Audio** — the mixer docks in this page: faders, pan, mute, solo, and meters in the track bay, with the program meter on the right and the timeline still underneath
 - **Deliver** — codec, container, in/out, and **Export**. With `--features ffmpeg` this encodes a real file. Without that feature, Export still writes the JSON manifest and says the encoder is compiled out.
 
@@ -136,7 +146,7 @@ Preview (`--features ffmpeg`) and Deliver call one compositor in `editor-media`.
 
 | Piece | Shared? | Notes |
 | --- | --- | --- |
-| Grade | Yes, one formula | Exposure in stops, contrast about mid grey, split shadow/highlight lift, temperature, tint, then Rec.709 luma saturation. Evaluated on the decoded RGB values as stored — not scene-linear, and not a film print |
+| Grade | Yes, one formula | Luma curve, exposure in stops, contrast about mid grey, lift/gamma/gain wheel offsets by tonal region, split shadow/highlight lift, temperature, tint, then Rec.709 luma saturation. Evaluated on the decoded RGB values as stored — not scene-linear, and not a film print |
 | Opacity, scale, position, rotation, anchor | Yes | Straight alpha over. Anchor is the normalized point that sits on the position |
 | Cross dissolve | Yes | Incoming blends over an opaque outgoing plate, which is a linear mix when that plate is opaque |
 | Wipe | Yes | `angle_deg` is the direction the reveal travels: 0° left to right, 90° top to bottom, 180° from the right, 270° from the bottom. Other angles use the same half-plane per pixel. The proxy only clips axis-aligned wipes; a diagonal wipe on the proxy is a stand-in |
@@ -253,7 +263,7 @@ A progress bar follows ffmpeg's `out_time`. **Cancel** sends `SIGTERM`. A failed
 
 ## Tests
 
-`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, the sample project round-trip, imported media paths in JSON, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, pan, fader, burned captions), the mix bus (pan law, mute, solo, keyframed gain, peak and RMS), and the shared composite (grade split, dissolve mix, wipe angle, push, anchor, caption burn-in). It does not spawn ffmpeg or whisper.
+`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, the sample project round-trip, imported media paths in JSON, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, pan, fader, burned captions), the mix bus (pan law, mute, solo, keyframed gain, peak and RMS), and the shared composite (luma curve, lift/gamma/gain wheels, grade split, dissolve mix, wipe angle, push, anchor, caption burn-in). It does not spawn ffmpeg or whisper.
 
 `cargo test -p editor-media --features ffmpeg` also encodes a short H.264/AAC mp4 when `ffmpeg` is on `PATH`. `cargo test -p editor-app --features whisper` builds the local speech-to-text path; the binary and model are resolved at runtime, not at compile time.
 
