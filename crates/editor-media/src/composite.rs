@@ -1,0 +1,1370 @@
+//! Shared picture composite for the program monitor and Deliver.
+//!
+//! Preview (`--features ffmpeg`) and export both evaluate this module. The
+//! grade is one formula — exposure in stops, contrast about mid grey, a split
+//! shadow/highlight lift, temperature, tint, then luma saturation. It runs on
+//! the decoded RGB values as stored (no scene-linear conversion). Transforms
+//! are position, scale, rotation, anchor, and opacity, then a straight alpha
+//! over. Dissolves, wipes, and pushes are the same `transition_motion` in both
+//! paths.
+//!
+//! The raster size may differ (the monitor fits inside 960×540, export uses the
+//! sequence size, capped at the preview decoder's 1920-pixel edge). The mapping
+//! is the same, so the pictures agree up to that scale and the codec.
+
+use editor_core::{
+    clip_relative, color_grade, source_frame_at, transform, Clip, ColorGrade, Direction, Frame,
+    MediaAsset, Sequence, Track, TrackKind, Transform, TransitionKind,
+};
+use font8x8::UnicodeFonts;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GradeSample {
+    pub exposure: f32,
+    pub contrast: f32,
+    pub highlights: f32,
+    pub shadows: f32,
+    pub temperature: f32,
+    pub tint: f32,
+    pub saturation: f32,
+}
+
+impl GradeSample {
+    pub fn neutral() -> Self {
+        Self {
+            exposure: 0.0,
+            contrast: 1.0,
+            highlights: 0.0,
+            shadows: 0.0,
+            temperature: 0.0,
+            tint: 0.0,
+            saturation: 1.0,
+        }
+    }
+
+    pub fn from_grade(grade: &ColorGrade, rel: i64) -> Self {
+        Self {
+            exposure: grade.exposure.value_at(rel),
+            contrast: grade.contrast.value_at(rel),
+            highlights: grade.highlights.value_at(rel),
+            shadows: grade.shadows.value_at(rel),
+            temperature: grade.temperature.value_at(rel),
+            tint: grade.tint.value_at(rel),
+            saturation: grade.saturation.value_at(rel),
+        }
+    }
+
+    pub fn from_effects(effects: &[editor_core::Effect], rel: i64) -> Self {
+        color_grade(effects)
+            .map(|grade| Self::from_grade(grade, rel))
+            .unwrap_or_else(Self::neutral)
+    }
+
+    pub fn is_neutral(self) -> bool {
+        self.exposure.abs() < 1.0e-4
+            && (self.contrast - 1.0).abs() < 1.0e-4
+            && self.highlights.abs() < 1.0e-4
+            && self.shadows.abs() < 1.0e-4
+            && self.temperature.abs() < 1.0e-4
+            && self.tint.abs() < 1.0e-4
+            && (self.saturation - 1.0).abs() < 1.0e-4
+    }
+
+    /// Shared grade. `rgb` channels are 0…1 display values.
+    ///
+    /// Shadows and highlights use a smooth split: shadows fall off by mid grey,
+    /// highlights start there, so a shadow lift does not also brighten the
+    /// whites. Coefficients are 0.45 of the parameter at full weight.
+    pub fn apply(self, rgb: [f32; 3]) -> [f32; 3] {
+        let mut c = rgb.map(|channel| channel * 2.0_f32.powf(self.exposure));
+        c = c.map(|channel| ((channel - 0.5) * self.contrast + 0.5).clamp(0.0, 1.5));
+        c = c.map(|channel| {
+            let shadow_w = 1.0 - smoothstep(0.10, 0.55, channel);
+            let high_w = smoothstep(0.45, 0.90, channel);
+            (channel + self.shadows * 0.45 * shadow_w + self.highlights * 0.45 * high_w)
+                .clamp(0.0, 1.5)
+        });
+        c[0] = (c[0] + self.temperature * 0.18).clamp(0.0, 1.5);
+        c[2] = (c[2] - self.temperature * 0.18).clamp(0.0, 1.5);
+        c[1] = (c[1] - self.tint * 0.14).clamp(0.0, 1.5);
+        c[0] = (c[0] + self.tint * 0.06).clamp(0.0, 1.5);
+        c[2] = (c[2] + self.tint * 0.06).clamp(0.0, 1.5);
+        let luma = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        c.map(|channel| (luma + (channel - luma) * self.saturation).clamp(0.0, 1.0))
+    }
+}
+
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// How a transition moves one side. `opacity_scale` multiplies the clip opacity.
+/// Shifts are sequence pixels (+x right, +y up). The mask is in canvas space.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TransitionMotion {
+    pub opacity_scale: f32,
+    pub shift_x: f32,
+    pub shift_y: f32,
+    pub mask: CanvasMask,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CanvasMask {
+    None,
+    /// `angle_deg` is the direction the reveal travels, clockwise from +X
+    /// (0 = left to right, 90 = top to bottom). `edge` is the progress.
+    /// `keep_below` keeps the side already revealed (`t <= edge`).
+    Wipe {
+        angle_deg: f32,
+        edge: f32,
+        keep_below: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MaskWindow {
+    All,
+    Empty,
+    /// Visible canvas window, normalized, x right and y down.
+    Uv {
+        u0: f32,
+        v0: f32,
+        u1: f32,
+        v1: f32,
+    },
+    /// Not an axis-aligned wipe. Test [`mask_allows`] per pixel.
+    PerPixel,
+}
+
+pub fn transition_motion(
+    kind: &TransitionKind,
+    progress: f32,
+    outgoing: bool,
+    seq_w: f32,
+    seq_h: f32,
+) -> TransitionMotion {
+    let p = progress.clamp(0.0, 1.0);
+    match kind {
+        TransitionKind::CrossDissolve => TransitionMotion {
+            // Incoming dissolves over a fully opaque outgoing plate, which is a
+            // linear mix when the outgoing clip itself is opaque.
+            opacity_scale: if outgoing { 1.0 } else { p },
+            shift_x: 0.0,
+            shift_y: 0.0,
+            mask: CanvasMask::None,
+        },
+        TransitionKind::Wipe { angle_deg } => TransitionMotion {
+            opacity_scale: 1.0,
+            shift_x: 0.0,
+            shift_y: 0.0,
+            mask: CanvasMask::Wipe {
+                angle_deg: *angle_deg,
+                edge: p,
+                keep_below: !outgoing,
+            },
+        },
+        TransitionKind::PushSlide { direction } => {
+            let (shift_x, shift_y) = push_shift(*direction, outgoing, p, seq_w, seq_h);
+            TransitionMotion {
+                opacity_scale: 1.0,
+                shift_x,
+                shift_y,
+                mask: CanvasMask::None,
+            }
+        }
+    }
+}
+
+fn push_shift(direction: Direction, outgoing: bool, p: f32, seq_w: f32, seq_h: f32) -> (f32, f32) {
+    match direction {
+        Direction::Left => {
+            if outgoing {
+                (-seq_w * p, 0.0)
+            } else {
+                (seq_w * (1.0 - p), 0.0)
+            }
+        }
+        Direction::Right => {
+            if outgoing {
+                (seq_w * p, 0.0)
+            } else {
+                (-seq_w * (1.0 - p), 0.0)
+            }
+        }
+        Direction::Up => {
+            if outgoing {
+                (0.0, seq_h * p)
+            } else {
+                (0.0, -seq_h * (1.0 - p))
+            }
+        }
+        Direction::Down => {
+            if outgoing {
+                (0.0, -seq_h * p)
+            } else {
+                (0.0, seq_h * (1.0 - p))
+            }
+        }
+    }
+}
+
+pub fn apply_transition(
+    mut place: Place,
+    kind: &TransitionKind,
+    progress: f32,
+    outgoing: bool,
+    seq_w: f32,
+    seq_h: f32,
+) -> Place {
+    let motion = transition_motion(kind, progress, outgoing, seq_w, seq_h);
+    place.opacity = (place.opacity * motion.opacity_scale).clamp(0.0, 1.0);
+    place.shift_x += motion.shift_x;
+    place.shift_y += motion.shift_y;
+    place.mask = motion.mask;
+    place
+}
+
+pub fn mask_window(mask: CanvasMask) -> MaskWindow {
+    let CanvasMask::Wipe {
+        angle_deg,
+        edge,
+        keep_below,
+    } = mask
+    else {
+        return MaskWindow::All;
+    };
+    let edge = edge.clamp(0.0, 1.0);
+    if keep_below && edge <= 1.0e-4 {
+        return MaskWindow::Empty;
+    }
+    if !keep_below && edge >= 1.0 - 1.0e-4 {
+        return MaskWindow::Empty;
+    }
+    if keep_below && edge >= 1.0 - 1.0e-4 {
+        return MaskWindow::All;
+    }
+    if !keep_below && edge <= 1.0e-4 {
+        return MaskWindow::All;
+    }
+    let angle = angle_deg.rem_euclid(360.0);
+    let rect = if angle < 0.51 || angle > 359.49 {
+        if keep_below {
+            (0.0, 0.0, edge, 1.0)
+        } else {
+            (edge, 0.0, 1.0, 1.0)
+        }
+    } else if (angle - 90.0).abs() < 0.51 {
+        if keep_below {
+            (0.0, 0.0, 1.0, edge)
+        } else {
+            (0.0, edge, 1.0, 1.0)
+        }
+    } else if (angle - 180.0).abs() < 0.51 {
+        if keep_below {
+            (1.0 - edge, 0.0, 1.0, 1.0)
+        } else {
+            (0.0, 0.0, 1.0 - edge, 1.0)
+        }
+    } else if (angle - 270.0).abs() < 0.51 {
+        if keep_below {
+            (0.0, 1.0 - edge, 1.0, 1.0)
+        } else {
+            (0.0, 0.0, 1.0, 1.0 - edge)
+        }
+    } else {
+        return MaskWindow::PerPixel;
+    };
+    if rect.2 - rect.0 < 1.0e-4 || rect.3 - rect.1 < 1.0e-4 {
+        MaskWindow::Empty
+    } else {
+        MaskWindow::Uv {
+            u0: rect.0,
+            v0: rect.1,
+            u1: rect.2,
+            v1: rect.3,
+        }
+    }
+}
+
+pub fn mask_allows(mask: CanvasMask, u: f32, v: f32) -> bool {
+    let CanvasMask::Wipe {
+        angle_deg,
+        edge,
+        keep_below,
+    } = mask
+    else {
+        return true;
+    };
+    let (sin, cos) = angle_deg.to_radians().sin_cos();
+    let t = wipe_t(cos, sin, u, v);
+    if keep_below {
+        t <= edge
+    } else {
+        t > edge
+    }
+}
+
+fn wipe_t(nx: f32, ny: f32, u: f32, v: f32) -> f32 {
+    let proj = nx * u + ny * v;
+    let min = nx.min(0.0) + ny.min(0.0);
+    let max = nx.max(0.0) + ny.max(0.0);
+    (proj - min) / (max - min).max(1.0e-6)
+}
+
+pub fn place_from_transform(xform: &Transform, rel: i64, mix: f32) -> Place {
+    Place {
+        scale_x: xform.scale_x.value_at(rel).max(0.01),
+        scale_y: xform.scale_y.value_at(rel).max(0.01),
+        pos_x: xform.position_x.value_at(rel),
+        pos_y: xform.position_y.value_at(rel),
+        rotation: xform.rotation_deg.value_at(rel),
+        anchor_x: xform.anchor_x.value_at(rel),
+        anchor_y: xform.anchor_y.value_at(rel),
+        opacity: (xform.opacity.value_at(rel) * mix).clamp(0.0, 1.0),
+        shift_x: 0.0,
+        shift_y: 0.0,
+        mask: CanvasMask::None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Place {
+    pub scale_x: f32,
+    pub scale_y: f32,
+    pub pos_x: f32,
+    pub pos_y: f32,
+    pub rotation: f32,
+    pub anchor_x: f32,
+    pub anchor_y: f32,
+    pub opacity: f32,
+    /// Extra sequence-pixel slide. Push transitions set this.
+    pub shift_x: f32,
+    pub shift_y: f32,
+    pub mask: CanvasMask,
+}
+
+impl Place {
+    pub fn identity() -> Self {
+        Self {
+            scale_x: 1.0,
+            scale_y: 1.0,
+            pos_x: 0.0,
+            pos_y: 0.0,
+            rotation: 0.0,
+            anchor_x: 0.5,
+            anchor_y: 0.5,
+            opacity: 1.0,
+            shift_x: 0.0,
+            shift_y: 0.0,
+            mask: CanvasMask::None,
+        }
+    }
+
+    pub fn contributes(self) -> bool {
+        self.opacity > 0.001 && !matches!(mask_window(self.mask), MaskWindow::Empty)
+    }
+}
+
+pub struct BlitLayer<'a> {
+    pub rgba: &'a [u8],
+    pub width: u32,
+    pub height: u32,
+    pub grade: GradeSample,
+    pub place: Place,
+}
+
+/// One decoded layer, bottom to top. Higher timeline tracks are later.
+#[derive(Clone, Debug)]
+pub struct ProgramLayer {
+    pub path: String,
+    pub source_frame: i64,
+    pub time_secs: f64,
+    pub frame_secs: f64,
+    pub last_source_frame: i64,
+    pub width: u32,
+    pub height: u32,
+    pub grade: GradeSample,
+    pub place: Place,
+    pub label: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProgramStack {
+    pub layers: Vec<ProgramLayer>,
+    /// Offline or missing media that a visible clip wanted. Preview drops these
+    /// when another layer still draws. Export fails on the first one.
+    pub errors: Vec<String>,
+}
+
+pub fn program_stack(
+    sequence: &Sequence,
+    media: &[MediaAsset],
+    playhead: i64,
+    canvas_w: u32,
+    canvas_h: u32,
+) -> ProgramStack {
+    let mut layers = Vec::new();
+    let mut errors = Vec::new();
+    if canvas_w < 2 || canvas_h < 2 {
+        return ProgramStack { layers, errors };
+    }
+    let seq_w = sequence.width.max(1) as f32;
+    let seq_h = sequence.height.max(1) as f32;
+    for track in sequence.tracks.iter().filter(|track| {
+        track.kind == TrackKind::Video && video_track_visible(track, &sequence.tracks)
+    }) {
+        if let Some(hit) = transition_hit(track, playhead) {
+            for (clip, outgoing) in [(hit.left, true), (hit.right, false)] {
+                match layer_from_clip(sequence, track, clip, media, playhead, canvas_w, canvas_h) {
+                    Ok(Some(mut layer)) => {
+                        layer.place = apply_transition(
+                            layer.place,
+                            &hit.kind,
+                            hit.progress,
+                            outgoing,
+                            seq_w,
+                            seq_h,
+                        );
+                        // The transition can change scale-1 geometry into a slide,
+                        // so the decode size has to follow the final place.
+                        let (width, height) = layer_pixel_size(canvas_w, canvas_h, &layer.place);
+                        layer.width = width;
+                        layer.height = height;
+                        layers.push(layer);
+                    }
+                    Ok(None) => {}
+                    Err(message) => errors.push(message),
+                }
+            }
+        } else if let Some(clip) = track
+            .clips
+            .iter()
+            .find(|clip| clip.enabled && clip.covers(Frame(playhead)))
+        {
+            match layer_from_clip(sequence, track, clip, media, playhead, canvas_w, canvas_h) {
+                Ok(Some(layer)) => layers.push(layer),
+                Ok(None) => {}
+                Err(message) => errors.push(message),
+            }
+        }
+    }
+    ProgramStack { layers, errors }
+}
+
+pub fn video_track_visible(track: &Track, tracks: &[Track]) -> bool {
+    if track.muted {
+        return false;
+    }
+    let any_solo = tracks
+        .iter()
+        .any(|item| item.kind == track.kind && item.solo);
+    if any_solo {
+        track.solo
+    } else {
+        true
+    }
+}
+
+struct TransHit<'a> {
+    kind: TransitionKind,
+    progress: f32,
+    left: &'a Clip,
+    right: &'a Clip,
+}
+
+fn transition_hit(track: &Track, playhead: i64) -> Option<TransHit<'_>> {
+    for transition in &track.transitions {
+        let Some(left) = track
+            .clips
+            .iter()
+            .find(|clip| clip.id == transition.left_clip)
+        else {
+            continue;
+        };
+        let Some(right) = track
+            .clips
+            .iter()
+            .find(|clip| clip.id == transition.right_clip)
+        else {
+            continue;
+        };
+        let Some(progress) = transition.progress(left.timeline_out, Frame(playhead)) else {
+            continue;
+        };
+        return Some(TransHit {
+            kind: transition.kind.clone(),
+            progress,
+            left,
+            right,
+        });
+    }
+    None
+}
+
+fn layer_from_clip(
+    sequence: &Sequence,
+    track: &Track,
+    clip: &Clip,
+    media: &[MediaAsset],
+    playhead: i64,
+    canvas_w: u32,
+    canvas_h: u32,
+) -> Result<Option<ProgramLayer>, String> {
+    if !clip.enabled {
+        return Ok(None);
+    }
+    let rel = clip_relative(Frame(playhead), clip.timeline_in);
+    let xform = transform(&clip.effects)
+        .cloned()
+        .unwrap_or_else(Transform::identity);
+    let place = place_from_transform(&xform, rel, 1.0);
+    if place.opacity <= 0.001 {
+        return Ok(None);
+    }
+    let media_id = clip
+        .media_id
+        .ok_or_else(|| format!("No media linked to {}", clip.name))?;
+    let asset = media
+        .iter()
+        .find(|item| item.id == media_id)
+        .ok_or_else(|| format!("Missing media for {}", clip.name))?;
+    if !asset.has_video {
+        return Err(format!("{} has no picture", asset.name));
+    }
+    let resolved = crate::resolve_media_path(&asset.path);
+    if !resolved.is_file() {
+        return Err(format!("Offline — {} is not on disk", asset.name));
+    }
+    let (width, height) = layer_pixel_size(canvas_w, canvas_h, &place);
+    let mut source_frame = source_frame_at(clip, Frame(playhead), sequence.timebase)
+        .0
+        .max(0);
+    let last_source_frame = asset.duration.0.saturating_sub(1).max(0);
+    if source_frame > last_source_frame {
+        source_frame = last_source_frame;
+    }
+    let duration_secs = asset.duration.to_seconds(asset.timebase);
+    let raw_time = Frame(source_frame).to_seconds(clip.media_timebase);
+    let time_secs = crate::clamp_preview_time(raw_time, duration_secs).unwrap_or(0.0);
+    Ok(Some(ProgramLayer {
+        path: resolved.to_string_lossy().into_owned(),
+        source_frame,
+        time_secs,
+        frame_secs: clip.media_timebase.frame_duration_secs().max(1.0e-4),
+        last_source_frame,
+        width,
+        height,
+        grade: GradeSample::from_effects(&clip.effects, rel),
+        place,
+        label: format!("{}  {}", track.name, clip.name),
+    }))
+}
+
+fn layer_pixel_size(canvas_w: u32, canvas_h: u32, place: &Place) -> (u32, u32) {
+    let (w, h) = if identity_geom(place) {
+        (canvas_w, canvas_h)
+    } else {
+        (
+            (canvas_w as f32 * place.scale_x).round().max(2.0) as u32,
+            (canvas_h as f32 * place.scale_y).round().max(2.0) as u32,
+        )
+    };
+    even_cap(w, h)
+}
+
+fn even_cap(width: u32, height: u32) -> (u32, u32) {
+    let max = crate::MAX_PREVIEW_DIMENSION;
+    let w = (width.min(max).max(2)) & !1;
+    let h = (height.min(max).max(2)) & !1;
+    (w, h)
+}
+
+fn identity_geom(place: &Place) -> bool {
+    (place.scale_x - 1.0).abs() < 0.01
+        && (place.scale_y - 1.0).abs() < 0.01
+        && place.pos_x.abs() < 0.5
+        && place.pos_y.abs() < 0.5
+        && place.shift_x.abs() < 0.5
+        && place.shift_y.abs() < 0.5
+        && place.rotation.abs() < 0.05
+        && (place.anchor_x - 0.5).abs() < 0.01
+        && (place.anchor_y - 0.5).abs() < 0.01
+}
+
+pub fn composite(
+    dst_w: u32,
+    dst_h: u32,
+    seq_w: f32,
+    seq_h: f32,
+    layers: &[BlitLayer<'_>],
+) -> Vec<u8> {
+    let len = (dst_w as usize)
+        .checked_mul(dst_h as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .unwrap_or(0);
+    let mut dst = vec![0u8; len];
+    if dst_w == 0 || dst_h == 0 || seq_w <= 1.0 || seq_h <= 1.0 {
+        return dst;
+    }
+    for layer in layers {
+        if !layer.place.contributes()
+            || layer.rgba.len() < 4
+            || layer.width == 0
+            || layer.height == 0
+        {
+            continue;
+        }
+        if straight_full_frame(layer, dst_w, dst_h) {
+            match mask_window(layer.place.mask) {
+                MaskWindow::Empty => {}
+                MaskWindow::All => grade_over(&mut dst, dst_w, dst_h, layer, 0, 0, dst_w, dst_h),
+                MaskWindow::Uv { u0, v0, u1, v1 } => {
+                    let x0 = (u0.clamp(0.0, 1.0) * dst_w as f32).floor() as u32;
+                    let y0 = (v0.clamp(0.0, 1.0) * dst_h as f32).floor() as u32;
+                    let x1 = (u1.clamp(0.0, 1.0) * dst_w as f32).ceil() as u32;
+                    let y1 = (v1.clamp(0.0, 1.0) * dst_h as f32).ceil() as u32;
+                    grade_over(&mut dst, dst_w, dst_h, layer, x0, y0, x1, y1);
+                }
+                MaskWindow::PerPixel => grade_over_masked(&mut dst, dst_w, dst_h, layer),
+            }
+        } else {
+            blit(&mut dst, dst_w, dst_h, seq_w, seq_h, layer);
+        }
+    }
+    dst
+}
+
+fn straight_full_frame(layer: &BlitLayer<'_>, dst_w: u32, dst_h: u32) -> bool {
+    layer.width == dst_w && layer.height == dst_h && identity_geom(&layer.place)
+}
+
+fn grade_over(
+    dst: &mut [u8],
+    dst_w: u32,
+    dst_h: u32,
+    layer: &BlitLayer<'_>,
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+) {
+    let x0 = x0.min(dst_w).min(layer.width);
+    let x1 = x1.min(dst_w).min(layer.width).max(x0);
+    let y0 = y0.min(dst_h).min(layer.height);
+    let y1 = y1.min(dst_h).min(layer.height).max(y0);
+    let neutral = layer.grade.is_neutral();
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let index = (y as usize * dst_w as usize + x as usize) * 4;
+            let src_index = (y as usize * layer.width as usize + x as usize) * 4;
+            if src_index + 3 >= layer.rgba.len() || index + 3 >= dst.len() {
+                continue;
+            }
+            let src = &layer.rgba[src_index..src_index + 4];
+            let rgb = if neutral {
+                [
+                    src[0] as f32 / 255.0,
+                    src[1] as f32 / 255.0,
+                    src[2] as f32 / 255.0,
+                ]
+            } else {
+                layer.grade.apply([
+                    src[0] as f32 / 255.0,
+                    src[1] as f32 / 255.0,
+                    src[2] as f32 / 255.0,
+                ])
+            };
+            let alpha = src[3] as f32 / 255.0 * layer.place.opacity;
+            over(&mut dst[index..index + 4], rgb, alpha);
+        }
+    }
+}
+
+fn grade_over_masked(dst: &mut [u8], dst_w: u32, dst_h: u32, layer: &BlitLayer<'_>) {
+    for y in 0..dst_h.min(layer.height) {
+        for x in 0..dst_w.min(layer.width) {
+            let u = (x as f32 + 0.5) / dst_w as f32;
+            let v = (y as f32 + 0.5) / dst_h as f32;
+            if !mask_allows(layer.place.mask, u, v) {
+                continue;
+            }
+            let index = (y as usize * dst_w as usize + x as usize) * 4;
+            let src_index = (y as usize * layer.width as usize + x as usize) * 4;
+            if src_index + 3 >= layer.rgba.len() || index + 3 >= dst.len() {
+                continue;
+            }
+            let src = &layer.rgba[src_index..src_index + 4];
+            let rgb = layer.grade.apply([
+                src[0] as f32 / 255.0,
+                src[1] as f32 / 255.0,
+                src[2] as f32 / 255.0,
+            ]);
+            let alpha = src[3] as f32 / 255.0 * layer.place.opacity;
+            over(&mut dst[index..index + 4], rgb, alpha);
+        }
+    }
+}
+
+fn blit(dst: &mut [u8], dst_w: u32, dst_h: u32, seq_w: f32, seq_h: f32, layer: &BlitLayer<'_>) {
+    let place = layer.place;
+    let sx = dst_w as f32 / seq_w;
+    let sy = dst_h as f32 / seq_h;
+    let disp_w = (dst_w as f32 * place.scale_x).max(1.0);
+    let disp_h = (dst_h as f32 * place.scale_y).max(1.0);
+    let center_x = dst_w as f32 * 0.5 + (place.pos_x + place.shift_x) * sx;
+    let center_y = dst_h as f32 * 0.5 - (place.pos_y + place.shift_y) * sy;
+    let local_anchor_x = (place.anchor_x - 0.5) * disp_w;
+    let local_anchor_y = (0.5 - place.anchor_y) * disp_h;
+    let (anchor_rx, anchor_ry) = if place.rotation.abs() < 0.05 {
+        (local_anchor_x, local_anchor_y)
+    } else {
+        rotate(local_anchor_x, local_anchor_y, place.rotation)
+    };
+    let origin_x = center_x - anchor_rx;
+    let origin_y = center_y - anchor_ry;
+    let (bx0, by0, bx1, by1) = match mask_window(place.mask) {
+        MaskWindow::Empty => return,
+        MaskWindow::All | MaskWindow::PerPixel => (0, 0, dst_w as i32, dst_h as i32),
+        MaskWindow::Uv { u0, v0, u1, v1 } => (
+            (u0.clamp(0.0, 1.0) * dst_w as f32).floor() as i32,
+            (v0.clamp(0.0, 1.0) * dst_h as f32).floor() as i32,
+            (u1.clamp(0.0, 1.0) * dst_w as f32).ceil() as i32,
+            (v1.clamp(0.0, 1.0) * dst_h as f32).ceil() as i32,
+        ),
+    };
+    let radius = (disp_w.hypot(disp_h) * 0.5 + 2.0) as i32;
+    let min_y = (origin_y as i32 - radius)
+        .clamp(by0, by1)
+        .clamp(0, dst_h as i32);
+    let max_y = (origin_y as i32 + radius + 1)
+        .clamp(by0, by1)
+        .clamp(0, dst_h as i32);
+    let min_x = (origin_x as i32 - radius)
+        .clamp(bx0, bx1)
+        .clamp(0, dst_w as i32);
+    let max_x = (origin_x as i32 + radius + 1)
+        .clamp(bx0, bx1)
+        .clamp(0, dst_w as i32);
+    let src_w = layer.width as i32;
+    let src_h = layer.height as i32;
+    let upright = place.rotation.abs() < 0.05;
+    let per_pixel = matches!(mask_window(place.mask), MaskWindow::PerPixel);
+    for y in min_y..max_y {
+        for x in min_x..max_x {
+            if per_pixel {
+                let u = (x as f32 + 0.5) / dst_w as f32;
+                let v = (y as f32 + 0.5) / dst_h as f32;
+                if !mask_allows(place.mask, u, v) {
+                    continue;
+                }
+            }
+            let (local_x, local_y) = if upright {
+                (x as f32 + 0.5 - origin_x, y as f32 + 0.5 - origin_y)
+            } else {
+                rotate(
+                    x as f32 + 0.5 - origin_x,
+                    y as f32 + 0.5 - origin_y,
+                    -place.rotation,
+                )
+            };
+            if local_x.abs() > disp_w * 0.5 || local_y.abs() > disp_h * 0.5 {
+                continue;
+            }
+            let u = local_x / disp_w + 0.5;
+            let v = local_y / disp_h + 0.5;
+            let sample = sample(
+                layer.rgba,
+                src_w,
+                src_h,
+                u * src_w as f32 - 0.5,
+                v * src_h as f32 - 0.5,
+            );
+            let rgb = layer.grade.apply([sample[0], sample[1], sample[2]]);
+            let alpha = sample[3] * place.opacity;
+            let index = (y as usize * dst_w as usize + x as usize) * 4;
+            if index + 3 < dst.len() {
+                over(&mut dst[index..index + 4], rgb, alpha);
+            }
+        }
+    }
+}
+
+fn sample(src: &[u8], width: i32, height: i32, x: f32, y: f32) -> [f32; 4] {
+    if width <= 0 || height <= 0 {
+        return [0.0; 4];
+    }
+    let x0 = x.floor() as i32;
+    let y0 = y.floor() as i32;
+    let tx = x - x0 as f32;
+    let ty = y - y0 as f32;
+    let p00 = pixel(src, width, height, x0, y0);
+    let p10 = pixel(src, width, height, x0 + 1, y0);
+    let p01 = pixel(src, width, height, x0, y0 + 1);
+    let p11 = pixel(src, width, height, x0 + 1, y0 + 1);
+    let mut out = [0.0; 4];
+    for channel in 0..4 {
+        let top = p00[channel] + (p10[channel] - p00[channel]) * tx;
+        let bottom = p01[channel] + (p11[channel] - p01[channel]) * tx;
+        out[channel] = top + (bottom - top) * ty;
+    }
+    out
+}
+
+fn pixel(src: &[u8], width: i32, height: i32, x: i32, y: i32) -> [f32; 4] {
+    if x < 0 || y < 0 || x >= width || y >= height {
+        return [0.0; 4];
+    }
+    let index = (y as usize * width as usize + x as usize) * 4;
+    if index + 3 >= src.len() {
+        return [0.0; 4];
+    }
+    [
+        src[index] as f32 / 255.0,
+        src[index + 1] as f32 / 255.0,
+        src[index + 2] as f32 / 255.0,
+        src[index + 3] as f32 / 255.0,
+    ]
+}
+
+fn over(dst: &mut [u8], rgb: [f32; 3], src_a: f32) {
+    if src_a <= 0.001 {
+        return;
+    }
+    let src_a = src_a.clamp(0.0, 1.0);
+    let dst_a = dst[3] as f32 / 255.0;
+    let out_a = src_a + dst_a * (1.0 - src_a);
+    if out_a <= 1.0e-4 {
+        return;
+    }
+    for channel in 0..3 {
+        let src = rgb[channel];
+        let old = dst[channel] as f32 / 255.0;
+        let mixed = (src * src_a + old * dst_a * (1.0 - src_a)) / out_a;
+        dst[channel] = (mixed.clamp(0.0, 1.0) * 255.0).round() as u8;
+    }
+    dst[3] = (out_a.clamp(0.0, 1.0) * 255.0).round() as u8;
+}
+
+fn rotate(x: f32, y: f32, degrees: f32) -> (f32, f32) {
+    let (sin, cos) = degrees.to_radians().sin_cos();
+    (x * cos - y * sin, x * sin + y * cos)
+}
+
+/// Caption layout shared by the monitor burn-in and export.
+///
+/// The bitmap is 8×8. Scale 4 at 1080p is a 32px cap, with a 48px bottom
+/// margin — the same safe area the previous drawtext used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CaptionStyle {
+    pub scale: u32,
+    pub glyph: u32,
+    pub margin: u32,
+}
+
+pub fn caption_style(canvas_h: u32) -> CaptionStyle {
+    let scale = ((canvas_h as f32) / 270.0).round().clamp(1.0, 8.0) as u32;
+    let margin = ((canvas_h as f32) * 48.0 / 1080.0).round().clamp(6.0, 96.0) as u32;
+    CaptionStyle {
+        scale,
+        glyph: 8 * scale,
+        margin,
+    }
+}
+
+pub fn active_captions(sequence: &Sequence, frame: i64) -> Vec<String> {
+    let mut lines = Vec::new();
+    for track in &sequence.tracks {
+        if track.kind != TrackKind::Caption || track.muted {
+            continue;
+        }
+        for cue in &track.cues {
+            if frame >= cue.timeline_in.0 && frame < cue.timeline_out.0 {
+                let text = cue.text.replace(['\n', '\r'], " ").trim().to_string();
+                if !text.is_empty() {
+                    lines.push(text);
+                }
+            }
+        }
+    }
+    lines
+}
+
+pub fn burn_captions(rgba: &mut [u8], width: u32, height: u32, lines: &[String]) {
+    if lines.is_empty() || width < 8 || height < 8 {
+        return;
+    }
+    let style = caption_style(height);
+    let gap = style.scale;
+    let n = lines.len() as u32;
+    let block = style.glyph * n + gap * n.saturating_sub(1);
+    let mut y = height.saturating_sub(style.margin.saturating_add(block));
+    for line in lines {
+        draw_line(rgba, width, height, y, line, style.scale);
+        y = y.saturating_add(style.glyph + gap);
+    }
+}
+
+fn draw_line(rgba: &mut [u8], width: u32, height: u32, y: u32, text: &str, scale: u32) {
+    let advance = 8 * scale;
+    let chars: Vec<char> = text.chars().take(180).collect();
+    if chars.is_empty() {
+        return;
+    }
+    let text_w = advance * chars.len() as u32;
+    let mut x = width.saturating_sub(text_w) / 2;
+    for ch in &chars {
+        if let Some(glyph) = glyph_rows(*ch) {
+            stamp_glyph(
+                rgba,
+                width,
+                height,
+                x as i32,
+                y as i32,
+                &glyph,
+                scale,
+                [0, 0, 0, 255],
+                true,
+            );
+        }
+        x = x.saturating_add(advance);
+    }
+    x = width.saturating_sub(text_w) / 2;
+    for ch in &chars {
+        if let Some(glyph) = glyph_rows(*ch) {
+            stamp_glyph(
+                rgba,
+                width,
+                height,
+                x as i32,
+                y as i32,
+                &glyph,
+                scale,
+                [255, 255, 255, 255],
+                false,
+            );
+        }
+        x = x.saturating_add(advance);
+    }
+}
+
+fn glyph_rows(ch: char) -> Option<[u8; 8]> {
+    font8x8::BASIC_FONTS
+        .get(ch)
+        .or_else(|| font8x8::BASIC_FONTS.get(ch.to_ascii_uppercase()))
+}
+
+fn stamp_glyph(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    origin_x: i32,
+    origin_y: i32,
+    rows: &[u8; 8],
+    scale: u32,
+    color: [u8; 4],
+    outline: bool,
+) {
+    let scale = scale.max(1) as i32;
+    for (row, bits) in rows.iter().enumerate() {
+        for col in 0..8 {
+            if bits & (1 << col) == 0 {
+                continue;
+            }
+            let x = origin_x + col * scale;
+            let y = origin_y + row as i32 * scale;
+            if outline {
+                fill_rect(
+                    rgba,
+                    width,
+                    height,
+                    x - 1,
+                    y - 1,
+                    scale + 2,
+                    scale + 2,
+                    color,
+                );
+            } else {
+                fill_rect(rgba, width, height, x, y, scale, scale, color);
+            }
+        }
+    }
+}
+
+fn fill_rect(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    color: [u8; 4],
+) {
+    for py in y..(y + h) {
+        if py < 0 || py >= height as i32 {
+            continue;
+        }
+        for px in x..(x + w) {
+            if px < 0 || px >= width as i32 {
+                continue;
+            }
+            let index = (py as usize * width as usize + px as usize) * 4;
+            if index + 3 < rgba.len() {
+                rgba[index..index + 4].copy_from_slice(&color);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use editor_core::{MediaId, SequenceId, TrackId};
+
+    fn solid(w: u32, h: u32, rgba: [u8; 4]) -> Vec<u8> {
+        let mut pixels = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..w * h {
+            pixels.extend_from_slice(&rgba);
+        }
+        pixels
+    }
+
+    fn layer<'a>(src: &'a [u8], w: u32, h: u32, place: Place, grade: GradeSample) -> BlitLayer<'a> {
+        BlitLayer {
+            rgba: src,
+            width: w,
+            height: h,
+            grade,
+            place,
+        }
+    }
+
+    #[test]
+    fn exposure_lifts_a_mid_grey_and_neutral_holds() {
+        let grade = GradeSample {
+            exposure: 1.0,
+            ..GradeSample::neutral()
+        };
+        let lifted = grade.apply([0.5, 0.5, 0.5]);
+        assert!(lifted[0] > 0.9, "{lifted:?}");
+        let neutral = GradeSample::neutral().apply([0.25, 0.5, 0.75]);
+        assert!((neutral[1] - 0.5).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn shadows_lift_darks_more_than_whites_and_warmth_is_red() {
+        let shadows = GradeSample {
+            shadows: 1.0,
+            ..GradeSample::neutral()
+        };
+        let dark = shadows.apply([0.05, 0.05, 0.05]);
+        let bright = shadows.apply([0.9, 0.9, 0.9]);
+        assert!(dark[0] - 0.05 > bright[0] - 0.9 + 0.05);
+        let warm = GradeSample {
+            temperature: 1.0,
+            ..GradeSample::neutral()
+        }
+        .apply([0.5, 0.5, 0.5]);
+        assert!(warm[0] > warm[2]);
+    }
+
+    #[test]
+    fn full_frame_grade_and_opacity_composite() {
+        let src = solid(2, 2, [128, 128, 128, 255]);
+        let layers = [layer(
+            &src,
+            2,
+            2,
+            Place {
+                opacity: 0.5,
+                ..Place::identity()
+            },
+            GradeSample {
+                exposure: 1.0,
+                ..GradeSample::neutral()
+            },
+        )];
+        let out = composite(2, 2, 2.0, 2.0, &layers);
+        assert!(out[0] > 180, "{}", out[0]);
+        assert!((out[3] as i32 - 128).abs() < 2, "{}", out[3]);
+    }
+
+    #[test]
+    fn dissolve_is_a_linear_mix_over_an_opaque_plate() {
+        let red = solid(2, 2, [200, 0, 0, 255]);
+        let blue = solid(2, 2, [0, 0, 200, 255]);
+        let layers = [
+            layer(&red, 2, 2, Place::identity(), GradeSample::neutral()),
+            layer(
+                &blue,
+                2,
+                2,
+                Place {
+                    opacity: 0.5,
+                    ..Place::identity()
+                },
+                GradeSample::neutral(),
+            ),
+        ];
+        let out = composite(2, 2, 2.0, 2.0, &layers);
+        assert!((out[0] as i32 - 100).abs() <= 1, "{}", out[0]);
+        assert!((out[2] as i32 - 100).abs() <= 1, "{}", out[2]);
+        assert_eq!(out[3], 255);
+    }
+
+    #[test]
+    fn wipe_angle_zero_keeps_the_left_half_and_ninety_the_top() {
+        let src = solid(4, 4, [0, 200, 0, 255]);
+        let left = layer(
+            &src,
+            4,
+            4,
+            Place {
+                mask: CanvasMask::Wipe {
+                    angle_deg: 0.0,
+                    edge: 0.5,
+                    keep_below: true,
+                },
+                ..Place::identity()
+            },
+            GradeSample::neutral(),
+        );
+        let out = composite(4, 4, 4.0, 4.0, &[left]);
+        assert_eq!(out[3], 255, "left pixel");
+        assert_eq!(out[(2 * 4) as usize + 3], 0, "right pixel");
+
+        let top = layer(
+            &src,
+            4,
+            4,
+            Place {
+                mask: CanvasMask::Wipe {
+                    angle_deg: 90.0,
+                    edge: 0.5,
+                    keep_below: true,
+                },
+                ..Place::identity()
+            },
+            GradeSample::neutral(),
+        );
+        let out = composite(4, 4, 4.0, 4.0, &[top]);
+        assert_eq!(out[3], 255, "top pixel");
+        assert_eq!(out[(2 * 4 * 4) as usize + 3], 0, "bottom pixel");
+    }
+
+    #[test]
+    fn push_left_slides_a_full_frame_off_the_canvas() {
+        let src = solid(4, 2, [10, 20, 30, 255]);
+        let parked = layer(
+            &src,
+            4,
+            2,
+            Place {
+                shift_x: 4.0,
+                ..Place::identity()
+            },
+            GradeSample::neutral(),
+        );
+        let out = composite(4, 2, 4.0, 2.0, &[parked]);
+        assert!(out.iter().all(|byte| *byte == 0));
+        let motion = transition_motion(
+            &TransitionKind::PushSlide {
+                direction: Direction::Left,
+            },
+            0.0,
+            false,
+            100.0,
+            40.0,
+        );
+        assert!((motion.shift_x - 100.0).abs() < 1.0e-3);
+        let mid = transition_motion(
+            &TransitionKind::PushSlide {
+                direction: Direction::Left,
+            },
+            0.5,
+            true,
+            100.0,
+            40.0,
+        );
+        assert!((mid.shift_x - (-50.0)).abs() < 1.0e-3);
+    }
+
+    #[test]
+    fn anchor_moves_the_opaque_centroid() {
+        let src = solid(4, 4, [255, 255, 255, 255]);
+        let centered = composite(
+            16,
+            16,
+            16.0,
+            16.0,
+            &[layer(
+                &src,
+                4,
+                4,
+                Place {
+                    scale_x: 0.5,
+                    scale_y: 0.5,
+                    ..Place::identity()
+                },
+                GradeSample::neutral(),
+            )],
+        );
+        let corner = composite(
+            16,
+            16,
+            16.0,
+            16.0,
+            &[layer(
+                &src,
+                4,
+                4,
+                Place {
+                    scale_x: 0.5,
+                    scale_y: 0.5,
+                    anchor_x: 0.0,
+                    anchor_y: 0.0,
+                    ..Place::identity()
+                },
+                GradeSample::neutral(),
+            )],
+        );
+        let a = centroid(&centered, 16, 16);
+        let b = centroid(&corner, 16, 16);
+        assert!(b.0 > a.0 + 1.0, "{a:?} -> {b:?}");
+        assert!(b.1 < a.1 - 1.0, "{a:?} -> {b:?}");
+    }
+
+    fn centroid(rgba: &[u8], w: u32, h: u32) -> (f32, f32) {
+        let mut sx = 0.0;
+        let mut sy = 0.0;
+        let mut n = 0.0;
+        for y in 0..h {
+            for x in 0..w {
+                let index = (y * w + x) as usize * 4;
+                if rgba[index + 3] > 200 {
+                    sx += x as f32;
+                    sy += y as f32;
+                    n += 1.0;
+                }
+            }
+        }
+        assert!(n > 0.0);
+        (sx / n, sy / n)
+    }
+
+    #[test]
+    fn caption_burn_writes_white_pixels_in_the_safe_area() {
+        let mut rgba = vec![0u8; 96 * 64 * 4];
+        burn_captions(&mut rgba, 96, 64, &["Hi".into()]);
+        let style = caption_style(64);
+        let mut white = 0;
+        for y in 0..64 {
+            for x in 0..96 {
+                let index = (y * 96 + x) * 4;
+                if rgba[index] > 240 && rgba[index + 1] > 240 && rgba[index + 2] > 240 {
+                    white += 1;
+                    assert!(
+                        y + 2 >= 64 - style.margin as usize - style.glyph as usize,
+                        "glyph y {y} is above the caption band"
+                    );
+                }
+            }
+        }
+        assert!(white > 8, "burned caption produced {white} white pixels");
+    }
+
+    #[test]
+    fn demo_stacks_pip_above_a_graded_base_and_dissolves() {
+        let project = editor_core::demo_project();
+        let sequence = project.active().unwrap();
+        let pip = program_stack(sequence, &project.media, 60, 320, 180);
+        assert!(pip.errors.is_empty(), "{:?}", pip.errors);
+        assert_eq!(pip.layers.len(), 2, "base plus picture-in-picture");
+        assert!(pip.layers[0].place.scale_x > 0.9);
+        assert!(pip.layers[1].place.scale_x < 0.5);
+        assert!(pip.layers[1].place.pos_x > 400.0);
+        assert!(pip.layers[0].grade.temperature > 0.2);
+        assert!(pip.layers[0].grade.exposure > 0.1);
+        let lines = active_captions(sequence, 60);
+        assert!(lines.iter().any(|line| line.contains("ridge")));
+
+        let dissolve = program_stack(sequence, &project.media, 144, 320, 180);
+        assert_eq!(dissolve.layers.len(), 2);
+        assert!((dissolve.layers[0].place.opacity - 1.0).abs() < 1.0e-3);
+        assert!((dissolve.layers[1].place.opacity - 0.5).abs() < 1.0e-3);
+        assert!(matches!(dissolve.layers[0].place.mask, CanvasMask::None));
+
+        let wipe = program_stack(sequence, &project.media, 264, 320, 180);
+        assert_eq!(wipe.layers.len(), 2);
+        match wipe.layers[1].place.mask {
+            CanvasMask::Wipe {
+                angle_deg,
+                edge,
+                keep_below,
+            } => {
+                assert!((angle_deg - 90.0).abs() < 1.0e-3);
+                assert!((edge - 0.5).abs() < 1.0e-3);
+                assert!(keep_below);
+            }
+            other => panic!("incoming wipe mask was {other:?}"),
+        }
+    }
+
+    #[test]
+    fn higher_track_is_later_and_a_muted_track_is_absent() {
+        let dir = std::env::temp_dir().join(format!("meridian-stack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clip.mp4");
+        std::fs::write(&path, b"media").unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let mut sequence = Sequence::new(
+            SequenceId(1),
+            "Cut",
+            64,
+            36,
+            editor_core::Timebase::fps_24(),
+        );
+        sequence.add_track(TrackId(2), TrackKind::Video, "V1");
+        sequence.add_track(TrackId(3), TrackKind::Video, "V2");
+        let mut base = Clip::basic(10, 0, 12);
+        base.media_id = Some(MediaId(1));
+        base.name = "BASE".into();
+        let mut top = Clip::basic(11, 0, 12);
+        top.media_id = Some(MediaId(1));
+        top.name = "TOP".into();
+        let mut xform = Transform::identity();
+        xform.opacity.base = 0.4;
+        top.effects.push(editor_core::Effect::Transform(xform));
+        sequence.tracks[0].clips = vec![base];
+        sequence.tracks[1].clips = vec![top];
+        let asset = MediaAsset {
+            id: MediaId(1),
+            bin_id: editor_core::BinId(1),
+            name: "clip".into(),
+            path: path.clone(),
+            duration: Frame(24),
+            timebase: editor_core::Timebase::fps_24(),
+            width: Some(64),
+            height: Some(36),
+            video_codec: Some("h264".into()),
+            audio_codec: None,
+            audio_channels: None,
+            sample_rate: None,
+            has_video: true,
+            has_audio: false,
+            offline: false,
+        };
+        let stack = program_stack(&sequence, &[asset.clone()], 2, 64, 36);
+        assert_eq!(stack.layers.len(), 2);
+        assert!(stack.layers[0].label.contains("BASE"));
+        assert!(stack.layers[1].label.contains("TOP"));
+        assert!((stack.layers[1].place.opacity - 0.4).abs() < 1.0e-3);
+        sequence.tracks[0].muted = true;
+        let stack = program_stack(&sequence, &[asset], 2, 64, 36);
+        assert_eq!(stack.layers.len(), 1);
+        assert!(stack.layers[0].label.contains("TOP"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

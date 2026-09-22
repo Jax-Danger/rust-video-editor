@@ -19,7 +19,12 @@ const LOOKAHEAD: i64 = 8;
 /// `lead` is how many frames before `source_frame` to include. Playback passes
 /// `0` (the burst runs forward from the playhead). Scrubbing and reverse pass
 /// a lead so the frames under the pointer are inside the cached window.
-pub fn burst_origin(source_frame: i64, last_source_frame: i64, burst: u32, lead: u32) -> (i64, u32) {
+pub fn burst_origin(
+    source_frame: i64,
+    last_source_frame: i64,
+    burst: u32,
+    lead: u32,
+) -> (i64, u32) {
     let last = last_source_frame.max(0);
     let burst = burst.clamp(1, MAX_BURST);
     if source_frame > last {

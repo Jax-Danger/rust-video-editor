@@ -164,7 +164,8 @@ impl AudioEngine {
             live.clock = None;
             live.armed = live.scheduled_until < live.sequence_end
                 && live.pieces.iter().any(|piece| {
-                    piece.timeline_out > live.scheduled_until && piece.timeline_in < live.sequence_end
+                    piece.timeline_out > live.scheduled_until
+                        && piece.timeline_in < live.sequence_end
                 });
             if live.armed {
                 self.badge = "Buffering";
@@ -220,7 +221,12 @@ impl Drop for AudioEngine {
     }
 }
 
-pub fn collect_pieces(sequence: &Sequence, media: &[MediaAsset], from: i64, to: i64) -> Vec<AudioPiece> {
+pub fn collect_pieces(
+    sequence: &Sequence,
+    media: &[MediaAsset],
+    from: i64,
+    to: i64,
+) -> Vec<AudioPiece> {
     let solos = sequence
         .tracks
         .iter()
@@ -398,13 +404,13 @@ fn chunk_frames(fps: f64) -> i64 {
 }
 
 #[cfg(feature = "ffmpeg")]
-fn worker_loop(
-    rx: std::sync::mpsc::Receiver<MixJob>,
-    tx: std::sync::mpsc::Sender<MixDone>,
-) {
+fn worker_loop(rx: std::sync::mpsc::Receiver<MixJob>, tx: std::sync::mpsc::Sender<MixDone>) {
     while let Ok(job) = rx.recv() {
         let mixed = mix_chunk(&job);
-        let peaks = mixed.as_ref().map(|samples| stereo_peak(samples)).unwrap_or([0.0, 0.0]);
+        let peaks = mixed
+            .as_ref()
+            .map(|samples| stereo_peak(samples))
+            .unwrap_or([0.0, 0.0]);
         let done = MixDone {
             id: job.id,
             generation: job.generation,
@@ -439,14 +445,14 @@ fn mix_chunk(job: &MixJob) -> Result<Vec<f32>, String> {
         if file_duration <= 0.001 {
             continue;
         }
-        let request = match AudioRequest::new(&piece.path, file_start.max(0.0), file_duration.min(8.0))
-        {
-            Ok(request) => request,
-            Err(err) => {
-                last_error = Some(err.to_string());
-                continue;
-            }
-        };
+        let request =
+            match AudioRequest::new(&piece.path, file_start.max(0.0), file_duration.min(8.0)) {
+                Ok(request) => request,
+                Err(err) => {
+                    last_error = Some(err.to_string());
+                    continue;
+                }
+            };
         let decoded = match decode_audio(&request) {
             Ok(samples) => samples,
             Err(err) => {
@@ -467,9 +473,13 @@ fn mix_chunk(job: &MixJob) -> Result<Vec<f32>, String> {
             mix[at] = (mix[at] + sample * gain).clamp(-1.0, 1.0);
         }
     }
-    if !any && last_error.is_some() && job.pieces.iter().any(|piece| {
-        piece.timeline_out > job.start_frame && piece.timeline_in < end
-    }) {
+    if !any
+        && last_error.is_some()
+        && job
+            .pieces
+            .iter()
+            .any(|piece| piece.timeline_out > job.start_frame && piece.timeline_in < end)
+    {
         return Err(last_error.unwrap_or_else(|| "audio decode failed".into()));
     }
     Ok(mix)
@@ -540,10 +550,7 @@ mod tests {
         loud.volume = 1.5;
         sequence.tracks[0].clips = vec![quiet];
         sequence.tracks[1].clips = vec![loud];
-        let media = vec![
-            tone(MediaId(1), &keep),
-            tone(MediaId(2), &other),
-        ];
+        let media = vec![tone(MediaId(1), &keep), tone(MediaId(2), &other)];
         let mixed = collect_pieces(&sequence, &media, 0, 24);
         assert_eq!(mixed.len(), 2);
         assert!((mixed[0].gain - 0.35).abs() < 1.0e-5);

@@ -1,18 +1,22 @@
 //! Program monitor.
 //!
-//! With the `ffmpeg` feature and a readable file, the topmost visible video
-//! clip is a decoded frame. Otherwise the monitor keeps the graded proxy cards
-//! and explains why picture is missing.
+//! With the `ffmpeg` feature and a readable file, every visible video layer
+//! under the playhead is decoded and composited with the shared engine (the
+//! same one Deliver encodes). Otherwise the monitor keeps the graded proxy
+//! cards and explains why picture is missing. Active captions are burned into
+//! that composite, and drawn on the proxy when decode is off.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use editor_core::{
-    clip_relative, color_grade, source_frame_at, transform, ColorGrade, Frame, MediaAsset,
-    TrackKind, Transform,
+use crate::composite::{
+    active_captions, burn_captions, composite, mask_window, program_stack, transition_motion,
+    BlitLayer, GradeSample, MaskWindow, PictureCache, Place,
 };
-use crate::composite::{place_from_transform, BlitLayer, GradeSample, PictureCache, Place};
-use editor_media::{clamp_preview_time, fit_preview_size, resolve_media_path, PreviewBackend};
+use editor_core::{
+    clip_relative, color_grade, transform, ColorGrade, Frame, MediaAsset, TrackKind, Transform,
+};
+use editor_media::{fit_preview_size, PreviewBackend};
 use egui::{Color32, FontId, Painter, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 
 use crate::app::{MeridianApp, ScrubSource};
@@ -92,13 +96,14 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
                                 place: layer.place,
                             })
                             .collect();
-                        let rgba = crate::composite::composite(
+                        let mut rgba = composite(
                             plan.canvas_w,
                             plan.canvas_h,
                             sequence.width as f32,
                             sequence.height as f32,
                             &blits,
                         );
+                        burn_captions(&mut rgba, plan.canvas_w, plan.canvas_h, &plan.captions);
                         app.picture_cache = Some(PictureCache {
                             signature,
                             width: plan.canvas_w,
@@ -181,7 +186,8 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
     let chip = (!plan.chip.is_empty() && picture.is_some()).then(|| plan.chip.clone());
 
     let monitor_h = (ui.available_height() - SCRUB_H).max(48.0);
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), monitor_h), Sense::hover());
+    let (rect, _) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), monitor_h), Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, THEME.stage);
     let frame = letterbox(
@@ -203,7 +209,7 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
             .tracks
             .iter()
             .filter(|t| t.kind == TrackKind::Video)
-            .filter(|t| track_visible(t, &sequence.tracks))
+            .filter(|t| editor_media::video_track_visible(t, &sequence.tracks))
             .collect();
         for track in video {
             if let Some(hit) = transition_hit(track, playhead) {
@@ -228,27 +234,8 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
         paint_decoded(&painter, frame, texture, width, height, opacity);
     }
 
-    let captions: Vec<_> = sequence
-        .tracks
-        .iter()
-        .filter(|t| t.kind == TrackKind::Caption && !t.muted)
-        .flat_map(|t| t.cues.iter())
-        .filter(|c| app.playhead >= c.timeline_in.0 && app.playhead < c.timeline_out.0)
-        .map(|c| c.text.clone())
-        .collect();
-    if let Some(text) = captions.last() {
-        let box_rect = Rect::from_min_max(
-            Pos2::new(frame.left() + 16.0, frame.bottom() - 42.0),
-            Pos2::new(frame.right() - 16.0, frame.bottom() - 12.0),
-        );
-        painter.rect_filled(box_rect, 3.0, Color32::from_rgba_unmultiplied(0, 0, 0, 180));
-        painter.text(
-            box_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            text,
-            FontId::new(15.0, egui::FontFamily::Proportional),
-            Color32::WHITE,
-        );
+    if paint_proxy {
+        paint_caption_burn(&painter, frame, &active_captions(&sequence, app.playhead));
     }
 
     let tc = format_tc(app.playhead, sequence.timebase);
@@ -332,8 +319,10 @@ fn follow_viewer_scrub(ui: &egui::Ui, app: &mut MeridianApp) {
 }
 
 fn program_scrubber(ui: &mut egui::Ui, app: &mut MeridianApp, end: i64) {
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), SCRUB_H), Sense::click_and_drag());
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), SCRUB_H),
+        Sense::click_and_drag(),
+    );
     let bar = Rect::from_min_max(
         Pos2::new(rect.left() + 58.0, rect.center().y - 6.0),
         Pos2::new(rect.right() - 16.0, rect.center().y + 6.0),
@@ -342,7 +331,11 @@ fn program_scrubber(ui: &mut egui::Ui, app: &mut MeridianApp, end: i64) {
     app.viewer_bar_end = end.max(0);
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, THEME.header);
-    painter.hline(rect.x_range(), rect.top(), Stroke::new(1.0_f32, THEME.hairline));
+    painter.hline(
+        rect.x_range(),
+        rect.top(),
+        Stroke::new(1.0_f32, THEME.hairline),
+    );
     painter.text(
         Pos2::new(rect.left() + 10.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
@@ -378,10 +371,16 @@ fn program_scrubber(ui: &mut egui::Ui, app: &mut MeridianApp, end: i64) {
         2.0,
         Color32::from_white_alpha(28),
     );
-    painter.vline(x, bar.y_range().expand(3.0), Stroke::new(2.0_f32, THEME.playhead));
+    painter.vline(
+        x,
+        bar.y_range().expand(3.0),
+        Stroke::new(2.0_f32, THEME.playhead),
+    );
     painter.circle_filled(Pos2::new(x, bar.center().y), 6.0, THEME.playhead);
     if response.hovered() || response.dragged() {
-        response.clone().on_hover_cursor(egui::CursorIcon::PointingHand);
+        response
+            .clone()
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
         response.clone().on_hover_text("Drag to scrub the program");
     }
     let pointer = ui.input(|input| input.pointer.interact_pos());
@@ -429,11 +428,7 @@ fn audio_meters(ui: &mut egui::Ui, peaks: [f32; 2], badge: &str, status: &str) {
         );
     }
     response.on_hover_text(format!("{badge} — {status}"));
-    ui.label(
-        egui::RichText::new(badge)
-            .size(11.0)
-            .color(THEME.text_mute),
-    );
+    ui.label(egui::RichText::new(badge).size(11.0).color(THEME.text_mute));
 }
 
 struct DecodePlan {
@@ -442,6 +437,7 @@ struct DecodePlan {
     chip: String,
     canvas_w: u32,
     canvas_h: u32,
+    captions: Vec<String>,
 }
 
 impl DecodePlan {
@@ -468,10 +464,27 @@ impl DecodePlan {
             bits(layer.place.pos_y).hash(&mut hasher);
             bits(layer.place.rotation).hash(&mut hasher);
             bits(layer.place.opacity).hash(&mut hasher);
-            bits(layer.place.clip_u0).hash(&mut hasher);
-            bits(layer.place.clip_u1).hash(&mut hasher);
             bits(layer.place.shift_x).hash(&mut hasher);
+            bits(layer.place.shift_y).hash(&mut hasher);
+            bits(layer.place.anchor_x).hash(&mut hasher);
+            bits(layer.place.anchor_y).hash(&mut hasher);
+            match layer.place.mask {
+                crate::composite::CanvasMask::None => 0u8.hash(&mut hasher),
+                crate::composite::CanvasMask::Wipe {
+                    angle_deg,
+                    edge,
+                    keep_below,
+                } => {
+                    1u8.hash(&mut hasher);
+                    bits(angle_deg).hash(&mut hasher);
+                    bits(edge).hash(&mut hasher);
+                    keep_below.hash(&mut hasher);
+                }
+            }
             layer.label.hash(&mut hasher);
+        }
+        for line in &self.captions {
+            line.hash(&mut hasher);
         }
         hasher.finish()
     }
@@ -496,159 +509,59 @@ fn decode_plan(
     scrubbing: bool,
     reverse: bool,
 ) -> DecodePlan {
-    let (canvas_w, canvas_h) =
-        fit_preview_size(sequence.width.max(2), sequence.height.max(2), PREVIEW_MAX_W, PREVIEW_MAX_H)
-            .unwrap_or((PREVIEW_MAX_W, PREVIEW_MAX_H));
-    let mut layers = Vec::new();
-    let mut problem = None;
-    let mut chip = String::new();
-    for track in sequence
-        .tracks
-        .iter()
-        .filter(|track| track.kind == TrackKind::Video && track_visible(track, &sequence.tracks))
-    {
-        if let Some(hit) = transition_hit(track, playhead) {
-            for (clip, mix, side) in [
-                (hit.left, 1.0 - hit.progress, true),
-                (hit.right, hit.progress, false),
-            ] {
-                match layer_for_clip(
-                    sequence, track, clip, media, playhead, playing, scrubbing, reverse, mix,
-                    canvas_w, canvas_h,
-                ) {
-                    Ok(mut layer) => {
-                        match &hit.kind {
-                            editor_core::TransitionKind::Wipe { .. } => {
-                                // Incoming picture wipes in from the left, matching export's wipeleft.
-                                if side {
-                                    layer.place.clip_u0 = hit.progress;
-                                } else {
-                                    layer.place.clip_u1 = hit.progress;
-                                }
-                                layer.place.opacity = (layer.place.opacity / mix.max(0.001)).clamp(0.0, 1.0);
-                            }
-                            editor_core::TransitionKind::PushSlide { .. } => {
-                                let shift = sequence.width as f32 * hit.progress;
-                                layer.place.shift_x = if side {
-                                    -shift
-                                } else {
-                                    sequence.width as f32 - shift
-                                };
-                                layer.place.opacity = (layer.place.opacity / mix.max(0.001)).clamp(0.0, 1.0);
-                            }
-                            editor_core::TransitionKind::CrossDissolve => {}
-                        }
-                        chip = layer.label.clone();
-                        layers.push(layer);
-                    }
-                    Err(message) => problem = Some(message),
-                }
-            }
-        } else if let Some(clip) = track
-            .clips
-            .iter()
-            .find(|clip| clip.enabled && clip.covers(Frame(playhead)))
-        {
-            match layer_for_clip(
-                sequence, track, clip, media, playhead, playing, scrubbing, reverse, 1.0,
-                canvas_w, canvas_h,
-            ) {
-                Ok(layer) => {
-                    chip = layer.label.clone();
-                    layers.push(layer);
-                }
-                Err(message) => problem = Some(message),
-            }
-        }
-    }
-    if !layers.is_empty() {
-        problem = None;
-    }
-    DecodePlan {
-        layers,
-        problem,
-        chip,
-        canvas_w,
-        canvas_h,
-    }
-}
-
-fn layer_for_clip(
-    sequence: &editor_core::Sequence,
-    track: &editor_core::Track,
-    clip: &editor_core::Clip,
-    media: &[MediaAsset],
-    playhead: i64,
-    playing: bool,
-    scrubbing: bool,
-    reverse: bool,
-    mix: f32,
-    canvas_w: u32,
-    canvas_h: u32,
-) -> Result<DecodedLayer, String> {
-    let rel = clip_relative(Frame(playhead), clip.timeline_in);
-    let xform = transform(&clip.effects)
-        .cloned()
-        .unwrap_or_else(Transform::identity);
-    let place = place_from_transform(&xform, rel, mix);
-    if place.opacity <= 0.001 {
-        return Err(format!("{} is fully transparent", clip.name));
-    }
-    let media_id = clip
-        .media_id
-        .ok_or_else(|| format!("No media linked to {}", clip.name))?;
-    let asset = media
-        .iter()
-        .find(|item| item.id == media_id)
-        .ok_or_else(|| format!("Missing media for {}", clip.name))?;
-    if !asset.has_video {
-        return Err(format!("{} has no picture", asset.name));
-    }
-    let resolved = resolve_media_path(&asset.path);
-    if !resolved.is_file() {
-        return Err(format!("Offline — {} is not on disk", asset.name));
-    }
-    let (src_w, src_h) = match (asset.width, asset.height) {
-        (Some(w), Some(h)) if w > 0 && h > 0 => (w, h),
-        _ => (canvas_w, canvas_h),
+    let (canvas_w, canvas_h) = fit_preview_size(
+        sequence.width.max(2),
+        sequence.height.max(2),
+        PREVIEW_MAX_W,
+        PREVIEW_MAX_H,
+    )
+    .unwrap_or((PREVIEW_MAX_W, PREVIEW_MAX_H));
+    let stack = program_stack(sequence, media, playhead, canvas_w, canvas_h);
+    let problem = if stack.layers.is_empty() {
+        stack.errors.into_iter().next()
+    } else {
+        None
     };
-    let (width, height) = fit_preview_size(src_w, src_h, canvas_w, canvas_h).unwrap_or((
-        canvas_w.min(src_w).max(2),
-        canvas_h.min(src_h).max(2),
-    ));
-    let mut source_frame = source_frame_at(clip, Frame(playhead), sequence.timebase)
-        .0
-        .max(0);
-    let last_source_frame = asset.duration.0.saturating_sub(1).max(0);
-    if source_frame > last_source_frame {
-        source_frame = last_source_frame;
-    }
-    let duration_secs = asset.duration.to_seconds(asset.timebase);
-    let raw_time = Frame(source_frame).to_seconds(clip.media_timebase);
-    let time_secs = clamp_preview_time(raw_time, duration_secs).unwrap_or(0.0);
-    let frame_secs = clip.media_timebase.frame_duration_secs();
     let burst = if playing && !scrubbing {
         PLAY_BURST
     } else {
         SCRUB_BURST
     };
     let lead = if scrubbing || reverse { burst / 3 } else { 0 };
-    Ok(DecodedLayer {
-        query: PreviewQuery {
-            path: resolved.to_string_lossy().into_owned(),
-            source_frame,
-            width,
-            height,
-            time_secs,
-            frame_secs,
-            last_source_frame,
-            burst,
-            lead,
-        },
-        grade: GradeSample::from_effects(&clip.effects, rel),
-        place,
-        label: format!("{}  {}", track.name, clip.name),
-    })
+    let chip = stack
+        .layers
+        .last()
+        .map(|layer| layer.label.clone())
+        .unwrap_or_default();
+    let layers = stack
+        .layers
+        .into_iter()
+        .filter(|layer| layer.place.contributes())
+        .map(|layer| DecodedLayer {
+            query: PreviewQuery {
+                path: layer.path,
+                source_frame: layer.source_frame,
+                width: layer.width,
+                height: layer.height,
+                time_secs: layer.time_secs,
+                frame_secs: layer.frame_secs,
+                last_source_frame: layer.last_source_frame,
+                burst,
+                lead,
+            },
+            grade: layer.grade,
+            place: layer.place,
+            label: layer.label,
+        })
+        .collect();
+    DecodePlan {
+        layers,
+        problem,
+        chip,
+        canvas_w,
+        canvas_h,
+        captions: active_captions(sequence, playhead),
+    }
 }
 
 fn paint_decoded(
@@ -694,18 +607,6 @@ fn overlay_note(painter: &Painter, frame: Rect, text: &str) {
     painter.galley(rect.min + pad, galley, THEME.text);
 }
 
-fn track_visible(track: &editor_core::Track, tracks: &[editor_core::Track]) -> bool {
-    if track.muted {
-        return false;
-    }
-    let any_solo = tracks.iter().any(|t| t.kind == track.kind && t.solo);
-    if any_solo {
-        track.solo
-    } else {
-        true
-    }
-}
-
 struct TransHit<'a> {
     kind: editor_core::TransitionKind,
     progress: f32,
@@ -743,25 +644,68 @@ fn paint_transition(
 ) {
     let w = sequence.width as f32;
     let h = sequence.height as f32;
-    match &hit.kind {
-        editor_core::TransitionKind::CrossDissolve => {
-            paint_clip(painter, frame, w, h, hit.left, 1.0 - hit.progress, playhead);
-            paint_clip(painter, frame, w, h, hit.right, hit.progress, playhead);
+    let view_x = frame.width() / w.max(1.0);
+    let view_y = frame.height() / h.max(1.0);
+    for (clip, outgoing) in [(hit.left, true), (hit.right, false)] {
+        let motion = transition_motion(&hit.kind, hit.progress, outgoing, w, h);
+        let shifted = frame.translate(Vec2::new(motion.shift_x * view_x, -motion.shift_y * view_y));
+        let window = match mask_window(motion.mask) {
+            MaskWindow::Empty => continue,
+            MaskWindow::All | MaskWindow::PerPixel => frame,
+            MaskWindow::Uv { u0, v0, u1, v1 } => Rect::from_min_max(
+                Pos2::new(
+                    frame.left() + u0.clamp(0.0, 1.0) * frame.width(),
+                    frame.top() + v0.clamp(0.0, 1.0) * frame.height(),
+                ),
+                Pos2::new(
+                    frame.left() + u1.clamp(0.0, 1.0) * frame.width(),
+                    frame.top() + v1.clamp(0.0, 1.0) * frame.height(),
+                ),
+            ),
+        };
+        if window.width() < 1.0 || window.height() < 1.0 {
+            continue;
         }
-        editor_core::TransitionKind::Wipe { .. } => {
-            let split = frame.left() + frame.width() * hit.progress;
-            let left_rect = Rect::from_min_max(frame.min, Pos2::new(split, frame.bottom()));
-            let right_rect = Rect::from_min_max(Pos2::new(split, frame.top()), frame.max);
-            paint_clip_clipped(painter, frame, left_rect, w, h, hit.left, 1.0, playhead);
-            paint_clip_clipped(painter, frame, right_rect, w, h, hit.right, 1.0, playhead);
+        paint_clip_clipped(
+            painter,
+            shifted,
+            window,
+            w,
+            h,
+            clip,
+            motion.opacity_scale,
+            playhead,
+        );
+    }
+}
+
+fn paint_caption_burn(painter: &Painter, frame: Rect, lines: &[String]) {
+    if lines.is_empty() {
+        return;
+    }
+    let margin = (frame.height() * 48.0 / 1080.0).clamp(8.0, 72.0);
+    let size = (frame.height() * 32.0 / 1080.0).clamp(13.0, 42.0);
+    let font = FontId::proportional(size);
+    let mut baseline = frame.bottom() - margin;
+    for line in lines.iter().rev() {
+        let pos = Pos2::new(frame.center().x, baseline);
+        for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+            painter.text(
+                pos + Vec2::new(dx, dy),
+                egui::Align2::CENTER_BOTTOM,
+                line,
+                font.clone(),
+                Color32::BLACK,
+            );
         }
-        editor_core::TransitionKind::PushSlide { .. } => {
-            let shift = frame.width() * hit.progress;
-            let left_frame = frame.translate(Vec2::new(-shift, 0.0));
-            let right_frame = frame.translate(Vec2::new(frame.width() - shift, 0.0));
-            paint_clip_clipped(painter, left_frame, frame, w, h, hit.left, 1.0, playhead);
-            paint_clip_clipped(painter, right_frame, frame, w, h, hit.right, 1.0, playhead);
-        }
+        painter.text(
+            pos,
+            egui::Align2::CENTER_BOTTOM,
+            line,
+            font.clone(),
+            Color32::WHITE,
+        );
+        baseline -= size + 4.0;
     }
 }
 

@@ -319,16 +319,7 @@ fn decode_audio_cli(request: &AudioRequest) -> Result<Vec<f32>, DecodeError> {
         ])
         .arg(&path)
         .args([
-            "-t",
-            &duration,
-            "-map",
-            "0:a:0",
-            "-ac",
-            &channels,
-            "-ar",
-            &rate,
-            "-f",
-            "f32le",
+            "-t", &duration, "-map", "0:a:0", "-ac", &channels, "-ar", &rate, "-f", "f32le",
             "pipe:1",
         ])
         .output()

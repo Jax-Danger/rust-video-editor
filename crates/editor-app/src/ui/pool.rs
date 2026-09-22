@@ -44,7 +44,8 @@ pub fn media_pool(ui: &mut egui::Ui, app: &mut MeridianApp) {
 
     let dropping = ui.input(|input| !input.raw.hovered_files.is_empty());
     if dropping {
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 36.0), Sense::hover());
+        let (rect, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 36.0), Sense::hover());
         ui.painter().rect_filled(rect, 3.0, THEME.accent_dim);
         ui.painter().text(
             rect.center(),
@@ -161,8 +162,10 @@ fn media_row(
     has_audio: bool,
 ) {
     let selected = app.selected_media == Some(id);
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::click_and_drag());
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), 40.0),
+        Sense::click_and_drag(),
+    );
     let painter = ui.painter();
     if selected {
         painter.rect_filled(rect, 0.0, THEME.accent_dim);
@@ -276,7 +279,12 @@ fn media_row(
         app.place_selected_media(false);
     }
     if missing {
-        if let Some(path) = app.session.project().media(id).map(|media| media.path.clone()) {
+        if let Some(path) = app
+            .session
+            .project()
+            .media(id)
+            .map(|media| media.path.clone())
+        {
             response.on_hover_text(format!("Offline — {path}"));
         }
     }

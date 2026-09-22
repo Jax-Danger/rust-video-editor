@@ -45,7 +45,14 @@ pub fn spawn_caption(
         shared: shared.clone(),
     };
     std::thread::spawn(move || {
-        let result = transcribe_range(&pieces, range_in, range_out, timebase, &speaker, language.as_deref());
+        let result = transcribe_range(
+            &pieces,
+            range_in,
+            range_out,
+            timebase,
+            &speaker,
+            language.as_deref(),
+        );
         let mut slot = shared.lock().unwrap_or_else(|poison| poison.into_inner());
         match result {
             Ok(drafts) => {
