@@ -78,7 +78,7 @@ The toolbar exposes Select, Razor, Ripple, Roll, Slip, and Slide, plus Overwrite
 
 Linked selection is on by default so picture and sound move together. Inserting a linked pair is one ripple, not two.
 
-Click or drag the timeline ruler, or the bar under the program monitor, to scrub. The decoded preview follows the playhead. Playback and scrubbing reuse a short frame cache (one ffmpeg job covers a window of frames) instead of spawning a process per pixel. The timeline scrolls horizontally. Scroll pans; Ctrl+scroll or a pinch zooms around the cursor. `+` / `−` zoom, and Shift+Z fits the sequence.
+Click or drag the timeline ruler, or the bar under the program monitor, to scrub. The decoded preview follows the playhead. Playback and scrubbing reuse one ffmpeg job for a short burst of frames, then a memory cache and a disk cache (see [Long projects](#long-projects)) so a second pass over the same frames does not spawn ffmpeg again. The timeline scrolls horizontally. Scroll pans; Ctrl+scroll or a pinch zooms around the cursor. `+` / `−` zoom. The zoom slider is logarithmic, from single frames (64 px/frame) out to about 12 px per minute at 24 fps, which fits an hour in the panel. Shift+Z fits the sequence and scrolls back to the start. Off-screen clips are not drawn, and the clip under the pointer is a binary search on the sorted track.
 
 ## Keyboard
 
@@ -186,7 +186,7 @@ Check with `ffmpeg -version` and `ffprobe -version`.
 cargo run -p editor-app --features ffmpeg
 ```
 
-`cargo run` and `cargo test` without the feature stay on the proxy and do not need ffmpeg installed.
+`cargo run` and `cargo test` without the feature stay on the placeholder cards and do not need ffmpeg installed.
 
 The example sequence *Northline — Opening* points its three picture clips at synthetic files in [`samples/media/`](samples/media/):
 
@@ -196,9 +196,58 @@ The example sequence *Northline — Opening* points its three picture clips at s
 | `city_broll.mp4` | classic `testsrc` card | 288 frames, 24 fps |
 | `aerial.mp4` | the same card with a moving hue | 192 frames, 24 fps |
 
-They are generated, not third-party footage. Regenerate them with [`scripts/generate-sample-media.sh`](scripts/generate-sample-media.sh) if you have ffmpeg. Launching from the repo root (or any subdirectory) resolves those relative paths. The viewer stacks every visible video layer, so V2's keyed aerial sits on top of V1 instead of replacing it, and caches a short burst of frames per layer so playback and scrubbing do not spawn ffmpeg once per frame.
+They are generated, not third-party footage. Regenerate them with [`scripts/generate-sample-media.sh`](scripts/generate-sample-media.sh) if you have ffmpeg. Launching from the repo root (or any subdirectory) resolves those relative paths. The viewer stacks every visible video layer, so V2's keyed aerial sits on top of V1 instead of replacing it.
 
 **File → Import** probes any file `ffprobe` can open and writes the absolute path into the project. Offline media and a missing `ffmpeg` binary leave the shell usable and put the reason on the program monitor and on the clip.
+
+## Long projects
+
+A long cut stays interactive when preview is looking at proxies, decoded frames are cached, and the timeline only paints what is on screen. **Sequence → Dense Sequence (400 clips)** builds a synthetic 13-minute cut of the sample interview so you can try the zoom without importing footage. Export ignores proxies and always encodes the original files.
+
+### Proxies
+
+A proxy is a H.264 file at most **960 pixels wide** (shorter sources stay at their own width), `libx264` `veryfast` CRF 23, no B-frames, GOP 12, no audio, `+faststart`. Picture preview can use it. Audio playback, captions, and Deliver keep reading the original.
+
+| | |
+| --- | --- |
+| Saved project | `<project directory>/<name>.meridian/proxies/` |
+| Unsaved project | `$XDG_CACHE_HOME/meridian/proxies` or `~/.cache/meridian/proxies` |
+
+The pool toggle **Proxies / Full** is **Prefer Proxies**. When it is on, a layer decodes its proxy if that file is on disk and falls back to the original if it is not. **Full** always decodes the original. The program header shows `Proxy` when a proxy file was actually used, and `Full*` when proxies are preferred but this frame fell back. Generating proxies turns the preference on.
+
+**Selected** proxies the selected pool item. **Project** proxies every online video in the project. Progress is the status line (`Proxy 2/5 — interview.mp4`). **Cancel** stops between files; finished files stay attached. The same commands are under **File**. The proxy path is stored on the media asset and saved with the project. A missing proxy is not an error.
+
+On Fedora, with the ffmpeg build:
+
+```bash
+sudo dnf install ffmpeg
+cargo run -p editor-app --features ffmpeg
+```
+
+Import the camera originals (or open the example), choose **Project** in the media pool, wait for the status line, then leave **Proxies** on while you cut. Switch to **Full** when you need to judge a grade. Deliver still writes the originals.
+
+The default `cargo build` does not spawn ffmpeg. **Selected** / **Project** then report that the feature is compiled out.
+
+### Decode cache
+
+Preview frames are keyed by the file being decoded (original or proxy), the source frame, and the decode size.
+
+| Cache | Default | Where |
+| --- | --- | --- |
+| Memory | 256 MiB, and at most 192 frames | Process RAM, dropped on quit |
+| Disk | 512 MiB, and at most 4096 files | `$XDG_CACHE_HOME/meridian/frames` or `~/.cache/meridian/frames` |
+
+The disk key also includes the source file's modification time, so replacing a file does not replay a stale frame. One frame larger than the budget is kept; older frames are deleted until the rest fits. A burst is read from disk only when every frame in that burst is already stored. Memory is checked first, then disk, then ffmpeg.
+
+### Timeline scale
+
+Tracks are sorted by start frame. Painting and hit-testing use a binary search for the clips that intersect the viewport, including a clip that starts off-screen and runs into view. The ruler spaces ticks from single frames out to hours, and only for the visible range. At the overview zoom, clips thinner than a couple of pixels draw as a solid mark instead of a labelled block. **Fit** (Shift+Z) uses the panel width, so a long sequence actually fits.
+
+### Relink
+
+Offline media shows an amber dot, the word Offline, and an **Offline** pill. Online media shows a green dot and the word Online. A row with a proxy file adds `Proxy` on that line.
+
+**File → Relink Media…**, the pool **Relink** button, or a click on the Offline pill picks a new path for the selected item. The media id stays, so timeline clips remain linked. The path, duration, and codecs are probed again, and any proxy is cleared because it belonged to the previous file. One relink is one undo step.
 
 ## Captions
 
@@ -253,7 +302,7 @@ A progress bar follows ffmpeg's `out_time`. **Cancel** sends `SIGTERM`. A failed
 
 ## Tests
 
-`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, the sample project round-trip, imported media paths in JSON, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, pan, fader, burned captions), the mix bus (pan law, mute, solo, keyframed gain, peak and RMS), and the shared composite (grade split, dissolve mix, wipe angle, push, anchor, caption burn-in). It does not spawn ffmpeg or whisper.
+`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, the sample project round-trip, imported media paths in JSON, proxy attach and relink, timeline culling on an 800-clip sequence, ruler spacing across an hour, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, proxy argument planning and preview fallback, the disk frame cache, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, pan, fader, burned captions), the mix bus (pan law, mute, solo, keyframed gain, peak and RMS), and the shared composite (grade split, dissolve mix, wipe angle, push, anchor, caption burn-in). It does not spawn ffmpeg or whisper.
 
 `cargo test -p editor-media --features ffmpeg` also encodes a short H.264/AAC mp4 when `ffmpeg` is on `PATH`. `cargo test -p editor-app --features whisper` builds the local speech-to-text path; the binary and model are resolved at runtime, not at compile time.
 

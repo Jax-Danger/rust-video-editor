@@ -410,6 +410,10 @@ fn default_pixel() -> u32 {
     1
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 impl Sequence {
     pub fn new(
         id: SequenceId,
@@ -553,6 +557,10 @@ pub struct MediaAsset {
     pub has_audio: bool,
     #[serde(default)]
     pub offline: bool,
+    /// Lower-resolution H.264 preview. Absent until a proxy is generated.
+    /// Preview falls back to [`Self::path`] when this file is missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_path: Option<String>,
 }
 
 impl MediaAsset {
@@ -581,6 +589,10 @@ pub struct Project {
     pub sequences: Vec<Sequence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_sequence: Option<SequenceId>,
+    /// Program monitor prefers proxy media when the proxy file is on disk.
+    /// Export ignores this and always uses the original.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub prefer_proxies: bool,
 }
 
 impl Project {
@@ -593,6 +605,7 @@ impl Project {
             media: Vec::new(),
             sequences: Vec::new(),
             active_sequence: None,
+            prefer_proxies: false,
         }
     }
 

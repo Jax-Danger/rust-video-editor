@@ -458,6 +458,7 @@ pub fn timecode_well(ui: &mut Ui, caption: &str, value: &str, primary: bool) {
     );
 }
 
+#[allow(dead_code)]
 pub fn mini_slider(ui: &mut Ui, value: f32, range: std::ops::RangeInclusive<f32>) -> Option<f32> {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(110.0, 18.0), Sense::click_and_drag());
     let painter = ui.painter();
@@ -483,6 +484,44 @@ pub fn mini_slider(ui: &mut Ui, value: f32, range: std::ops::RangeInclusive<f32>
     let pos = response.interact_pointer_pos()?;
     let nt = ((pos.x - track.left()) / track.width()).clamp(0.0, 1.0);
     Some(min + nt * span)
+}
+
+/// Logarithmic slider so frame zoom and minute zoom share the track.
+pub fn mini_slider_log(
+    ui: &mut Ui,
+    value: f32,
+    range: std::ops::RangeInclusive<f32>,
+) -> Option<f32> {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(110.0, 18.0), Sense::click_and_drag());
+    let painter = ui.painter();
+    let track = Rect::from_center_size(rect.center(), Vec2::new(rect.width(), 4.0));
+    painter.rect_filled(track, 2.0, THEME.inset);
+    let min = range.start().max(1.0e-4).ln();
+    let max = range.end().max(*range.start()).ln();
+    let span = (max - min).abs().max(0.0001);
+    let current = if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        *range.start()
+    };
+    let t = ((current.ln() - min) / span).clamp(0.0, 1.0);
+    painter.rect_filled(
+        Rect::from_min_max(
+            track.min,
+            pos2(track.left() + track.width() * t, track.bottom()),
+        ),
+        2.0,
+        THEME.accent_dim,
+    );
+    let knob = pos2(track.left() + track.width() * t, track.center().y);
+    painter.circle_filled(knob, 5.0, THEME.text);
+    painter.circle_stroke(knob, 5.0, Stroke::new(1.0_f32, THEME.accent));
+    if !(response.dragged() || response.clicked()) {
+        return None;
+    }
+    let pos = response.interact_pointer_pos()?;
+    let nt = ((pos.x - track.left()) / track.width()).clamp(0.0, 1.0);
+    Some((min + nt * span).exp())
 }
 
 pub fn readout(ui: &mut Ui, text: &str, width: f32, emphasis: bool) {

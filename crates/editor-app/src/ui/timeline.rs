@@ -3,8 +3,9 @@
 use std::collections::HashSet;
 
 use editor_core::{
-    collect_snap_points, expand_linked, snap_span, ClipId, Frame, MediaId, TrackFlag, TrackKind,
-    TrimEdge,
+    align_frame, clamp_timeline_zoom, clip_index_at, collect_snap_points, expand_linked,
+    ruler_step, snap_span, visible_clip_span, visible_span, ClipId, Frame, MediaId, TrackFlag,
+    TrackKind, TrimEdge, MAX_PIXELS_PER_FRAME, MIN_PIXELS_PER_FRAME,
 };
 use egui::{pos2, Align2, Color32, CursorIcon, FontId, Id, Rect, Sense, Shape, Stroke, Vec2};
 
@@ -44,6 +45,14 @@ pub fn timeline_panel(ui: &mut egui::Ui, app: &mut MeridianApp) {
             Vec2::new(body_w, body_h),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
+                if app.scroll_timeline_home {
+                    let id = timeline_scroll_id(ui);
+                    if let Some(mut state) = egui::scroll_area::State::load(ui.ctx(), id) {
+                        state.offset.x = 0.0;
+                        state.store(ui.ctx(), id);
+                    }
+                    app.scroll_timeline_home = false;
+                }
                 nudge_timeline_scroll(ui, app);
                 let output = egui::ScrollArea::horizontal()
                     .id_salt("timeline_body")
@@ -104,7 +113,7 @@ fn nudge_timeline_scroll(ui: &egui::Ui, app: &mut MeridianApp) {
             (dy * 0.0016).exp()
         };
         let old = app.pixels_per_frame;
-        let new = (old * factor).clamp(0.2, 64.0);
+        let new = clamp_timeline_zoom(old * factor);
         let content_x = state.offset.x + (pointer.x - view.min.x);
         let frame = if old > 0.0 { content_x / old } else { 0.0 };
         state.offset.x = (frame * new - (pointer.x - view.min.x)).max(0.0);
@@ -269,8 +278,12 @@ fn transport(ui: &mut egui::Ui, app: &mut MeridianApp) {
         if widgets::ghost_button(ui, "+") {
             app.zoom_by(1.25);
         }
-        if let Some(zoom) = widgets::mini_slider(ui, app.pixels_per_frame, 0.2..=64.0) {
-            app.pixels_per_frame = zoom;
+        if let Some(zoom) = widgets::mini_slider_log(
+            ui,
+            app.pixels_per_frame,
+            MIN_PIXELS_PER_FRAME..=MAX_PIXELS_PER_FRAME,
+        ) {
+            app.pixels_per_frame = clamp_timeline_zoom(zoom);
         }
         if widgets::ghost_button(ui, "−") {
             app.zoom_by(1.0 / 1.25);
@@ -358,24 +371,37 @@ fn ruler(
     painter.hline(rect.x_range(), rect.bottom(), theme::hairline_stroke());
     let ppf = app.pixels_per_frame;
     let fps = sequence.timebase.timecode_fps().max(1);
-    let major = fps;
-    if ppf >= 3.0 {
-        let minor = if ppf >= 10.0 { 1 } else { (fps / 2).max(1) };
-        let mut tick = 0_i64;
-        while tick <= end {
-            if tick % major != 0 {
-                let x = rect.min.x + tick as f32 * ppf;
-                if x > rect.max.x + 8.0 {
-                    break;
-                }
-                painter.vline(
-                    x,
-                    (rect.bottom() - 4.0)..=rect.bottom(),
-                    Stroke::new(1.0_f32, THEME.hairline),
-                );
-            }
-            tick += minor;
+    let (view_start, view_end) = visible_frame_range(ui, rect, ppf, end);
+    let step = ruler_step(ppf, fps);
+    let mut frame = align_frame(view_start, step.minor).max(0);
+    let mut drawn = 0;
+    while frame <= view_end && drawn < 800 {
+        let x = rect.min.x + frame as f32 * ppf;
+        let major = step.major > 0 && frame % step.major == 0;
+        if major {
+            painter.vline(
+                x,
+                rect.bottom() - 10.0..=rect.bottom(),
+                Stroke::new(1.0_f32, THEME.border),
+            );
+        } else if frame % step.minor.max(1) == 0 {
+            painter.vline(
+                x,
+                (rect.bottom() - 4.0)..=rect.bottom(),
+                Stroke::new(1.0_f32, THEME.hairline),
+            );
         }
+        if step.label > 0 && frame % step.label == 0 {
+            painter.text(
+                pos2(x + 3.0, rect.top() + 2.0),
+                Align2::LEFT_TOP,
+                format_tc(frame, sequence.timebase),
+                THEME.mono(9.0),
+                THEME.text_mute,
+            );
+        }
+        frame += step.minor.max(1);
+        drawn += 1;
     }
     if let (Some(inn), Some(out)) = (sequence.in_point, sequence.out_point) {
         let x0 = rect.min.x + inn.0 as f32 * ppf;
@@ -389,39 +415,12 @@ fn ruler(
             THEME.accent,
         );
     }
-    let step = if ppf < 1.2 { major * 2 } else { major };
-    let mut frame = 0;
-    while frame <= end {
-        let x = rect.min.x + frame as f32 * ppf;
-        if x > rect.max.x + 40.0 {
-            break;
-        }
-        let height = if frame % (major * 5) == 0 {
-            14.0
-        } else if frame % major == 0 {
-            9.0
-        } else {
-            0.0
-        };
-        if height > 0.0 {
-            painter.vline(
-                x,
-                rect.bottom() - height..=rect.bottom(),
-                Stroke::new(1.0_f32, THEME.border),
-            );
-        }
-        if frame % step == 0 && ppf > 0.8 {
-            painter.text(
-                pos2(x + 3.0, rect.top() + 2.0),
-                Align2::LEFT_TOP,
-                format_tc(frame, sequence.timebase),
-                THEME.mono(9.0),
-                THEME.text_mute,
-            );
-        }
-        frame += major.max(1);
-    }
     for marker in &sequence.markers {
+        if marker.frame.0 < view_start.saturating_sub(2)
+            || marker.frame.0 > view_end.saturating_add(2)
+        {
+            continue;
+        }
         let x = rect.min.x + marker.frame.0 as f32 * ppf;
         painter.add(Shape::convex_polygon(
             vec![
@@ -470,9 +469,17 @@ fn lane(
     };
     painter.rect_filled(rect, 0.0, bg);
     let ppf = app.pixels_per_frame;
+    let (view_start, view_end) = visible_frame_range(ui, rect, ppf, sequence.end_frame().0 + 48);
 
     if track.kind == TrackKind::Caption {
-        for cue in &track.cues {
+        let span = visible_span(
+            &track.cues,
+            view_start,
+            view_end,
+            |cue| cue.timeline_in.0,
+            |cue| cue.timeline_out.0,
+        );
+        for cue in &track.cues[span] {
             let x0 = rect.min.x + cue.timeline_in.0 as f32 * ppf;
             let x1 = rect.min.x + cue.timeline_out.0 as f32 * ppf;
             let crect = Rect::from_min_max(
@@ -480,17 +487,31 @@ fn lane(
                 pos2(x1.max(x0 + 4.0), rect.max.y - CLIP_PAD_Y),
             );
             paint_clip_body(&painter, crect, theme::CAPTION, false, false);
-            painter.with_clip_rect(crect.shrink(3.0)).text(
-                crect.left_center() + Vec2::new(5.0, 0.0),
-                Align2::LEFT_CENTER,
-                &cue.text,
-                THEME.font(10.5),
-                Color32::WHITE,
-            );
+            if crect.width() >= 18.0 {
+                painter.with_clip_rect(crect.shrink(3.0)).text(
+                    crect.left_center() + Vec2::new(5.0, 0.0),
+                    Align2::LEFT_CENTER,
+                    &cue.text,
+                    THEME.font(10.5),
+                    Color32::WHITE,
+                );
+            }
         }
     }
 
-    for clip in &track.clips {
+    let mut span = visible_clip_span(&track.clips, view_start, view_end);
+    if let Some(drag) = &app.drag {
+        if drag.track_id == track.id {
+            if let Some(index) = track.clips.iter().position(|clip| clip.id == drag.clip_id) {
+                if index < span.start {
+                    span.start = index;
+                } else if index >= span.end {
+                    span.end = index + 1;
+                }
+            }
+        }
+    }
+    for clip in &track.clips[span] {
         let (start, end) = preview_span(app, clip.id, clip.timeline_in.0, clip.timeline_out.0);
         let x0 = rect.min.x + start as f32 * ppf;
         let x1 = rect.min.x + end as f32 * ppf;
@@ -501,6 +522,10 @@ fn lane(
         let selected = app.selected.contains(&clip.id);
         let fill = theme::label_fill(clip.label, track.kind);
         let clip_offline = clip.media_id.is_some_and(|id| offline.contains(&id));
+        if crect.width() < 2.0 {
+            painter.rect_filled(crect, 0.0, fill);
+            continue;
+        }
         paint_clip_body(
             &painter,
             crect,
@@ -510,21 +535,25 @@ fn lane(
         );
         if clip_offline {
             painter.rect_filled(crect, 3.0, Color32::from_black_alpha(90));
-            painter.text(
-                crect.right_center() - Vec2::new(8.0, 0.0),
-                Align2::RIGHT_CENTER,
-                "Offline",
-                FontId::new(10.0, egui::FontFamily::Proportional),
-                THEME.amber,
+            if crect.width() >= 48.0 {
+                painter.text(
+                    crect.right_center() - Vec2::new(8.0, 0.0),
+                    Align2::RIGHT_CENTER,
+                    "Offline",
+                    FontId::new(10.0, egui::FontFamily::Proportional),
+                    THEME.amber,
+                );
+            }
+        }
+        if crect.width() >= 18.0 {
+            painter.with_clip_rect(crect.shrink(3.0)).text(
+                crect.left_center() + Vec2::new(5.0, 0.0),
+                Align2::LEFT_CENTER,
+                &clip.name,
+                THEME.font(10.5),
+                Color32::WHITE,
             );
         }
-        painter.with_clip_rect(crect.shrink(3.0)).text(
-            crect.left_center() + Vec2::new(5.0, 0.0),
-            Align2::LEFT_CENTER,
-            &clip.name,
-            THEME.font(10.5),
-            Color32::WHITE,
-        );
     }
 
     for transition in &track.transitions {
@@ -534,6 +563,10 @@ fn lane(
         let (start, end) = transition.range(left.timeline_out);
         let x0 = rect.min.x + start.0 as f32 * ppf;
         let x1 = rect.min.x + end.0 as f32 * ppf;
+        let view = painter.clip_rect();
+        if x1 < view.min.x - 8.0 || x0 > view.max.x + 8.0 {
+            continue;
+        }
         let mid_y = rect.center().y;
         let mid_x = (x0 + x1) * 0.5;
         painter.add(Shape::convex_polygon(
@@ -719,28 +752,54 @@ struct Hit {
 }
 
 fn hit_test(track: &editor_core::Track, rect: Rect, pos: egui::Pos2, ppf: f32) -> Option<Hit> {
-    for clip in track.clips.iter().rev() {
-        let x0 = rect.min.x + clip.timeline_in.0 as f32 * ppf;
-        let x1 = rect.min.x + clip.timeline_out.0 as f32 * ppf;
-        let crect = Rect::from_min_max(
-            pos2(x0, rect.min.y + CLIP_PAD_Y),
-            pos2(x1.max(x0 + 4.0), rect.max.y - CLIP_PAD_Y),
-        );
+    let frame = x_to_frame(pos.x, rect.min.x, ppf);
+    if let Some(index) = clip_index_at(&track.clips, frame) {
+        return Some(hit_from_clip(&track.clips[index], rect, pos, ppf));
+    }
+    let slop = ((8.0 / ppf.max(0.001)).ceil() as i64).clamp(1, 64);
+    let span = visible_clip_span(
+        &track.clips,
+        frame.saturating_sub(slop),
+        frame.saturating_add(slop + 1),
+    );
+    for clip in track.clips[span].iter().rev() {
+        let crect = clip_rect(clip, rect, ppf);
         if crect.contains(pos) {
-            let edge = if (pos.x - crect.min.x).abs() <= 6.0 {
-                Some(TrimEdge::Head)
-            } else if (pos.x - crect.max.x).abs() <= 6.0 {
-                Some(TrimEdge::Tail)
-            } else {
-                None
-            };
-            return Some(Hit {
-                clip_id: clip.id,
-                edge,
-            });
+            return Some(hit_from_clip(clip, rect, pos, ppf));
         }
     }
     None
+}
+
+fn hit_from_clip(clip: &editor_core::Clip, rect: Rect, pos: egui::Pos2, ppf: f32) -> Hit {
+    let crect = clip_rect(clip, rect, ppf);
+    let edge = if crect.width() >= 16.0 && (pos.x - crect.min.x).abs() <= 6.0 {
+        Some(TrimEdge::Head)
+    } else if crect.width() >= 16.0 && (pos.x - crect.max.x).abs() <= 6.0 {
+        Some(TrimEdge::Tail)
+    } else {
+        None
+    };
+    Hit {
+        clip_id: clip.id,
+        edge,
+    }
+}
+
+fn clip_rect(clip: &editor_core::Clip, rect: Rect, ppf: f32) -> Rect {
+    let x0 = rect.min.x + clip.timeline_in.0 as f32 * ppf;
+    let x1 = rect.min.x + clip.timeline_out.0 as f32 * ppf;
+    Rect::from_min_max(
+        pos2(x0, rect.min.y + CLIP_PAD_Y),
+        pos2(x1.max(x0 + 4.0), rect.max.y - CLIP_PAD_Y),
+    )
+}
+
+fn visible_frame_range(ui: &egui::Ui, content: Rect, ppf: f32, end: i64) -> (i64, i64) {
+    let view = ui.clip_rect();
+    let start = x_to_frame(view.min.x - 24.0, content.min.x, ppf).saturating_sub(1);
+    let stop = x_to_frame(view.max.x + 24.0, content.min.x, ppf).saturating_add(2);
+    (start.max(0), stop.max(start).min(end.max(0) + 8))
 }
 
 fn select_clip(
@@ -908,11 +967,11 @@ fn paint_clip_body(
         Color32::from_white_alpha(46),
     );
     if waveform {
-        let mut x = rect.left() + 8.0;
-        let mut seed = (rect.left() as u32)
-            .wrapping_mul(1664525)
-            .wrapping_add(1013904223);
-        while x < rect.right() - 4.0 {
+        let visible = rect.intersect(painter.clip_rect());
+        let mut x = visible.left().max(rect.left() + 8.0);
+        let mut seed = (x as u32).wrapping_mul(1664525).wrapping_add(1013904223);
+        let right = visible.right().min(rect.right() - 4.0);
+        while x < right {
             seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
             let h = 2.0 + ((seed >> 16) % 100) as f32 / 100.0 * (rect.height() * 0.32);
             painter.vline(

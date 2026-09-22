@@ -242,7 +242,66 @@ fn asset(
         has_video,
         has_audio,
         offline,
+        proxy_path: None,
     }
+}
+
+/// A long synthetic cut: hundreds of non-overlapping shots of the sample
+/// interview, back to back. Used to exercise timeline culling.
+pub fn dense_project() -> Project {
+    const COUNT: usize = 400;
+    const CLIP_LEN: i64 = 48;
+    let mut project = Project::new("Dense — Long Cut");
+    let tb = Timebase::fps_24();
+    project.bins.push(Bin {
+        id: BinId(1),
+        name: "Master".into(),
+        parent: None,
+    });
+    project.media.push(asset(
+        10,
+        1,
+        "interview.mp4",
+        "samples/media/interview.mp4",
+        480,
+        tb,
+        true,
+        true,
+        Some("h264"),
+        Some("aac"),
+        Some(960),
+        Some(540),
+        false,
+    ));
+    let mut sequence = Sequence::new(SequenceId(2), "Long Cut", 1920, 1080, tb);
+    sequence.add_track(TrackId(3), TrackKind::Video, "V1");
+    sequence.add_track(TrackId(4), TrackKind::Audio, "A1");
+    let labels = [
+        LabelColor::Blue,
+        LabelColor::Teal,
+        LabelColor::Amber,
+        LabelColor::Violet,
+        LabelColor::Green,
+        LabelColor::Rose,
+    ];
+    let source_room = 480 - CLIP_LEN;
+    for index in 0..COUNT {
+        let start = index as i64 * CLIP_LEN;
+        let source = (index as i64 * 17) % source_room;
+        let mut clip = Clip::basic((100 + index) as u64, start, start + CLIP_LEN);
+        clip.media_id = Some(MediaId(10));
+        clip.name = format!("Shot {:03}", index + 1);
+        clip.source_in = Frame(source);
+        clip.source_out = Frame(source + CLIP_LEN);
+        clip.source_max = Frame(480);
+        clip.label = labels[index % labels.len()];
+        sequence.tracks[0].clips.push(clip);
+    }
+    project.sequences.push(sequence);
+    project.active_sequence = Some(SequenceId(2));
+    project.next_id = (100 + COUNT) as u64;
+    project.normalize();
+    project
 }
 
 fn placed(
@@ -357,6 +416,23 @@ mod tests {
         let text = std::fs::read_to_string(path).expect("samples/northline-opening.json");
         let loaded = Project::from_json(&text).unwrap();
         assert_eq!(loaded, demo_project());
+    }
+
+    #[test]
+    fn dense_project_culls_to_a_handful_of_shots() {
+        use crate::scale::visible_clip_span;
+
+        let project = dense_project();
+        let sequence = project.active().unwrap();
+        let clips = &sequence.tracks[0].clips;
+        assert_eq!(clips.len(), 400);
+        assert!(sequence.end_frame().0 >= 400 * 48);
+        let span = visible_clip_span(clips, 10_000, 10_200);
+        assert!(!span.is_empty());
+        assert!(span.len() <= 6, "visible shots {}", span.len());
+        assert!(clips
+            .windows(2)
+            .all(|pair| pair[0].timeline_out.0 <= pair[1].timeline_in.0));
     }
 
     #[test]

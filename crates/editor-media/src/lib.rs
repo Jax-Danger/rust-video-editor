@@ -15,15 +15,17 @@
 mod composite;
 mod decode;
 mod export;
+mod frame_cache;
 mod probe;
+mod proxy;
 #[cfg(feature = "whisper")]
 mod transcribe;
 
 pub use composite::{
     active_captions, apply_transition, burn_captions, caption_style, composite, mask_allows,
-    mask_window, place_from_transform, program_stack, transition_motion, video_track_visible,
-    BlitLayer, CanvasMask, CaptionStyle, GradeSample, MaskWindow, Place, ProgramLayer,
-    ProgramStack, TransitionMotion,
+    mask_window, place_from_transform, program_stack, program_stack_with, transition_motion,
+    video_track_visible, BlitLayer, CanvasMask, CaptionStyle, GradeSample, MaskWindow, Place,
+    ProgramLayer, ProgramStack, TransitionMotion,
 };
 pub use decode::{
     clamp_preview_time, decode_audio, decode_frames, ensure_time_in_range, fit_preview_size,
@@ -34,7 +36,15 @@ pub use decode::{
 pub use export::{caption_font, cues_to_srt, plan_encode, FfmpegScript, WavPiece};
 #[cfg(feature = "ffmpeg")]
 pub use export::{spawn_export, write_timeline_wav, ExportJob, ExportSnapshot};
+pub use frame_cache::{
+    source_stamp, FrameCache, FrameCacheKey, DEFAULT_FRAME_CACHE_BYTES, DEFAULT_FRAME_CACHE_FILES,
+};
 pub use probe::{parse_ffprobe_json, probe, probe_stub, ProbeError, ProbeResult};
+pub use proxy::{
+    cache_root, frame_cache_dir, generate_proxy, preview_file, project_proxy_dir,
+    proxy_ffmpeg_args, proxy_output_path, unsaved_proxy_dir, PreviewSource, ProxyError,
+    ProxyRequest, PROXY_MAX_WIDTH,
+};
 #[cfg(feature = "whisper")]
 pub use transcribe::{transcribe_wav, whisper_availability, WhisperPaths};
 

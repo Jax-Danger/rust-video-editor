@@ -1144,6 +1144,56 @@ pub fn set_out_point(
     })
 }
 
+/// Point `id` at a new file. The media id, bin, and display name stay so
+/// timeline clips remain linked. A generated proxy is cleared because it was
+/// transcoded from the previous path.
+pub fn relink_media(
+    project: &mut Project,
+    id: MediaId,
+    source: &MediaAsset,
+) -> Result<(), EditError> {
+    let asset = project
+        .media
+        .iter_mut()
+        .find(|media| media.id == id)
+        .ok_or(EditError::MediaNotFound)?;
+    asset.path = source.path.clone();
+    asset.duration = source.duration;
+    asset.timebase = source.timebase;
+    asset.width = source.width;
+    asset.height = source.height;
+    asset.video_codec = source.video_codec.clone();
+    asset.audio_codec = source.audio_codec.clone();
+    asset.audio_channels = source.audio_channels;
+    asset.sample_rate = source.sample_rate;
+    asset.has_video = source.has_video;
+    asset.has_audio = source.has_audio;
+    asset.offline = source.offline;
+    asset.proxy_path = None;
+    Ok(())
+}
+
+/// Record generated proxy files on the matching assets.
+pub fn attach_proxies(project: &mut Project, links: &[(MediaId, String)]) -> Result<(), EditError> {
+    if links.is_empty() {
+        return Err(EditError::MediaNotFound);
+    }
+    for (id, path) in links {
+        let asset = project
+            .media
+            .iter_mut()
+            .find(|media| media.id == *id)
+            .ok_or(EditError::MediaNotFound)?;
+        let trimmed = path.trim();
+        asset.proxy_path = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
+    Ok(())
+}
+
 pub fn import_media(project: &mut Project, mut asset: MediaAsset) -> MediaId {
     if asset.id.0 == 0 {
         asset.id = MediaId(project.alloc());
@@ -2069,10 +2119,11 @@ mod tests {
             has_video: true,
             has_audio: true,
             offline: false,
+            proxy_path: None,
         };
         let id = import_media(&mut project, asset);
         let json = project.to_json_pretty().unwrap();
-        let loaded = Project::from_json(&json).unwrap();
+        let mut loaded = Project::from_json(&json).unwrap();
         let media = loaded.media(id).unwrap();
         assert_eq!(media.path, "/home/editor/footage/interview.mp4");
         assert_eq!(media.name, "interview.mp4");
@@ -2080,5 +2131,32 @@ mod tests {
         assert!(media.has_video && media.has_audio);
         assert!(!media.offline);
         assert_eq!(media.duration, Frame(240));
+        assert!(media.proxy_path.is_none());
+
+        attach_proxies(&mut loaded, &[(id, "/cache/interview-proxy.mp4".into())]).unwrap();
+        assert_eq!(
+            loaded.media(id).unwrap().proxy_path.as_deref(),
+            Some("/cache/interview-proxy.mp4")
+        );
+        let json = loaded.to_json_pretty().unwrap();
+        let mut loaded = Project::from_json(&json).unwrap();
+        assert_eq!(
+            loaded.media(id).unwrap().proxy_path.as_deref(),
+            Some("/cache/interview-proxy.mp4")
+        );
+
+        let mut replacement = loaded.media(id).unwrap().clone();
+        replacement.path = "/restore/interview.mp4".into();
+        replacement.offline = true;
+        relink_media(&mut loaded, id, &replacement).unwrap();
+        let media = loaded.media(id).unwrap();
+        assert_eq!(media.path, "/restore/interview.mp4");
+        assert!(media.offline);
+        assert!(media.proxy_path.is_none());
+        assert_eq!(media.name, "interview.mp4");
+        assert_eq!(
+            relink_media(&mut loaded, MediaId(99), &replacement),
+            Err(EditError::MediaNotFound)
+        );
     }
 }
