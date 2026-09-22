@@ -12,8 +12,8 @@ use thiserror::Error;
 
 use crate::caption::CaptionDraft;
 use crate::effects::{
-    blur_mut, color_grade_mut, crop_mut, sharpen_mut, transform_mut, vignette_mut, GradeParam,
-    TransformParam,
+    blur_mut, chroma_key_mut, color_grade_mut, crop_mut, sharpen_mut, transform_mut, vignette_mut,
+    GradeParam, TransformParam,
 };
 use crate::model::{
     Bin, BinId, CaptionCue, Clip, ClipId, ClipSpeed, CueId, LabelColor, Marker, MarkerId,
@@ -1090,6 +1090,36 @@ pub fn set_filter_at(
                     .amount
                     .write_at(clip_relative_frame, value.clamp(0.0, 2.0));
             }
+            crate::effects::FilterParam::ChromaKeyRed => {
+                chroma_key_mut(effects)
+                    .key_red
+                    .write_at(clip_relative_frame, value.clamp(0.0, 1.0));
+            }
+            crate::effects::FilterParam::ChromaKeyGreen => {
+                chroma_key_mut(effects)
+                    .key_green
+                    .write_at(clip_relative_frame, value.clamp(0.0, 1.0));
+            }
+            crate::effects::FilterParam::ChromaKeyBlue => {
+                chroma_key_mut(effects)
+                    .key_blue
+                    .write_at(clip_relative_frame, value.clamp(0.0, 1.0));
+            }
+            crate::effects::FilterParam::ChromaKeyTolerance => {
+                chroma_key_mut(effects)
+                    .tolerance
+                    .write_at(clip_relative_frame, value.clamp(0.0, 1.0));
+            }
+            crate::effects::FilterParam::ChromaKeySoftness => {
+                chroma_key_mut(effects)
+                    .softness
+                    .write_at(clip_relative_frame, value.clamp(0.0, 1.0));
+            }
+            crate::effects::FilterParam::ChromaKeySpillSuppression => {
+                chroma_key_mut(effects)
+                    .spill_suppression
+                    .write_at(clip_relative_frame, value.clamp(0.0, 1.0));
+            }
         }
         Ok(())
     })
@@ -1116,6 +1146,14 @@ pub fn toggle_filter_key(
             crate::effects::FilterParam::CropTop => &mut crop_mut(effects).top,
             crate::effects::FilterParam::CropBottom => &mut crop_mut(effects).bottom,
             crate::effects::FilterParam::SharpenAmount => &mut sharpen_mut(effects).amount,
+            crate::effects::FilterParam::ChromaKeyRed => &mut chroma_key_mut(effects).key_red,
+            crate::effects::FilterParam::ChromaKeyGreen => &mut chroma_key_mut(effects).key_green,
+            crate::effects::FilterParam::ChromaKeyBlue => &mut chroma_key_mut(effects).key_blue,
+            crate::effects::FilterParam::ChromaKeyTolerance => &mut chroma_key_mut(effects).tolerance,
+            crate::effects::FilterParam::ChromaKeySoftness => &mut chroma_key_mut(effects).softness,
+            crate::effects::FilterParam::ChromaKeySpillSuppression => {
+                &mut chroma_key_mut(effects).spill_suppression
+            }
         };
         if anim.has_key(clip_relative_frame) {
             anim.remove_key(clip_relative_frame);

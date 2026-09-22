@@ -1270,6 +1270,19 @@ impl DecodePlan {
                 }
             }
             bits(layer.place.blur_radius).hash(&mut hasher);
+            bits(layer.filters.blur_radius).hash(&mut hasher);
+            bits(layer.filters.vignette_amount).hash(&mut hasher);
+            bits(layer.filters.vignette_softness).hash(&mut hasher);
+            for inset in layer.filters.crop {
+                bits(inset).hash(&mut hasher);
+            }
+            bits(layer.filters.sharpen).hash(&mut hasher);
+            for channel in layer.filters.chroma_key_color {
+                bits(channel).hash(&mut hasher);
+            }
+            bits(layer.filters.chroma_key_tolerance).hash(&mut hasher);
+            bits(layer.filters.chroma_key_softness).hash(&mut hasher);
+            bits(layer.filters.chroma_key_spill).hash(&mut hasher);
             layer.label.hash(&mut hasher);
         }
         for line in &self.captions {
