@@ -245,6 +245,28 @@ impl Session {
         })
     }
 
+    pub fn ripple_trim_prev_to_playhead(
+        &mut self,
+        at: Frame,
+        tracks: &[TrackId],
+    ) -> Result<(), EditError> {
+        let seq = self.active_id()?;
+        self.edit("Ripple trim previous", |project| {
+            edit::ripple_trim_prev_to_playhead(project, seq, at, tracks)
+        })
+    }
+
+    pub fn ripple_trim_next_to_playhead(
+        &mut self,
+        at: Frame,
+        tracks: &[TrackId],
+    ) -> Result<(), EditError> {
+        let seq = self.active_id()?;
+        self.edit("Ripple trim next", |project| {
+            edit::ripple_trim_next_to_playhead(project, seq, at, tracks)
+        })
+    }
+
     pub fn roll(&mut self, left_clip: ClipId, delta: i64) -> Result<(), EditError> {
         let seq = self.active_id()?;
         self.edit("Roll", |project| {
