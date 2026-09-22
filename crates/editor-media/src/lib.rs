@@ -27,7 +27,7 @@ pub use composite::{
     active_captions, apply_transition, burn_captions, caption_style, compose_layers,
     compose_layers_env, composite, mask_allows, mask_window, media_layers_in_stack,
     place_from_transform, program_stack, program_stack_with, render_title, transition_motion,
-    video_track_visible, BlitLayer,
+    video_track_visible, visible_video_tracks, BlitLayer,
     CanvasMask, CaptionStyle, ComposeEnv, FilterSample, GradeSample, LayerSource, MaskWindow,
     Place, ProgramLayer, ProgramStack, StabilizeSample, TransitionMotion,
 };

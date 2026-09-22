@@ -54,6 +54,22 @@ impl Session {
         self.saved_generation = self.generation;
     }
 
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Replace the open project with edits that still need a real save.
+    /// Undo history is cleared. The project file is not written.
+    pub fn restore_unsaved(&mut self, mut project: Project) {
+        project.normalize();
+        self.project = project;
+        self.undo.clear();
+        self.redo.clear();
+        self.interactive = None;
+        self.dirty = true;
+        self.generation = self.generation.saturating_add(1);
+    }
+
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty()
     }
@@ -489,6 +505,17 @@ mod tests {
         assert!(session.redo());
         assert_eq!(session.project().active().unwrap().tracks[0].clips.len(), 3);
         assert_eq!(session.undo_label(), Some("Overwrite"));
+    }
+
+    #[test]
+    fn restore_unsaved_keeps_the_session_dirty() {
+        let (mut session, _track) = session();
+        assert!(!session.is_dirty());
+        session.restore_unsaved(Project::new("recovered"));
+        assert!(session.is_dirty());
+        assert_eq!(session.project().name, "recovered");
+        assert!(!session.can_undo());
+        assert!(!session.can_redo());
     }
 
     #[test]

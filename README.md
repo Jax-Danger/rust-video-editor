@@ -50,7 +50,24 @@ sudo apt install gcc g++ cmake pkg-config libgtk-3-dev libasound2-dev ffmpeg \
 cargo run -p editor-app --features ffmpeg
 ```
 
-The first launch loads an in-memory example: three picture tracks, a lower-third title, linked interview audio, a cross dissolve, a wipe, keyframed picture-in-picture, captions, and markers. **File → Open Example** returns to it. **File → Save** and **File → Save As** write pretty JSON through a native dialog. A copy of that example lives at [`samples/northline-opening.json`](samples/northline-opening.json). **File → Open** (Ctrl+O) reloads a project file.
+The first launch loads an in-memory example: three picture tracks, a lower-third title, linked interview audio, a cross dissolve, a wipe, keyframed picture-in-picture, captions, and markers. **File → Open Example** returns to it. **File → Save** and **File → Save As** write pretty JSON through a native dialog. A copy of that example lives at [`samples/northline-opening.json`](samples/northline-opening.json). **File → Open** (Ctrl+O) reloads a project file. Unsaved edits are also copied to a recovery sidecar; see [Autosave and recovery](#autosave-and-recovery).
+
+## Autosave and recovery
+
+Meridian copies dirty projects to a recovery sidecar. **File → Save** and **Save As** are the only commands that write the project path you chose.
+
+A dirty session is written after 3 seconds without another edit, and every 60 seconds while edits keep coming. Each write goes to a temporary file in the same directory, then renames over the sidecar. The status bar reports a failed autosave; a successful one is quiet. Quitting with unsaved edits flushes the sidecar first. A crash keeps the last of those writes.
+
+| Session | Recovery file |
+| --- | --- |
+| Saved project `film.json` | `film.meridian/recovery.json` beside the project |
+| Never saved | `~/.config/meridian/recovery/unsaved.json` |
+
+`MERIDIAN_CONFIG` overrides that config directory, the same way Deliver's last-used settings do. The sidecar is not a project file. Opening it from **File → Open** is refused.
+
+`~/.config/meridian/recovery-index.json` remembers the last sidecar. On the next launch, if that file is strictly newer than the project it belongs to — or the project was never saved — Meridian asks you to **Restore** or **Discard** before showing the timeline. Restore loads the sidecar into the editor and leaves the project file untouched, so the session stays unsaved until you Save. Discard deletes the sidecar. When a project file is still on disk, Discard then opens that saved file.
+
+Opening a project whose sidecar is newer than the file shows the same choice. Saving deletes the sidecar for that project. A recovery that is older than the project file, or the same age, is ignored.
 
 ## Import
 
@@ -523,7 +540,7 @@ A progress bar follows ffmpeg's `out_time`. **Cancel** sends `SIGTERM`. A failed
 
 ## Tests
 
-`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, deliver presets (apply, custom JSON, last-settings round-trip), the sample project round-trip, imported media paths in JSON, media-pool bins (create, rename, move, delete, JSON round-trip), sequence markers (add, edit, delete, JSON round-trip), proxy attach and relink, timeline culling on an 800-clip sequence, ruler spacing across an hour, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, proxy argument planning and preview fallback, the disk frame cache, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, pan, fader, burned captions, deliver bitrate hints, audio-only WAV planning, retimed source frames, muted retimed audio), multicam sync offsets, razor angle switches, group-time cuts, JSON round-trip, and raster frames that follow the active angle, nested sequence create/frame mapping/JSON round-trip/export raster, the mix bus (pan law, mute, solo, keyframed gain, 3-band EQ, peak and RMS), clip speed (constant 25–400%, reverse, a linear ramp, JSON round-trip, and duration ripple), adjustment layers (JSON round-trip, track placement, composite stacking), shape mask and track matte JSON round-trip, 3D LUT `.cube` parse/tetrahedral sampling/JSON round-trip/mix, and the shared composite (luma curve, lift/gamma/gain wheels, grade split, dissolve mix, wipe angle, push, dip, slide, blur dissolve, iris, clip filters including shape mask alpha, track matte alpha multiply, stabilize on synthetic shake, 3D LUT look after grade, anchor, caption burn-in, adjustment grade-below). It does not spawn ffmpeg or whisper.
+`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, deliver presets (apply, custom JSON, last-settings round-trip), the sample project round-trip, imported media paths in JSON, media-pool bins (create, rename, move, delete, JSON round-trip), sequence markers (add, edit, delete, JSON round-trip), proxy attach and relink, timeline culling on an 800-clip sequence, ruler spacing across an hour, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, proxy argument planning and preview fallback, the disk frame cache, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, pan, fader, burned captions, deliver bitrate hints, audio-only WAV planning, retimed source frames, muted retimed audio), multicam sync offsets, razor angle switches, group-time cuts, JSON round-trip, and raster frames that follow the active angle, nested sequence create/frame mapping/JSON round-trip/export raster, the mix bus (pan law, mute, solo, keyframed gain, 3-band EQ, peak and RMS), clip speed (constant 25–400%, reverse, a linear ramp, JSON round-trip, and duration ripple), adjustment layers (JSON round-trip, track placement, composite stacking), shape mask and track matte JSON round-trip, 3D LUT `.cube` parse/tetrahedral sampling/JSON round-trip/mix, recovery sidecars (path, newer-than-project offer, autosave idle and interval, atomic write that leaves the project file untouched, discard), and the shared composite (luma curve, lift/gamma/gain wheels, grade split, dissolve mix, wipe angle, push, dip, slide, blur dissolve, iris, clip filters including shape mask alpha, track matte alpha multiply, stabilize on synthetic shake, 3D LUT look after grade, anchor, caption burn-in, adjustment grade-below). It does not spawn ffmpeg or whisper.
 
 `cargo test -p editor-media --features ffmpeg` also encodes a short H.264/AAC mp4 when `ffmpeg` is on `PATH`. `cargo test -p editor-app --features whisper` builds the local speech-to-text path; the binary and model are resolved at runtime, not at compile time.
 
