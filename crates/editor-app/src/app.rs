@@ -112,10 +112,7 @@ struct CaptionRequest {
     start: i64,
     end: i64,
     timebase: editor_core::Timebase,
-    #[cfg_attr(
-        not(all(feature = "ffmpeg", feature = "whisper")),
-        allow(dead_code)
-    )]
+    #[cfg_attr(not(all(feature = "ffmpeg", feature = "whisper")), allow(dead_code))]
     pieces: Vec<crate::audio::AudioPiece>,
 }
 
@@ -283,7 +280,11 @@ impl MeridianApp {
             return;
         }
         let _ = self.audio.pump();
-        let rate = if self.play_rate == 0 { 1 } else { self.play_rate };
+        let rate = if self.play_rate == 0 {
+            1
+        } else {
+            self.play_rate
+        };
         let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
         self.play_accum += dt * rate.unsigned_abs().max(1) as f32;
         let frame_dur = self.timebase().frame_duration_secs().max(1.0 / 120.0) as f32;
@@ -383,12 +384,7 @@ impl MeridianApp {
             .project()
             .active()
             .map(|sequence| {
-                collect_pieces(
-                    sequence,
-                    &self.session.project().media,
-                    self.playhead,
-                    end,
-                )
+                collect_pieces(sequence, &self.session.project().media, self.playhead, end)
             })
             .unwrap_or_default();
         self.audio.begin(self.playhead, end, fps, pieces);
@@ -2009,7 +2005,10 @@ impl MeridianApp {
 
 const SHORTCUTS: &[(&str, &str)] = &[
     ("Space", "Play / pause at 1×"),
-    ("J  K  L", "Reverse shuttle, stop, forward shuttle (tap again to go faster)"),
+    (
+        "J  K  L",
+        "Reverse shuttle, stop, forward shuttle (tap again to go faster)",
+    ),
     ("Left / Right", "Step one frame"),
     ("Shift+Left / Right", "Jump 10 frames"),
     ("Ctrl+Left / Right", "Jump one second"),

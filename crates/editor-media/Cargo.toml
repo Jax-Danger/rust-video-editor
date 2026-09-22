@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 editor-core = { path = "../editor-core" }
+font8x8 = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

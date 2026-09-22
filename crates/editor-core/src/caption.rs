@@ -288,7 +288,8 @@ pub fn map_words_to_cues(
         }
         let gap = word.start - cue_end;
         let cue_secs = word.end - cue_start;
-        let sentence = cue_text.ends_with('.') || cue_text.ends_with('?') || cue_text.ends_with('!');
+        let sentence =
+            cue_text.ends_with('.') || cue_text.ends_with('?') || cue_text.ends_with('!');
         let too_long = !cue_text.is_empty()
             && (gap > 0.45 || cue_secs > 2.8 || cue_text.len() + text.len() > 48 || sentence);
         if too_long {
@@ -401,10 +402,9 @@ mod tests {
         .unwrap();
         assert_eq!(words.len(), 2);
         assert_eq!(words[1].text, "world");
-        let segments = parse_stt_json(
-            r#"{"segments":[{"start":1.0,"end":2.5,"text":" room tone under"}]}"#,
-        )
-        .unwrap();
+        let segments =
+            parse_stt_json(r#"{"segments":[{"start":1.0,"end":2.5,"text":" room tone under"}]}"#)
+                .unwrap();
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].text, "room tone under");
     }
@@ -428,7 +428,13 @@ mod tests {
                 text: "in.".into(),
             },
         ];
-        let cues = map_words_to_cues(&words, Frame(24), Frame(24 + 96), Timebase::fps_24(), Some("INTV".into()));
+        let cues = map_words_to_cues(
+            &words,
+            Frame(24),
+            Frame(24 + 96),
+            Timebase::fps_24(),
+            Some("INTV".into()),
+        );
         assert_eq!(cues.len(), 2);
         assert_eq!(cues[0].text, "We came");
         assert_eq!(cues[0].timeline_in, Frame(24));

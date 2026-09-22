@@ -40,7 +40,7 @@ sudo dnf install gcc gcc-c++ cmake pkg-config gtk3-devel alsa-lib-devel ffmpeg \
 cargo run -p editor-app --features ffmpeg
 ```
 
-`gtk3-devel` is required to compile: the open, save, and import dialogs link GTK 3. `alsa-lib-devel` is required only for `--features ffmpeg`, which is the build that plays audio and encodes. The default `cargo build` / `cargo test` does not link ALSA and does not spawn ffmpeg. Auto Caption with a local model is a separate build: `cargo run -p editor-app --features whisper` (that feature includes ffmpeg). `gcc-c++` and `cmake` are only for building whisper.cpp itself — use `g++`, not Clang, because the Cloud and Fedora Clang packages often cannot find `libstdc++`. `dejavu-sans-fonts` is what Export uses to burn captions into the picture.
+`gtk3-devel` is required to compile: the open, save, and import dialogs link GTK 3. `alsa-lib-devel` is required only for `--features ffmpeg`, which is the build that plays audio and encodes. The default `cargo build` / `cargo test` does not link ALSA and does not spawn ffmpeg. Auto Caption with a local model is a separate build: `cargo run -p editor-app --features whisper` (that feature includes ffmpeg). `gcc-c++` and `cmake` are only for building whisper.cpp itself — use `g++`, not Clang, because the Cloud and Fedora Clang packages often cannot find `libstdc++`. `dejavu-sans-fonts` is the UI font when it is installed. Caption burn-in does not use it: preview and export stamp the same built-in 8×8 bitmap.
 
 ### Debian / Ubuntu
 
@@ -127,9 +127,23 @@ Transitions (cross dissolve, wipe, push) are centered on a cut and consume head 
 - **Colour** — viewer plus grade, wheels, and transform
 - **Deliver** — codec, container, in/out, and **Export**. With `--features ffmpeg` this encodes a real file. Without that feature, Export still writes the JSON manifest and says the encoder is compiled out.
 
-The program monitor draws mute/solo, grade, transform, dissolve, wipe, push, and caption burn-in as proxy cards when decode is off. With `--features ffmpeg` it decodes every visible video layer under the playhead and composites them on the CPU: the same grade formula as the proxy cards, plus scale, position, rotation, anchor, opacity, a left wipe, and a push. Dissolves update every frame. Play, keyboard stepping, and mouse scrubbing all follow the sequence timebase. If ffmpeg is missing or every layer is offline, the proxy stays up and the viewer says why.
+The program monitor draws mute/solo, grade, transform, dissolve, wipe, push, and caption burn-in as proxy cards when decode is off. With `--features ffmpeg` it decodes every visible video layer under the playhead and runs the same CPU compositor Deliver uses. Play, keyboard stepping, and mouse scrubbing all follow the sequence timebase. If ffmpeg is missing or every layer is offline, the proxy stays up and the viewer says why. Active caption cues are burned into that decoded picture; on the proxy they are drawn with the UI font in the same bottom safe area.
 
-What the preview still does not do: blend modes, motion blur, and a true wipe angle (wipes are always left-to-right). Decoded frames are fit into the preview box before the transform, so a source that is not the sequence aspect is letterboxed by ffmpeg and then scaled again by the clip transform. Export samples a keyed grade or transform about every six frames, and its grade filters are an ffmpeg approximation of the preview formula (exposure, eq, colorbalance). The preview formula and the export filters will not match pixel for pixel.
+### What matches, and what is still approximate
+
+Preview (`--features ffmpeg`) and Deliver call one compositor in `editor-media`. Higher video tracks paint later, so they sit on top. Muted video is skipped; solo hides the other video tracks.
+
+| Piece | Shared? | Notes |
+| --- | --- | --- |
+| Grade | Yes, one formula | Exposure in stops, contrast about mid grey, split shadow/highlight lift, temperature, tint, then Rec.709 luma saturation. Evaluated on the decoded RGB values as stored — not scene-linear, and not a film print |
+| Opacity, scale, position, rotation, anchor | Yes | Straight alpha over. Anchor is the normalized point that sits on the position |
+| Cross dissolve | Yes | Incoming blends over an opaque outgoing plate, which is a linear mix when that plate is opaque |
+| Wipe | Yes | `angle_deg` is the direction the reveal travels: 0° left to right, 90° top to bottom, 180° from the right, 270° from the bottom. Other angles use the same half-plane per pixel. The proxy only clips axis-aligned wipes; a diagonal wipe on the proxy is a stand-in |
+| Push | Yes | Direction is left, right, up, or down. Both sides slide; they are not a crossfade |
+| Captions | Placement yes, glyphs mostly | Both burn the same 8×8 bitmap into the picture (about 32px at 1080p, 48px bottom margin). The proxy uses the UI font instead. Soft `mov_text` subtitles are still written. H.264 then quantizes the burn-in |
+| Stacking | Yes | Simple alpha over only. No blend modes, no motion blur, no track mattes |
+
+A source is stretched to fill the clip's quad. It is not letterboxed when its aspect differs from the sequence. The monitor fits the sequence inside 960×540 before compositing; export composites at sequence size, with a decoded edge capped at 1920px. On the Northline picture-in-picture frame, a 16×16 block average of the H.264 export sits within about 1.3 levels of the CPU composite. That is the same picture through a codec, not a bit-identical file. Keyframes are evaluated on every frame in both paths.
 
 ## Templates
 
@@ -227,20 +241,18 @@ The Northline sample audio is sine tones, so Whisper on the example falls back t
 
 **Deliver → Export** runs ffmpeg and writes the file in the path field (default `/tmp/meridian-export.mp4`). The tested path is H.264 + AAC in an mp4. H.265, ProRes, and DNxHR are passed through as codec arguments when that ffmpeg build has the encoder.
 
-The graph is the sequence, or the marked in/out when that checkbox is on:
+The graph is the sequence, or the marked in/out when that checkbox is on. Picture is rasterized with the shared compositor (one frame at a time, decoded in short bursts) and piped to ffmpeg as raw video. Audio is still an ffmpeg filter graph:
 
-- Visible video tracks, bottom to top. Muted video is black. Solo hides the other video tracks.
-- A cross dissolve, left wipe, or left push that fills a slice uses ffmpeg `xfade`. A slice that only overlaps part of a transition holds the midpoint opacity.
-- Scale, position, rotation, and opacity are applied. Rotation is around the center. Anchor is preview-only.
-- Grade is an ffmpeg approximation (exposure, contrast, saturation, shadow/highlight lift, temperature and tint). Neutral grades are omitted.
+- Visible video tracks, bottom to top, with each clip's opacity, transform, and grade. A muted video track is skipped, so the tracks under it show through. Solo hides the other video tracks. An empty stack is black.
+- A cross dissolve, wipe, or push on a track composites the outgoing and incoming clips for that frame. Wipe angle and push direction follow the project. Anchor is included.
 - Audio is mixed with each clip's gain. Offline audio is skipped and named in the report. Offline video that is actually visible fails the export.
-- Captions are burned with `drawtext` when a DejaVu, Liberation, FreeSans, or Arial font is installed, and written as `mov_text` soft subtitles on mp4 and mov. Uncheck **Burn captions into the picture** to keep them soft only. MXF does not get the soft-sub input.
+- Captions are burned with the shared bitmap when **Burn captions into the picture** is checked, and written as `mov_text` soft subtitles on mp4 and mov. Uncheck the box to keep them soft only. MXF does not get the soft-sub input.
 
 A progress bar follows ffmpeg's `out_time`. **Cancel** sends `SIGTERM`. A failed or cancelled encode deletes the partial file. Without `--features ffmpeg`, Export writes the JSON manifest instead and explains how to rebuild.
 
 ## Tests
 
-`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, the sample project round-trip, imported media paths in JSON, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, caption JSON parsing, the export filter graph (grade, overlay, dissolve, gain, burned captions), and the preview composite. It does not spawn ffmpeg or whisper.
+`cargo test --workspace` covers timebase conversion and drop-frame timecode, overwrite, insert, razor, lift and ripple delete, move, trim, ripple, roll, slip, slide, transitions, keyframes, undo, templates, the sample project round-trip, imported media paths in JSON, the stub probe, still-image holds, the ffprobe JSON parser, preview frame-request bounds, caption JSON parsing, the export plan (grade, picture-in-picture, dissolve, gain, burned captions), and the shared composite (grade split, dissolve mix, wipe angle, push, anchor, caption burn-in). It does not spawn ffmpeg or whisper.
 
 `cargo test -p editor-media --features ffmpeg` also encodes a short H.264/AAC mp4 when `ffmpeg` is on `PATH`. `cargo test -p editor-app --features whisper` builds the local speech-to-text path; the binary and model are resolved at runtime, not at compile time.
 
@@ -249,7 +261,7 @@ A progress bar follows ffmpeg's `out_time`. **Cancel** sends `SIGTERM`. A failed
 - GPU viewer. The CPU composite already stacks tracks, grades, transforms, and the three transitions; it is not a full optical-flow or blend-mode engine
 - Fairlight-class mixing beyond mute, solo, and clip gain
 - OFX-style plugins for third-party effects
-- Export that matches the preview grade formula per frame, including anchor and wipe angle
+- Scene-linear grading and a hinted caption font. Preview and export already share the display-space formula and the bitmap burn-in
 - Multi-cam: sync groups and angle switching
 - More trim shortcuts, gang, and a command palette
 

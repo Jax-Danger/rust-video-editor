@@ -130,10 +130,7 @@ fn dtw_preset(model: &Path) -> Option<String> {
         "large.v3",
         "large.v3.turbo",
     ];
-    KNOWN
-        .iter()
-        .any(|item| *item == preset)
-        .then_some(preset)
+    KNOWN.iter().any(|item| *item == preset).then_some(preset)
 }
 
 fn find_binary() -> Result<PathBuf, String> {
@@ -243,11 +240,7 @@ mod tests {
         if whisper_availability().is_err() {
             return;
         }
-        if Command::new("espeak-ng")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
+        if Command::new("espeak-ng").arg("--version").output().is_err() {
             return;
         }
         let dir = std::env::temp_dir().join(format!("meridian-stt-{}", std::process::id()));

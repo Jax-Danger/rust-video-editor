@@ -1,16 +1,19 @@
 //! Timeline export.
 //!
-//! [`plan_encode`] builds an ffmpeg filter graph for the sequence (or its
-//! in/out). It is pure and does not spawn anything, so `cargo test` can check
-//! grades, overlays, transitions, and captions without the `ffmpeg` feature.
-//! With that feature, [`spawn_export`] runs the graph and reports progress.
+//! [`plan_encode`] is pure: it plans one CPU composite per frame with the same
+//! grade, transform, and transitions as the program monitor, plus an ffmpeg
+//! audio graph. It does not spawn anything, so `cargo test` can check the stack
+//! without the `ffmpeg` feature. With that feature, [`spawn_export`] decodes
+//! the planned layers, runs [`composite`], burns captions, and pipes the
+//! pictures to ffmpeg for the codec.
 
-use std::path::{Path, PathBuf};
+#[cfg(feature = "ffmpeg")]
+use std::path::Path;
+use std::path::PathBuf;
 
-use editor_core::{
-    color_grade, source_frame_at, transform, AnimatedF32, Clip, ColorGrade, Effect, ExportRange,
-    Frame, MediaAsset, Sequence, Timebase, Track, TrackKind, Transform, TransitionKind,
-};
+use editor_core::{source_frame_at, ExportRange, Frame, MediaAsset, Sequence, Timebase, TrackKind};
+
+use crate::composite::{active_captions, program_stack, ProgramLayer};
 
 /// One audible region. Times are sequence frames; `source_at_in` is seconds
 /// into the media at `timeline_in`.
@@ -36,6 +39,25 @@ pub struct FfmpegScript {
     pub container: String,
     pub warnings: Vec<String>,
     pub burn_captions: bool,
+    /// Picture is rasterized with the shared compositor, then encoded.
+    pub raster: RasterPlan,
+}
+
+/// One output frame. Layers are bottom to top, already graded in their `place`.
+#[derive(Clone, Debug)]
+pub struct RasterFrame {
+    pub layers: Vec<ProgramLayer>,
+    pub captions: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RasterPlan {
+    pub width: u32,
+    pub height: u32,
+    pub seq_width: f32,
+    pub seq_height: f32,
+    pub fps: String,
+    pub frames: Vec<RasterFrame>,
 }
 
 #[derive(Clone, Debug)]
@@ -57,89 +79,63 @@ pub fn plan_encode(
 ) -> Result<FfmpegScript, String> {
     let (range_in, range_out) = export_bounds(sequence, range)?;
     let mut warnings = Vec::new();
-    let video_bounds = video_boundaries(sequence, range_in, range_out);
-    let mut slices = pairs(&video_bounds);
-    slices = subdivide_animated(sequence, slices);
-    if slices.is_empty() {
-        return Err("nothing to export".into());
-    }
-
-    let mut graph = Graph::default();
-    let mut video_labels = Vec::new();
-    let mut audio_labels = Vec::new();
     let width = even_dim(sequence.width);
     let height = even_dim(sequence.height);
     let fps = fps_token(sequence.timebase);
     let pieces = audible_pieces(sequence, media, range_in, range_out, &mut warnings);
+    let dur = frames_secs(range_out - range_in, sequence.timebase);
+    let mut graph = Graph::default();
+    let audio = slice_audio(
+        &mut graph,
+        &pieces,
+        range_in,
+        range_out,
+        sequence.timebase,
+        dur,
+    );
 
-    for (start, end) in slices {
-        let dur = frames_secs(end - start, sequence.timebase);
-        if dur <= 0.0 {
-            continue;
+    let mut frames = Vec::with_capacity((range_out - range_in) as usize);
+    for frame in range_in..range_out {
+        let stack = program_stack(sequence, media, frame, width, height);
+        if let Some(error) = stack.errors.first() {
+            return Err(error.clone());
         }
-        let video = slice_video(
-            &mut graph,
-            sequence,
-            media,
-            start,
-            end,
-            width,
-            height,
-            &fps,
-            dur,
-        )?;
-        let audio = slice_audio(&mut graph, &pieces, start, end, sequence.timebase, dur);
-        video_labels.push(video);
-        audio_labels.push(audio);
+        let captions = if burn_captions {
+            active_captions(sequence, frame)
+        } else {
+            Vec::new()
+        };
+        frames.push(RasterFrame {
+            layers: stack.layers,
+            captions,
+        });
     }
-    if video_labels.is_empty() {
+    if frames.is_empty() {
         return Err("nothing to export".into());
     }
 
-    let (cat_v, cat_a) = if video_labels.len() == 1 {
-        (video_labels.remove(0), audio_labels.remove(0))
-    } else {
-        let cat_v = graph.lab();
-        let cat_a = graph.lab();
-        let mut chain = String::new();
-        for (video, audio) in video_labels.iter().zip(audio_labels.iter()) {
-            chain.push_str(&format!("[{video}][{audio}]"));
-        }
-        graph.filters.push(format!(
-            "{chain}concat=n={}:v=1:a=1[{cat_v}][{cat_a}]",
-            video_labels.len()
-        ));
-        (cat_v, cat_a)
-    };
-
     let cues = caption_cues(sequence, range_in, range_out);
     let srt = cues_to_srt(&cues);
-    let video_label = if burn_captions && !cues.is_empty() {
-        match caption_font() {
-            Some(font) => burn_drawtext(&mut graph, &cat_v, &cues, &font),
-            None => {
-                warnings.push(
-                    "No DejaVu, Liberation, or Arial font found, so captions are soft subtitles only."
-                        .into(),
-                );
-                cat_v
-            }
-        }
-    } else {
-        cat_v
-    };
 
     Ok(FfmpegScript {
         inputs: graph.inputs,
         filter: graph.filters.join(";"),
-        video_label,
-        audio_label: cat_a,
+        video_label: "raster".into(),
+        audio_label: audio,
         srt,
-        duration_secs: frames_secs(range_out - range_in, sequence.timebase),
+        duration_secs: dur,
         codec_args: codec_args(codec),
         container: container_name(container).to_string(),
         warnings,
         burn_captions,
+        raster: RasterPlan {
+            width,
+            height,
+            seq_width: sequence.width.max(1) as f32,
+            seq_height: sequence.height.max(1) as f32,
+            fps,
+            frames,
+        },
     })
 }
 
@@ -195,7 +191,12 @@ pub fn write_timeline_wav(
     }
     let filter = graph.filters.join(";");
     let mut command = std::process::Command::new("ffmpeg");
-    command.arg("-y").arg("-hide_banner").arg("-loglevel").arg("error").arg("-nostdin");
+    command
+        .arg("-y")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-nostdin");
     for input in &graph.inputs {
         command.arg("-i").arg(input);
     }
@@ -305,17 +306,16 @@ fn encode_blocking(
     ));
     std::fs::create_dir_all(&temp).map_err(|err| err.to_string())?;
     let srt_path = temp.join("captions.srt");
-    let soft = !script.srt.trim().is_empty()
-        && matches!(script.container.as_str(), "mp4" | "mov");
+    let soft = !script.srt.trim().is_empty() && matches!(script.container.as_str(), "mp4" | "mov");
     if soft || (script.burn_captions && !script.srt.trim().is_empty()) {
         std::fs::write(&srt_path, &script.srt).map_err(|err| err.to_string())?;
     }
 
+    let video_index = script.inputs.len();
     let mut command = std::process::Command::new("ffmpeg");
     command
         .arg("-y")
         .arg("-hide_banner")
-        .arg("-nostdin")
         .arg("-nostats")
         .arg("-stats_period")
         .arg("0.25")
@@ -324,7 +324,18 @@ fn encode_blocking(
     for input in &script.inputs {
         command.arg("-i").arg(input);
     }
-    let srt_index = script.inputs.len();
+    command
+        .arg("-f")
+        .arg("rawvideo")
+        .arg("-pix_fmt")
+        .arg("rgba")
+        .arg("-s")
+        .arg(format!("{}x{}", script.raster.width, script.raster.height))
+        .arg("-r")
+        .arg(&script.raster.fps)
+        .arg("-i")
+        .arg("pipe:0");
+    let srt_index = video_index + 1;
     if soft {
         command.arg("-i").arg(&srt_path);
     }
@@ -332,7 +343,7 @@ fn encode_blocking(
         .arg("-filter_complex")
         .arg(&script.filter)
         .arg("-map")
-        .arg(format!("[{}]", script.video_label))
+        .arg(format!("{video_index}:v"))
         .arg("-map")
         .arg(format!("[{}]", script.audio_label));
     if soft {
@@ -342,8 +353,14 @@ fn encode_blocking(
     if soft {
         command.args(["-c:s", "mov_text", "-metadata:s:s:0", "language=eng"]);
     }
-    command.arg("-f").arg(&script.container).arg(output);
     command
+        .arg("-frames:v")
+        .arg(script.raster.frames.len().to_string())
+        .arg("-f")
+        .arg(&script.container)
+        .arg(output);
+    command
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let mut child = command.spawn().map_err(|err| {
@@ -353,6 +370,18 @@ fn encode_blocking(
             err.to_string()
         }
     })?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "ffmpeg stdin was not piped".to_string())?;
+    let raster = script.raster.clone();
+    let cancel_write = cancel.clone();
+    let shared_write = shared.clone();
+    let writer = std::thread::spawn(move || {
+        let result = write_raster(&mut stdin, &raster, &cancel_write, &shared_write);
+        drop(stdin);
+        result
+    });
     let stderr = child.stderr.take();
     let stderr_handle = std::thread::spawn(move || {
         let mut text = String::new();
@@ -404,7 +433,13 @@ fn encode_blocking(
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = killer.join();
     let stderr_text = stderr_handle.join().unwrap_or_default();
+    let write_result = writer
+        .join()
+        .unwrap_or_else(|_| Err("composite thread panicked".into()));
     let _ = std::fs::remove_dir_all(&temp);
+    if let Err(err) = write_result {
+        return Err(err);
+    }
     if !status.success() {
         let detail = stderr_tail(&stderr_text);
         return Err(if detail.is_empty() {
@@ -423,7 +458,9 @@ fn encode_blocking(
 fn progress_seconds(line: &str) -> Option<f64> {
     let (key, value) = line.trim().split_once('=')?;
     match key {
-        "out_time_us" | "out_time_ms" => value.parse::<f64>().ok().map(|micros| micros / 1_000_000.0),
+        "out_time_us" | "out_time_ms" => {
+            value.parse::<f64>().ok().map(|micros| micros / 1_000_000.0)
+        }
         "out_time" => parse_clock(value),
         _ => None,
     }
@@ -457,6 +494,123 @@ fn stderr_tail(text: &str) -> String {
         .join(" ")
 }
 
+#[cfg(feature = "ffmpeg")]
+fn write_raster(
+    stdin: &mut impl std::io::Write,
+    plan: &RasterPlan,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    shared: &std::sync::Arc<std::sync::Mutex<ExportSnapshot>>,
+) -> Result<(), String> {
+    let mut cache = DecodeCache::default();
+    let total = plan.frames.len().max(1) as f32;
+    for (index, frame) in plan.frames.iter().enumerate() {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("export cancelled".into());
+        }
+        let rgba = render_frame(frame, plan, &mut cache)?;
+        stdin.write_all(&rgba).map_err(|err| err.to_string())?;
+        if let Ok(mut slot) = shared.lock() {
+            let fraction = ((index as f32 + 1.0) / total).clamp(0.0, 0.99);
+            slot.fraction = fraction;
+            slot.message = format!("Encoding {:.0}%", fraction * 100.0);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "ffmpeg")]
+fn render_frame(
+    frame: &RasterFrame,
+    plan: &RasterPlan,
+    cache: &mut DecodeCache,
+) -> Result<Vec<u8>, String> {
+    let mut owned = Vec::with_capacity(frame.layers.len());
+    for layer in &frame.layers {
+        if !layer.place.contributes() {
+            continue;
+        }
+        owned.push((cache.load(layer)?, layer));
+    }
+    let blits: Vec<crate::composite::BlitLayer<'_>> = owned
+        .iter()
+        .map(|(pixels, layer)| crate::composite::BlitLayer {
+            rgba: pixels,
+            width: layer.width,
+            height: layer.height,
+            grade: layer.grade,
+            place: layer.place,
+        })
+        .collect();
+    let mut rgba = crate::composite::composite(
+        plan.width,
+        plan.height,
+        plan.seq_width,
+        plan.seq_height,
+        &blits,
+    );
+    crate::composite::burn_captions(&mut rgba, plan.width, plan.height, &frame.captions);
+    Ok(rgba)
+}
+
+#[cfg(feature = "ffmpeg")]
+#[derive(Default)]
+struct DecodeCache {
+    map: std::collections::HashMap<(String, u32, u32, i64), std::sync::Arc<[u8]>>,
+    order: std::collections::VecDeque<(String, u32, u32, i64)>,
+}
+
+#[cfg(feature = "ffmpeg")]
+impl DecodeCache {
+    fn load(&mut self, layer: &ProgramLayer) -> Result<std::sync::Arc<[u8]>, String> {
+        let key = (
+            layer.path.clone(),
+            layer.width,
+            layer.height,
+            layer.source_frame,
+        );
+        if let Some(hit) = self.map.get(&key) {
+            return Ok(hit.clone());
+        }
+        let count = 8.min(crate::MAX_BURST);
+        let request = crate::FrameRequest::new(
+            &layer.path,
+            layer.time_secs,
+            layer.width,
+            layer.height,
+            count,
+        )
+        .map_err(|err| err.to_string())?;
+        let decoded = crate::decode_frames(&request).map_err(|err| err.to_string())?;
+        if decoded.is_empty() {
+            return Err(format!("ffmpeg returned no frame for {}", layer.path));
+        }
+        let mut first = None;
+        for (offset, frame) in decoded.into_iter().enumerate() {
+            let src = layer.source_frame.saturating_add(offset as i64);
+            let key = (layer.path.clone(), layer.width, layer.height, src);
+            let pixels: std::sync::Arc<[u8]> = std::sync::Arc::from(frame.rgba.into_boxed_slice());
+            if offset == 0 {
+                first = Some(pixels.clone());
+            }
+            self.insert(key, pixels);
+        }
+        first.ok_or_else(|| format!("ffmpeg returned no frame for {}", layer.path))
+    }
+
+    fn insert(&mut self, key: (String, u32, u32, i64), pixels: std::sync::Arc<[u8]>) {
+        if self.map.contains_key(&key) {
+            return;
+        }
+        self.order.push_back(key.clone());
+        self.map.insert(key, pixels);
+        while self.order.len() > 24 {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct Graph {
     inputs: Vec<String>,
@@ -475,282 +629,6 @@ impl Graph {
         self.inputs.push(path.to_string());
         self.inputs.len() - 1
     }
-}
-
-fn slice_video(
-    graph: &mut Graph,
-    sequence: &Sequence,
-    media: &[MediaAsset],
-    start: i64,
-    end: i64,
-    width: u32,
-    height: u32,
-    fps: &str,
-    dur: f64,
-) -> Result<String, String> {
-    let mut base = graph.lab();
-    graph.filters.push(format!(
-        "color=c=black:s={width}x{height}:r={fps}:d={},format=yuv420p,setsar=1[{base}]",
-        secs(dur)
-    ));
-    for track in sequence
-        .tracks
-        .iter()
-        .filter(|track| track.kind == TrackKind::Video && track_visible(track, &sequence.tracks))
-    {
-        if let Some(blend) = transition_on(track, start, end) {
-            let left = track
-                .clips
-                .iter()
-                .find(|clip| clip.id == blend.left)
-                .ok_or_else(|| "transition is missing its outgoing clip".to_string())?;
-            let right = track
-                .clips
-                .iter()
-                .find(|clip| clip.id == blend.right)
-                .ok_or_else(|| "transition is missing its incoming clip".to_string())?;
-            if blend.exact && end - start > 1 {
-                let left_v = emit_picture(
-                    graph,
-                    sequence,
-                    media,
-                    left,
-                    start,
-                    end,
-                    width,
-                    height,
-                    fps,
-                    dur,
-                    1.0,
-                    start,
-                )?;
-                let right_v = emit_picture(
-                    graph,
-                    sequence,
-                    media,
-                    right,
-                    start,
-                    end,
-                    width,
-                    height,
-                    fps,
-                    dur,
-                    1.0,
-                    end - 1,
-                )?;
-                let mixed = graph.lab();
-                let fade = (dur - frames_secs(1, sequence.timebase)).max(dur * 0.5);
-                graph.filters.push(format!(
-                    "[{left_v}][{right_v}]xfade=transition={}:duration={}:offset=0[{mixed}]",
-                    xfade_name(&blend.kind),
-                    secs(fade)
-                ));
-                let next = graph.lab();
-                graph.filters.push(format!(
-                    "[{base}][{mixed}]overlay=0:0:format=auto:eof_action=pass:shortest=1,format=yuv420p,setsar=1[{next}]"
-                ));
-                base = next;
-            } else {
-                let mid = start + (end - start) / 2;
-                let progress = blend.progress_at(mid);
-                let left_v = emit_picture(
-                    graph, sequence, media, left, start, end, width, height, fps, dur,
-                    1.0 - progress, mid,
-                )?;
-                let right_v = emit_picture(
-                    graph, sequence, media, right, start, end, width, height, fps, dur, progress, mid,
-                )?;
-                for layer in [left_v, right_v] {
-                    let next = graph.lab();
-                    graph.filters.push(format!(
-                        "[{base}][{layer}]overlay=0:0:format=auto:eof_action=pass:shortest=1,format=yuv420p,setsar=1[{next}]"
-                    ));
-                    base = next;
-                }
-            }
-        } else if let Some(clip) = track
-            .clips
-            .iter()
-            .find(|clip| clip.enabled && clip.timeline_in.0 < end && clip.timeline_out.0 > start)
-        {
-            let layer = emit_picture(
-                graph, sequence, media, clip, start, end, width, height, fps, dur, 1.0, start,
-            )?;
-            let next = graph.lab();
-            graph.filters.push(format!(
-                "[{base}][{layer}]overlay=0:0:format=auto:eof_action=pass:shortest=1,format=yuv420p,setsar=1[{next}]"
-            ));
-            base = next;
-        }
-    }
-    Ok(base)
-}
-
-struct Blend {
-    left: editor_core::ClipId,
-    right: editor_core::ClipId,
-    kind: TransitionKind,
-    start: i64,
-    end: i64,
-    exact: bool,
-}
-
-impl Blend {
-    fn progress_at(&self, frame: i64) -> f32 {
-        let span = (self.end - self.start).max(1) as f32;
-        ((frame - self.start) as f32 / span).clamp(0.0, 1.0)
-    }
-}
-
-fn transition_on(track: &Track, start: i64, end: i64) -> Option<Blend> {
-    for transition in &track.transitions {
-        let Some(left) = track.clips.iter().find(|clip| clip.id == transition.left_clip) else {
-            continue;
-        };
-        let (t0, t1) = transition.range(left.timeline_out);
-        if start >= t0.0 && end <= t1.0 && t1.0 > t0.0 {
-            return Some(Blend {
-                left: transition.left_clip,
-                right: transition.right_clip,
-                kind: transition.kind.clone(),
-                start: t0.0,
-                end: t1.0,
-                exact: start == t0.0 && end == t1.0,
-            });
-        }
-    }
-    None
-}
-
-fn xfade_name(kind: &TransitionKind) -> &'static str {
-    match kind {
-        TransitionKind::CrossDissolve => "fade",
-        TransitionKind::Wipe { .. } => "wipeleft",
-        TransitionKind::PushSlide { .. } => "slideleft",
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_picture(
-    graph: &mut Graph,
-    sequence: &Sequence,
-    media: &[MediaAsset],
-    clip: &Clip,
-    start: i64,
-    end: i64,
-    width: u32,
-    height: u32,
-    fps: &str,
-    dur: f64,
-    opacity_scale: f32,
-    eval_frame: i64,
-) -> Result<String, String> {
-    let asset = clip
-        .media_id
-        .and_then(|id| media.iter().find(|item| item.id == id))
-        .ok_or_else(|| format!("{} has no media", clip.name))?;
-    if !asset.has_video {
-        return Err(format!("{} has no picture", clip.name));
-    }
-    let resolved = crate::resolve_media_path(&asset.path);
-    if !resolved.is_file() {
-        return Err(format!("{} is offline ({})", clip.name, asset.path));
-    }
-    let src_start_frame = source_frame_at(clip, Frame(start), sequence.timebase);
-    let src_end_frame = source_frame_at(clip, Frame(end), sequence.timebase);
-    let src_start = src_start_frame
-        .to_seconds(clip.media_timebase)
-        .max(0.0);
-    let src_span = (src_end_frame.0 - src_start_frame.0).max(1) as f64
-        * clip.media_timebase.frame_duration_secs();
-    let rel = eval_frame - clip.timeline_in.0;
-    let grade = grade_filter(color_grade(&clip.effects), rel);
-    let xform = transform(&clip.effects).cloned().unwrap_or_else(Transform::identity);
-    let opacity = (xform.opacity.value_at(rel) * opacity_scale).clamp(0.0, 1.0);
-    let scale_x = xform.scale_x.value_at(rel).abs().max(0.01);
-    let scale_y = xform.scale_y.value_at(rel).abs().max(0.01);
-    let pos_x = xform.position_x.value_at(rel);
-    let pos_y = xform.position_y.value_at(rel);
-    let rotation = xform.rotation_deg.value_at(rel);
-    let full = (scale_x - 1.0).abs() < 0.015
-        && (scale_y - 1.0).abs() < 0.015
-        && pos_x.abs() < 0.5
-        && pos_y.abs() < 0.5
-        && rotation.abs() < 0.05
-        && opacity > 0.999;
-
-    let index = graph.add_input(&resolved.to_string_lossy());
-    let fitted = graph.lab();
-    let speed = if src_span > 0.001 { dur / src_span } else { 1.0 };
-    graph.filters.push(format!(
-        "[{index}:v]trim=start={}:end={},setpts={speed}*(PTS-STARTPTS),fps={fps},{grade}scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,trim=duration={},setpts=PTS-STARTPTS[{fitted}]",
-        secs(src_start),
-        secs(src_start + src_span.max(1.0 / 1000.0)),
-        secs(dur),
-        speed = format!("{speed:.6}"),
-        grade = grade,
-    ));
-    if full {
-        let out = graph.lab();
-        graph.filters.push(format!(
-            "[{fitted}]format=yuv420p,fps={fps},trim=duration={},setpts=PTS-STARTPTS[{out}]",
-            secs(dur)
-        ));
-        return Ok(out);
-    }
-    let sw = even_dim((width as f32 * scale_x).round().max(2.0) as u32);
-    let sh = even_dim((height as f32 * scale_y).round().max(2.0) as u32);
-    let scaled = graph.lab();
-    let mut chain = format!("[{fitted}]scale={sw}:{sh}:flags=bilinear,setsar=1");
-    if rotation.abs() > 0.05 {
-        let radians = rotation.to_radians();
-        chain.push_str(&format!(
-            ",rotate={radians:.6}:ow=rotw({radians:.6}):oh=roth({radians:.6}):c=none:fillcolor=black@0"
-        ));
-    }
-    chain.push_str(&format!(
-        ",format=rgba,colorchannelmixer=aa={opacity:.4}[{scaled}]"
-    ));
-    graph.filters.push(chain);
-    let plate = graph.lab();
-    graph.filters.push(format!(
-        "color=c=black@0:s={width}x{height}:r={fps}:d={},format=rgba[{plate}]",
-        secs(dur)
-    ));
-    let out = graph.lab();
-    graph.filters.push(format!(
-        "[{plate}][{scaled}]overlay=x='(main_w-overlay_w)/2+({pos_x:.2})':y='(main_h-overlay_h)/2-({pos_y:.2})':format=auto:eof_action=pass:shortest=1,format=yuva420p,setsar=1[{out}]"
-    ));
-    Ok(out)
-}
-
-fn grade_filter(grade: Option<&ColorGrade>, rel: i64) -> String {
-    let Some(grade) = grade else {
-        return String::new();
-    };
-    let exposure = grade.exposure.value_at(rel);
-    let contrast = grade.contrast.value_at(rel).clamp(0.0, 4.0);
-    let saturation = grade.saturation.value_at(rel).clamp(0.0, 4.0);
-    let shadows = (grade.shadows.value_at(rel) * 0.35).clamp(-1.0, 1.0);
-    let highlights = (grade.highlights.value_at(rel) * 0.35).clamp(-1.0, 1.0);
-    let temperature = grade.temperature.value_at(rel).clamp(-1.0, 1.0);
-    let tint = grade.tint.value_at(rel).clamp(-1.0, 1.0);
-    let neutral = exposure.abs() < 1.0e-3
-        && (contrast - 1.0).abs() < 1.0e-3
-        && (saturation - 1.0).abs() < 1.0e-3
-        && shadows.abs() < 1.0e-3
-        && highlights.abs() < 1.0e-3
-        && temperature.abs() < 1.0e-3
-        && tint.abs() < 1.0e-3;
-    if neutral {
-        return String::new();
-    }
-    let rm = (temperature * 0.25 + tint * 0.08).clamp(-1.0, 1.0);
-    let gm = (-tint * 0.20).clamp(-1.0, 1.0);
-    let bm = (-temperature * 0.25 + tint * 0.08).clamp(-1.0, 1.0);
-    format!(
-        "exposure=exposure={exposure:.4}:black=0,eq=contrast={contrast:.4}:saturation={saturation:.4},colorbalance=rs={shadows:.4}:gs={shadows:.4}:bs={shadows:.4}:rh={highlights:.4}:gh={highlights:.4}:bh={highlights:.4}:rm={rm:.4}:gm={gm:.4}:bm={bm:.4},"
-    )
 }
 
 fn slice_audio(
@@ -867,26 +745,6 @@ fn audible_pieces(
     pieces
 }
 
-fn burn_drawtext(graph: &mut Graph, input: &str, cues: &[(f64, f64, String)], font: &Path) -> String {
-    let mut label = input.to_string();
-    let font = escape_filter_path(&font.to_string_lossy());
-    for (start, end, text) in cues {
-        if *end <= *start {
-            continue;
-        }
-        let text = escape_drawtext(text);
-        if text.is_empty() {
-            continue;
-        }
-        let next = graph.lab();
-        graph.filters.push(format!(
-            "[{label}]drawtext=fontfile='{font}':text='{text}':fontsize=28:fontcolor=white:borderw=2:bordercolor=black:x=(w-text_w)/2:y=h-th-48:enable='between(t\\,{start:.3}\\,{end:.3})'[{next}]"
-        ));
-        label = next;
-    }
-    label
-}
-
 fn caption_cues(sequence: &Sequence, range_in: i64, range_out: i64) -> Vec<(f64, f64, String)> {
     let mut cues = Vec::new();
     for track in &sequence.tracks {
@@ -897,8 +755,14 @@ fn caption_cues(sequence: &Sequence, range_in: i64, range_out: i64) -> Vec<(f64,
             if cue.timeline_out.0 <= range_in || cue.timeline_in.0 >= range_out {
                 continue;
             }
-            let start = frames_secs(cue.timeline_in.0.max(range_in) - range_in, sequence.timebase);
-            let end = frames_secs(cue.timeline_out.0.min(range_out) - range_in, sequence.timebase);
+            let start = frames_secs(
+                cue.timeline_in.0.max(range_in) - range_in,
+                sequence.timebase,
+            );
+            let end = frames_secs(
+                cue.timeline_out.0.min(range_out) - range_in,
+                sequence.timebase,
+            );
             if end > start && !cue.text.trim().is_empty() {
                 cues.push((start, end, cue.text.clone()));
             }
@@ -908,211 +772,16 @@ fn caption_cues(sequence: &Sequence, range_in: i64, range_out: i64) -> Vec<(f64,
     cues
 }
 
-fn video_boundaries(sequence: &Sequence, range_in: i64, range_out: i64) -> Vec<i64> {
-    let mut marks = vec![range_in, range_out];
-    let transitions = transition_ranges(sequence);
-    for track in sequence
-        .tracks
-        .iter()
-        .filter(|track| track.kind == TrackKind::Video)
-    {
-        for clip in &track.clips {
-            push_mark(&mut marks, clip.timeline_in.0, range_in, range_out, &transitions);
-            push_mark(&mut marks, clip.timeline_out.0, range_in, range_out, &transitions);
-            for effect in &clip.effects {
-                for frame in effect_key_frames(effect, clip.timeline_in.0) {
-                    push_mark(&mut marks, frame, range_in, range_out, &transitions);
-                }
-            }
-        }
-        for transition in &track.transitions {
-            if let Some(left) = track.clips.iter().find(|clip| clip.id == transition.left_clip) {
-                let (start, end) = transition.range(left.timeline_out);
-                push_edge(&mut marks, start.0, range_in, range_out);
-                push_edge(&mut marks, end.0, range_in, range_out);
-            }
-        }
-    }
-    marks.sort_unstable();
-    marks.dedup();
-    marks
-}
-
-fn push_mark(marks: &mut Vec<i64>, frame: i64, inn: i64, out: i64, transitions: &[(i64, i64)]) {
-    if frame <= inn || frame >= out {
-        return;
-    }
-    if transitions
-        .iter()
-        .any(|(start, end)| frame > *start && frame < *end)
-    {
-        return;
-    }
-    marks.push(frame);
-}
-
-fn push_edge(marks: &mut Vec<i64>, frame: i64, inn: i64, out: i64) {
-    if frame > inn && frame < out {
-        marks.push(frame);
-    }
-}
-
-fn transition_ranges(sequence: &Sequence) -> Vec<(i64, i64)> {
-    let mut ranges = Vec::new();
-    for track in &sequence.tracks {
-        for transition in &track.transitions {
-            if let Some(left) = track.clips.iter().find(|clip| clip.id == transition.left_clip) {
-                let (start, end) = transition.range(left.timeline_out);
-                if end.0 > start.0 {
-                    ranges.push((start.0, end.0));
-                }
-            }
-        }
-    }
-    ranges
-}
-
-fn effect_key_frames(effect: &Effect, timeline_in: i64) -> Vec<i64> {
-    let mut frames = Vec::new();
-    match effect {
-        Effect::Color(grade) => {
-            for anim in [
-                &grade.exposure,
-                &grade.contrast,
-                &grade.highlights,
-                &grade.shadows,
-                &grade.temperature,
-                &grade.tint,
-                &grade.saturation,
-            ] {
-                push_keys(&mut frames, anim, timeline_in);
-            }
-        }
-        Effect::Transform(xform) => {
-            for anim in [
-                &xform.position_x,
-                &xform.position_y,
-                &xform.scale_x,
-                &xform.scale_y,
-                &xform.rotation_deg,
-                &xform.anchor_x,
-                &xform.anchor_y,
-                &xform.opacity,
-            ] {
-                push_keys(&mut frames, anim, timeline_in);
-            }
-        }
-    }
-    frames
-}
-
-fn push_keys(frames: &mut Vec<i64>, anim: &AnimatedF32, timeline_in: i64) {
-    for key in &anim.keys {
-        frames.push(timeline_in + key.frame);
-    }
-}
-
-fn pairs(marks: &[i64]) -> Vec<(i64, i64)> {
-    marks.windows(2).map(|pair| (pair[0], pair[1])).collect()
-}
-
-fn subdivide_animated(sequence: &Sequence, slices: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
-    const STEP: i64 = 6;
-    let mut out = Vec::new();
-    for (start, end) in slices {
-        if end <= start {
-            continue;
-        }
-        let inside_transition = sequence.tracks.iter().any(|track| {
-            transition_on(track, start, end).is_some_and(|blend| blend.exact)
-        });
-        if inside_transition || !slice_changes(sequence, start, end) || end - start <= STEP {
-            out.push((start, end));
-            continue;
-        }
-        let mut cursor = start;
-        while cursor < end {
-            let next = (cursor + STEP).min(end);
-            out.push((cursor, next));
-            cursor = next;
-        }
-    }
-    out
-}
-
-fn slice_changes(sequence: &Sequence, start: i64, end: i64) -> bool {
-    for track in sequence
-        .tracks
-        .iter()
-        .filter(|track| track.kind == TrackKind::Video && track_visible(track, &sequence.tracks))
-    {
-        for clip in track.clips.iter().filter(|clip| {
-            clip.enabled && clip.timeline_in.0 < end && clip.timeline_out.0 > start
-        }) {
-            let rel0 = start - clip.timeline_in.0;
-            let rel1 = end - clip.timeline_in.0;
-            for effect in &clip.effects {
-                if effect_changes(effect, rel0, rel1) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-fn effect_changes(effect: &Effect, rel0: i64, rel1: i64) -> bool {
-    match effect {
-        Effect::Color(grade) => [
-            &grade.exposure,
-            &grade.contrast,
-            &grade.highlights,
-            &grade.shadows,
-            &grade.temperature,
-            &grade.tint,
-            &grade.saturation,
-        ]
-        .into_iter()
-        .any(|anim| anim_changes(anim, rel0, rel1)),
-        Effect::Transform(xform) => [
-            &xform.position_x,
-            &xform.position_y,
-            &xform.scale_x,
-            &xform.scale_y,
-            &xform.rotation_deg,
-            &xform.opacity,
-        ]
-        .into_iter()
-        .any(|anim| anim_changes(anim, rel0, rel1)),
-    }
-}
-
-fn anim_changes(anim: &AnimatedF32, rel0: i64, rel1: i64) -> bool {
-    if anim.keys.is_empty() {
-        return false;
-    }
-    (anim.value_at(rel0) - anim.value_at(rel1)).abs() > 1.0e-3
-        || anim.keys.iter().any(|key| key.frame > rel0 && key.frame < rel1)
-}
-
-fn track_visible(track: &Track, tracks: &[Track]) -> bool {
-    if track.muted {
-        return false;
-    }
-    let any_solo = tracks.iter().any(|item| item.kind == track.kind && item.solo);
-    if any_solo {
-        track.solo
-    } else {
-        true
-    }
-}
-
 fn export_bounds(sequence: &Sequence, range: ExportRange) -> Result<(i64, i64), String> {
     let end = sequence.end_frame().0.max(0);
     let (inn, out) = match range {
         ExportRange::InOut => {
             let inn = sequence.in_point.unwrap_or(Frame::ZERO).0.max(0);
-            let out = sequence.out_point.map(|frame| frame.0).unwrap_or(end).max(inn);
+            let out = sequence
+                .out_point
+                .map(|frame| frame.0)
+                .unwrap_or(end)
+                .max(inn);
             (inn, out)
         }
         ExportRange::WholeSequence => (0, end),
@@ -1152,27 +821,6 @@ fn srt_time(secs: f64) -> String {
     format!("{hours:02}:{mins:02}:{whole:02},{millis:03}")
 }
 
-fn escape_drawtext(text: &str) -> String {
-    let mut out = String::new();
-    for ch in text.chars() {
-        match ch {
-            '\\' | ':' | '\'' | '%' | ',' | '[' | ']' | ';' => {
-                out.push('\\');
-                out.push(ch);
-            }
-            '\n' | '\r' => out.push(' '),
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
-fn escape_filter_path(path: &str) -> String {
-    path.replace('\\', "\\\\")
-        .replace(':', "\\:")
-        .replace('\'', "\\'")
-}
-
 fn codec_args(codec: &str) -> Vec<String> {
     match codec.trim().to_ascii_lowercase().as_str() {
         "h.265" | "h265" | "hevc" => split_args(
@@ -1195,6 +843,39 @@ fn split_args(text: &str) -> Vec<String> {
     text.split_whitespace().map(str::to_string).collect()
 }
 
+#[cfg(all(test, feature = "ffmpeg"))]
+fn block_mae(rgba: &[u8], rgb: &[u8], width: u32, height: u32, block: u32) -> f32 {
+    let bw = (width / block).max(1);
+    let bh = (height / block).max(1);
+    let mut err = 0.0f32;
+    let mut count = 0.0f32;
+    for by in 0..bh {
+        for bx in 0..bw {
+            let mut src = [0.0f32; 3];
+            let mut dst = [0.0f32; 3];
+            let mut n = 0.0f32;
+            let x0 = bx * block;
+            let y0 = by * block;
+            for y in y0..(y0 + block).min(height) {
+                for x in x0..(x0 + block).min(width) {
+                    let rgba_i = (y as usize * width as usize + x as usize) * 4;
+                    let rgb_i = (y as usize * width as usize + x as usize) * 3;
+                    for channel in 0..3 {
+                        src[channel] += rgba[rgba_i + channel] as f32;
+                        dst[channel] += rgb[rgb_i + channel] as f32;
+                    }
+                    n += 1.0;
+                }
+            }
+            for channel in 0..3 {
+                err += (src[channel] / n - dst[channel] / n).abs();
+                count += 1.0;
+            }
+        }
+    }
+    err / count.max(1.0)
+}
+
 fn container_name(container: &str) -> &'static str {
     match container.trim().to_ascii_lowercase().as_str() {
         "mov" => "mov",
@@ -1207,8 +888,8 @@ fn container_name(container: &str) -> &'static str {
 mod tests {
     use super::*;
     use editor_core::{
-        Clip, ClipId, CueId, MediaId, SequenceId, TrackId, Transition, TransitionAlign,
-        TransitionId,
+        Clip, ClipId, ColorGrade, CueId, Effect, MediaId, SequenceId, TrackId, Transform,
+        Transition, TransitionAlign, TransitionId, TransitionKind,
     };
 
     fn touch(dir: &std::path::Path, name: &str) -> String {
@@ -1295,20 +976,37 @@ mod tests {
             asset(2, &pip, true, false),
             asset(3, &voice, false, true),
         ];
-        let script = plan_encode(
-            &sequence,
-            &media,
-            ExportRange::InOut,
-            "H.264",
-            "mp4",
-            true,
-        )
-        .unwrap();
-        assert!(script.filter.contains("exposure=exposure=0.5000"));
-        assert!(script.filter.contains("xfade=transition=fade"));
-        assert!(script.filter.contains("overlay="));
+        let script =
+            plan_encode(&sequence, &media, ExportRange::InOut, "H.264", "mp4", true).unwrap();
+        let pip_frame = &script.raster.frames[8];
+        assert!(
+            pip_frame
+                .layers
+                .iter()
+                .any(|layer| (layer.grade.exposure - 0.5).abs() < 1.0e-4),
+            "graded base missing"
+        );
+        let pip = pip_frame
+            .layers
+            .iter()
+            .find(|layer| (layer.place.scale_x - 0.4).abs() < 1.0e-3)
+            .expect("picture-in-picture layer");
+        assert!((pip.place.pos_x - 40.0).abs() < 1.0e-3);
+        assert!((pip.place.pos_y - (-20.0)).abs() < 1.0e-3);
+        assert!((pip.place.anchor_x - 0.5).abs() < 1.0e-3);
+        assert!(
+            pip_frame.layers.len() >= 2,
+            "base should sit under the inset"
+        );
+        let dissolve = &script.raster.frames[36];
+        assert!(dissolve.layers.len() >= 2, "dissolve needs both sides");
+        assert!((dissolve.layers[0].place.opacity - 1.0).abs() < 1.0e-3);
+        assert!((dissolve.layers[1].place.opacity - 0.5).abs() < 1.0e-3);
+        assert!(script.raster.frames[0]
+            .captions
+            .iter()
+            .any(|line| line.contains("Hello, ridge")));
         assert!(script.filter.contains("volume=0.2500"));
-        assert!(script.filter.contains("drawtext="));
         assert!(script.srt.contains("Hello, ridge"));
         assert!(script.codec_args.iter().any(|arg| arg == "libx264"));
         assert!((script.duration_secs - 2.0).abs() < 1.0e-6);
@@ -1352,8 +1050,20 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(script.filter.contains("color=c=black"));
-        assert!(!script.inputs.iter().any(|path| path.ends_with("picture.mp4")));
+        assert!(script
+            .raster
+            .frames
+            .iter()
+            .all(|frame| frame.layers.is_empty()));
+        assert!(script
+            .raster
+            .frames
+            .iter()
+            .all(|frame| frame.captions.is_empty()));
+        assert!(!script
+            .inputs
+            .iter()
+            .any(|path| path.ends_with("picture.mp4")));
         assert!(script.inputs.iter().any(|path| path.ends_with("keep.wav")));
         assert!(!script.inputs.iter().any(|path| path.ends_with("drop.wav")));
         assert!(script.srt.is_empty());
@@ -1522,6 +1232,143 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "ffmpeg")]
+    #[test]
+    fn exported_pip_frame_stays_close_to_the_shared_composite() {
+        if crate::preview_backend() != crate::PreviewBackend::Cli {
+            return;
+        }
+        let mut project = editor_core::demo_project();
+        let sequence = project.active_mut().unwrap();
+        sequence.in_point = Some(Frame(60));
+        sequence.out_point = Some(Frame(61));
+        let sequence = project.active().unwrap();
+        let script = plan_encode(
+            sequence,
+            &project.media,
+            ExportRange::InOut,
+            "H.264",
+            "mp4",
+            true,
+        )
+        .unwrap();
+        assert_eq!(script.raster.frames.len(), 1);
+        assert_eq!(script.raster.frames[0].layers.len(), 2);
+        assert!(script.raster.frames[0]
+            .captions
+            .iter()
+            .any(|line| line.contains("ridge")));
+        let mut cache = DecodeCache::default();
+        let rgba = render_frame(&script.raster.frames[0], &script.raster, &mut cache).unwrap();
+        let dir = std::env::temp_dir().join(format!("meridian-match-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let composite_png = dir.join("composite.png");
+        let raw = dir.join("composite.rgba");
+        std::fs::write(&raw, &rgba).unwrap();
+        let dumped = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgba",
+                "-s",
+            ])
+            .arg(format!("{}x{}", script.raster.width, script.raster.height))
+            .arg("-i")
+            .arg(&raw)
+            .args(["-frames:v", "1"])
+            .arg(&composite_png)
+            .status()
+            .unwrap();
+        assert!(dumped.success());
+        let output = dir.join("out.mp4");
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(ExportSnapshot {
+            fraction: 0.0,
+            message: String::new(),
+            finished: false,
+            ok: false,
+        }));
+        encode_blocking(&script, &output, &cancel, &shared).unwrap();
+        let encoded = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&output)
+            .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+            .output()
+            .unwrap();
+        assert!(encoded.status.success());
+        let rgb = &encoded.stdout;
+        assert_eq!(
+            rgb.len(),
+            script.raster.width as usize * script.raster.height as usize * 3
+        );
+        let mae = block_mae(&rgba, rgb, script.raster.width, script.raster.height, 16);
+        if std::env::var_os("MERIDIAN_PROOF").is_some() {
+            let _ = std::fs::copy(&composite_png, "/tmp/meridian-composite.png");
+            let _ = std::fs::copy(&output, "/tmp/meridian-pip.mp4");
+            let export_png = dir.join("export.png");
+            let _ = std::process::Command::new("ffmpeg")
+                .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+                .arg(&output)
+                .args(["-frames:v", "1"])
+                .arg(&export_png)
+                .status();
+            let _ = std::fs::copy(&export_png, "/tmp/meridian-export.png");
+            for (frame, name) in [(144i64, "dissolve"), (264, "wipe")] {
+                let mut project = editor_core::demo_project();
+                let sequence = project.active_mut().unwrap();
+                sequence.in_point = Some(Frame(frame));
+                sequence.out_point = Some(Frame(frame + 1));
+                let sequence = project.active().unwrap();
+                let script = plan_encode(
+                    sequence,
+                    &project.media,
+                    ExportRange::InOut,
+                    "H.264",
+                    "mp4",
+                    true,
+                )
+                .unwrap();
+                let mut cache = DecodeCache::default();
+                let rgba =
+                    render_frame(&script.raster.frames[0], &script.raster, &mut cache).unwrap();
+                let raw = dir.join(format!("{name}.rgba"));
+                std::fs::write(&raw, &rgba).unwrap();
+                let png = dir.join(format!("{name}.png"));
+                let _ = std::process::Command::new("ffmpeg")
+                    .args([
+                        "-y",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-f",
+                        "rawvideo",
+                        "-pix_fmt",
+                        "rgba",
+                        "-s",
+                    ])
+                    .arg(format!("{}x{}", script.raster.width, script.raster.height))
+                    .arg("-i")
+                    .arg(&raw)
+                    .args(["-frames:v", "1"])
+                    .arg(&png)
+                    .status();
+                let _ = std::fs::copy(&png, format!("/tmp/meridian-{name}.png"));
+            }
+            eprintln!("block mae {mae:.3}");
+        }
+        assert!(
+            mae < 8.0,
+            "export drifted from the shared composite (16px block mae {mae:.2})"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(all(feature = "ffmpeg", feature = "whisper"))]
     #[test]
     fn whisper_words_become_burned_captions_on_a_graded_export() {
@@ -1538,7 +1385,8 @@ mod tests {
         {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("meridian-whisper-export-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("meridian-whisper-export-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let wav = dir.join("voice.wav");
@@ -1553,13 +1401,25 @@ mod tests {
         let clip_path = dir.join("speech.mp4");
         let status = std::process::Command::new("ffmpeg")
             .args([
-                "-y", "-hide_banner", "-loglevel", "error",
-                "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=6",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x180:rate=24:duration=6",
                 "-i",
             ])
             .arg(&wav)
             .args([
-                "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                "-shortest",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
             ])
             .arg(&clip_path)
             .status()
@@ -1600,7 +1460,10 @@ mod tests {
             .map(|cue| cue.text.to_ascii_lowercase())
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(joined.contains("ridge") || joined.contains("came"), "{joined}");
+        assert!(
+            joined.contains("ridge") || joined.contains("came"),
+            "{joined}"
+        );
         for (index, draft) in drafts.iter().enumerate() {
             sequence.tracks[2].cues.push(editor_core::CaptionCue {
                 id: CueId(100 + index as u64),
@@ -1619,8 +1482,19 @@ mod tests {
             true,
         )
         .unwrap();
-        assert!(script.filter.contains("exposure=exposure=0.4500"));
-        assert!(script.filter.contains("drawtext="));
+        assert!(script
+            .raster
+            .frames
+            .iter()
+            .any(|frame| frame
+                .layers
+                .iter()
+                .any(|layer| (layer.grade.exposure - 0.45).abs() < 1.0e-4)));
+        assert!(script
+            .raster
+            .frames
+            .iter()
+            .any(|frame| !frame.captions.is_empty()));
         assert!(script.filter.contains("volume=0.8000"));
         let output = dir.join("out.mp4");
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1634,8 +1508,13 @@ mod tests {
         let frame = dir.join("frame.png");
         let dumped = std::process::Command::new("ffmpeg")
             .args([
-                "-y", "-hide_banner", "-loglevel", "error",
-                "-ss", "1.0", "-i",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                "1.0",
+                "-i",
             ])
             .arg(&output)
             .args(["-frames:v", "1"])
@@ -1645,10 +1524,7 @@ mod tests {
         assert!(dumped.success());
         let raw = dir.join("frame.rgb");
         let dumped = std::process::Command::new("ffmpeg")
-            .args([
-                "-y", "-hide_banner", "-loglevel", "error",
-                "-i",
-            ])
+            .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
             .arg(&frame)
             .args(["-f", "rawvideo", "-pix_fmt", "rgb24"])
             .arg(&raw)
@@ -1676,14 +1552,19 @@ mod tests {
             let var = (sq as f32 / count as f32) - mean * mean;
             (mean, var.max(0.0).sqrt())
         };
-        // drawtext sits at y = h - text_h - 48, about rows 96–132 on a 180p frame.
+        let style = crate::caption_style(180);
+        let band_bottom = 180 - style.margin as usize;
+        let band_top = band_bottom.saturating_sub(style.glyph as usize + 8);
         let (picture, _) = stats(20, 70);
-        let (burned, burned_dev) = stats(96, 136);
+        let (burned, burned_dev) = stats(band_top, band_bottom);
         if std::env::var_os("MERIDIAN_KEEP_EXPORT").is_some() {
             let _ = std::fs::copy(&output, "/tmp/meridian-whisper-export.mp4");
             let _ = std::fs::copy(&frame, "/tmp/meridian-whisper-frame.png");
         }
-        assert!(picture > 40.0, "graded picture is unexpectedly dark: {picture}");
+        assert!(
+            picture > 40.0,
+            "graded picture is unexpectedly dark: {picture}"
+        );
         assert!(
             burned_dev > 35.0,
             "caption band is flat (mean {burned}, stddev {burned_dev}); cues: {joined}"

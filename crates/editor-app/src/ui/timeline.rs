@@ -279,7 +279,11 @@ fn transport(ui: &mut egui::Ui, app: &mut MeridianApp) {
             egui::RichText::new(rate)
                 .size(11.0)
                 .monospace()
-                .color(if app.playing { THEME.accent } else { THEME.text_mute }),
+                .color(if app.playing {
+                    THEME.accent
+                } else {
+                    THEME.text_mute
+                }),
         );
     });
     let mut scrub_ui = ui.new_child(
@@ -424,7 +428,8 @@ fn ruler(
     }
     if app.reveal_playhead {
         let x = rect.min.x + app.playhead as f32 * ppf;
-        let target = Rect::from_center_size(pos2(x, rect.center().y), Vec2::new(48.0, rect.height()));
+        let target =
+            Rect::from_center_size(pos2(x, rect.center().y), Vec2::new(48.0, rect.height()));
         ui.scroll_to_rect(target, None);
         app.reveal_playhead = false;
     }

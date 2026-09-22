@@ -66,7 +66,7 @@ fn deliver_body(ui: &mut egui::Ui, app: &mut MeridianApp, sequence: &editor_core
             ui.add_space(8.0);
             ui.label(
                 RichText::new(
-                    "Export encodes this sequence with ffmpeg: top-to-bottom picture, grade and transform, audio gain, and captions. H.264 / AAC in an mp4 is the tested path.",
+                    "Export runs the same composite as the program monitor — stacked tracks, grade, transform, dissolves, wipes, pushes, and burned captions — then ffmpeg encodes it. H.264 / AAC in an mp4 is the tested path.",
                 )
                 .size(12.5)
                 .color(THEME.text_dim),
