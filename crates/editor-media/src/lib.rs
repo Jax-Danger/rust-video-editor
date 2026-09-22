@@ -20,10 +20,10 @@ mod probe;
 mod transcribe;
 
 pub use composite::{
-    active_captions, apply_transition, burn_captions, caption_style, composite, mask_allows,
-    mask_window, place_from_transform, program_stack, transition_motion, video_track_visible,
-    BlitLayer, CanvasMask, CaptionStyle, GradeSample, MaskWindow, Place, ProgramLayer,
-    ProgramStack, TransitionMotion,
+    active_captions, apply_transition, burn_captions, caption_style, compose_layers, composite,
+    mask_allows, mask_window, place_from_transform, program_stack, render_title, transition_motion,
+    video_track_visible, BlitLayer, CanvasMask, CaptionStyle, GradeSample, LayerSource, MaskWindow,
+    Place, ProgramLayer, ProgramStack, TransitionMotion,
 };
 pub use decode::{
     clamp_preview_time, decode_audio, decode_frames, ensure_time_in_range, fit_preview_size,

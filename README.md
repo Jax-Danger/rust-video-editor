@@ -14,7 +14,7 @@ Meridian is a desktop non-linear editor written in Rust. The timeline is frame-a
 
 `editor-core` never stores an edit in floating-point seconds. A [`Timebase`](crates/editor-core/src/time.rs) is a rational frame rate. A [`Frame`](crates/editor-core/src/time.rs) is an `i64` index on that rate. Media time is an integer tick count (`MediaTime`) and converts onto the sequence with rounded rational arithmetic. Drop-frame timecode is used for 29.97 and 59.94.
 
-A project holds bins, media, and sequences. A sequence has video, audio, and caption tracks. Clips can be linked (picture and sound stay selected and split together). Markers, in/out, and transitions sit on the sequence.
+A project holds bins, media, and sequences. A sequence has video, audio, and caption tracks. Clips can be linked (picture and sound stay selected and split together). Markers, in/out, transitions, and title generators sit on the sequence.
 
 Edits are transactional. `Session` clones the project, runs the operation, and pushes the previous project onto the undo stack only when the edit succeeds. Interactive slider drags snapshot once at drag start.
 
@@ -50,7 +50,7 @@ sudo apt install gcc g++ cmake pkg-config libgtk-3-dev libasound2-dev ffmpeg \
 cargo run -p editor-app --features ffmpeg
 ```
 
-The first launch loads an in-memory example: three picture tracks, linked interview audio, a cross dissolve, a wipe, keyframed picture-in-picture, captions, and markers. **File → Open Example** returns to it. **File → Save** and **File → Save As** write pretty JSON through a native dialog. A copy of that example lives at [`samples/northline-opening.json`](samples/northline-opening.json). **File → Open** (Ctrl+O) reloads a project file.
+The first launch loads an in-memory example: three picture tracks, a lower-third title, linked interview audio, a cross dissolve, a wipe, keyframed picture-in-picture, captions, and markers. **File → Open Example** returns to it. **File → Save** and **File → Save As** write pretty JSON through a native dialog. A copy of that example lives at [`samples/northline-opening.json`](samples/northline-opening.json). **File → Open** (Ctrl+O) reloads a project file.
 
 ## Import
 
@@ -131,6 +131,16 @@ Wheels, curve, and sliders all run through the shared `GradeSample` compositor, 
 
 Transitions (cross dissolve, wipe, push) are centered on a cut and consume head and tail handles. Duration is in sequence frames.
 
+## Titles
+
+**File → New Title**, or **New Title** in the media pool, drops a five-second title generator on the highest video track that has room at the playhead. If every video track is busy, Meridian adds a track and places the title there. The clip is selected so the inspector can edit it.
+
+A title is not a media file. The clip stores the text, font size (a fraction of the frame height), colour, alignment, normalized position, and plate opacity. Those fields round-trip in the project JSON. Empty text draws nothing. The timeline labels the clip `T` plus the first line.
+
+Preview and Deliver rasterize that generator in `compose_layers` — the same composite that grades, transforms, and stacks picture. Glyphs are the built-in 8×8 bitmap, scaled to the font size, with a straight-alpha plate behind the block. A title on a higher video track paints over the picture under it. Opacity and transform on the clip still move the whole layer. When decode is off, the program monitor paints that same raster over the proxy cards, in track order, instead of a coloured stand-in.
+
+Northline opens with **NORTHLINE** on V3 for the first five seconds.
+
 ## Workspaces
 
 - **Edit** — media pool, program viewer, inspector, captions, timeline
@@ -138,7 +148,7 @@ Transitions (cross dissolve, wipe, push) are centered on a cut and consume head 
 - **Audio** — the mixer docks in this page: faders, pan, mute, solo, and meters in the track bay, with the program meter on the right and the timeline still underneath
 - **Deliver** — codec, container, in/out, and **Export**. With `--features ffmpeg` this encodes a real file. Without that feature, Export still writes the JSON manifest and says the encoder is compiled out.
 
-The program monitor draws mute/solo, grade, transform, dissolve, wipe, push, and caption burn-in as proxy cards when decode is off. With `--features ffmpeg` it decodes every visible video layer under the playhead and runs the same CPU compositor Deliver uses. Play, keyboard stepping, and mouse scrubbing all follow the sequence timebase. If ffmpeg is missing or every layer is offline, the proxy stays up and the viewer says why. Active caption cues are burned into that decoded picture; on the proxy they are drawn with the UI font in the same bottom safe area.
+The program monitor draws mute/solo, grade, transform, dissolve, wipe, push, and caption burn-in as proxy cards when decode is off. Title generators are the exception: proxy and decode both stamp the shared bitmap. With `--features ffmpeg` it decodes every visible video layer under the playhead and runs the same CPU compositor Deliver uses, titles included. Play, keyboard stepping, and mouse scrubbing all follow the sequence timebase. If ffmpeg is missing or every layer is offline, the proxy stays up and the viewer says why. Active caption cues are burned into that decoded picture; on the proxy they are drawn with the UI font in the same bottom safe area.
 
 ### What matches, and what is still approximate
 
@@ -152,6 +162,7 @@ Preview (`--features ffmpeg`) and Deliver call one compositor in `editor-media`.
 | Wipe | Yes | `angle_deg` is the direction the reveal travels: 0° left to right, 90° top to bottom, 180° from the right, 270° from the bottom. Other angles use the same half-plane per pixel. The proxy only clips axis-aligned wipes; a diagonal wipe on the proxy is a stand-in |
 | Push | Yes | Direction is left, right, up, or down. Both sides slide; they are not a crossfade |
 | Captions | Placement yes, glyphs mostly | Both burn the same 8×8 bitmap into the picture (about 32px at 1080p, 48px bottom margin). The proxy uses the UI font instead. Soft `mov_text` subtitles are still written. H.264 then quantizes the burn-in |
+| Titles | Yes | Generator clips on a video track. Text, size, colour, alignment, position, and plate are rasterized in `compose_layers` for the monitor and for Deliver. The proxy draws that same bitmap in track order |
 | Stacking | Yes | Simple alpha over only. No blend modes, no motion blur, no track mattes |
 
 A source is stretched to fill the clip's quad. It is not letterboxed when its aspect differs from the sequence. The monitor fits the sequence inside 960×540 before compositing; export composites at sequence size, with a decoded edge capped at 1920px. On the Northline picture-in-picture frame, a 16×16 block average of the H.264 export sits within about 1.3 levels of the CPU composite. That is the same picture through a codec, not a bit-identical file. Keyframes are evaluated on every frame in both paths.
