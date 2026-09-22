@@ -15,8 +15,8 @@
 //! decodes, so a ramp or a constant rate is the same picture in both.
 
 use editor_core::{
-    blur, clip_relative, color_grade, crop, picture_at, sharpen, source_frame_at, transform,
-    vignette, Clip, ColorGrade, Direction, Frame, MediaAsset, MulticamGroup, Sequence,
+    blur, chroma_key, clip_relative, color_grade, crop, picture_at, sharpen, source_frame_at,
+    transform, vignette, Clip, ColorGrade, Direction, Frame, MediaAsset, MulticamGroup, Sequence,
     SequenceId, Title, ToneCurve, Track, TrackKind, Transform, TransitionKind, MAX_NEST_DEPTH,
 };
 use font8x8::UnicodeFonts;
@@ -165,6 +165,10 @@ pub struct FilterSample {
     pub vignette_softness: f32,
     pub crop: [f32; 4],
     pub sharpen: f32,
+    pub chroma_key_color: [f32; 3],
+    pub chroma_key_tolerance: f32,
+    pub chroma_key_softness: f32,
+    pub chroma_key_spill: f32,
 }
 
 impl FilterSample {
@@ -175,6 +179,10 @@ impl FilterSample {
             vignette_softness: 0.5,
             crop: [0.0, 0.0, 0.0, 0.0],
             sharpen: 0.0,
+            chroma_key_color: [0.0, 1.0, 0.0],
+            chroma_key_tolerance: 0.0,
+            chroma_key_softness: 0.15,
+            chroma_key_spill: 0.0,
         }
     }
 
@@ -213,6 +221,32 @@ impl FilterSample {
                 .map(|f| f.amount.value_at(rel))
                 .unwrap_or(0.0)
                 .clamp(0.0, 2.0),
+            chroma_key_color: {
+                let ck = chroma_key(effects);
+                [
+                    ck.map(|f| f.key_red.value_at(rel))
+                        .unwrap_or(0.0)
+                        .clamp(0.0, 1.0),
+                    ck.map(|f| f.key_green.value_at(rel))
+                        .unwrap_or(1.0)
+                        .clamp(0.0, 1.0),
+                    ck.map(|f| f.key_blue.value_at(rel))
+                        .unwrap_or(0.0)
+                        .clamp(0.0, 1.0),
+                ]
+            },
+            chroma_key_tolerance: chroma_key(effects)
+                .map(|f| f.tolerance.value_at(rel))
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0),
+            chroma_key_softness: chroma_key(effects)
+                .map(|f| f.softness.value_at(rel))
+                .unwrap_or(0.15)
+                .clamp(0.0, 1.0),
+            chroma_key_spill: chroma_key(effects)
+                .map(|f| f.spill_suppression.value_at(rel))
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0),
         }
     }
 
@@ -221,6 +255,7 @@ impl FilterSample {
             && self.vignette_amount < 1.0e-4
             && self.crop.iter().all(|v| *v < 1.0e-4)
             && self.sharpen < 1.0e-4
+            && self.chroma_key_tolerance < 1.0e-4
     }
 }
 
@@ -1116,6 +1151,60 @@ fn solid_rgba(width: u32, height: u32, rgb: [f32; 3]) -> Vec<u8> {
     rgba
 }
 
+fn apply_chroma_key_spill(rgb: [f32; 3], key_color: [f32; 3], amount: f32) -> [f32; 3] {
+    let key_channel = if key_color[1] >= key_color[0] && key_color[1] >= key_color[2] {
+        1
+    } else if key_color[0] >= key_color[1] && key_color[0] >= key_color[2] {
+        0
+    } else {
+        2
+    };
+    let max_other = if key_channel == 0 {
+        rgb[1].max(rgb[2])
+    } else if key_channel == 1 {
+        rgb[0].max(rgb[2])
+    } else {
+        rgb[0].max(rgb[1])
+    };
+    let spill = rgb[key_channel] - max_other;
+    if spill <= 0.0 {
+        return rgb;
+    }
+    let mut out = rgb;
+    out[key_channel] -= spill * amount;
+    out
+}
+
+fn apply_chroma_key(
+    rgba: &mut [u8],
+    key_color: [f32; 3],
+    tolerance: f32,
+    softness: f32,
+    spill: f32,
+) {
+    let tol = tolerance * 0.75 + 0.01;
+    let soft = softness * 0.5 + 0.01;
+    for pixel in rgba.chunks_exact_mut(4) {
+        let r = pixel[0] as f32 / 255.0;
+        let g = pixel[1] as f32 / 255.0;
+        let b = pixel[2] as f32 / 255.0;
+        let dr = r - key_color[0];
+        let dg = g - key_color[1];
+        let db = b - key_color[2];
+        let dist = (dr * dr + dg * dg + db * db).sqrt();
+        let matte = smoothstep(tol - soft, tol + soft, dist);
+        let mut rgb = [r, g, b];
+        if spill > 1.0e-4 && matte > 0.1 {
+            rgb = apply_chroma_key_spill(rgb, key_color, spill);
+            pixel[0] = (rgb[0].clamp(0.0, 1.0) * 255.0).round() as u8;
+            pixel[1] = (rgb[1].clamp(0.0, 1.0) * 255.0).round() as u8;
+            pixel[2] = (rgb[2].clamp(0.0, 1.0) * 255.0).round() as u8;
+        }
+        let existing_alpha = pixel[3] as f32 / 255.0;
+        pixel[3] = (matte * existing_alpha * 255.0).round() as u8;
+    }
+}
+
 fn apply_filters(
     rgba: &mut [u8],
     width: u32,
@@ -1123,6 +1212,15 @@ fn apply_filters(
     filters: &FilterSample,
     extra_blur: f32,
 ) {
+    if filters.chroma_key_tolerance > 1.0e-4 {
+        apply_chroma_key(
+            rgba,
+            filters.chroma_key_color,
+            filters.chroma_key_tolerance,
+            filters.chroma_key_softness,
+            filters.chroma_key_spill,
+        );
+    }
     let blur_radius = filters.blur_radius.max(extra_blur);
     if blur_radius >= 0.5 {
         box_blur(rgba, width, height, blur_radius);
@@ -2325,6 +2423,65 @@ mod tests {
         assert_eq!(cropped[3], 0, "cropped corner is transparent");
         let centre = (8 * 16 + 8) * 4;
         assert_eq!(cropped[centre + 3], 255);
+    }
+
+    #[test]
+    fn chroma_key_keys_green_plate() {
+        let green = solid(16, 16, [0, 255, 0, 255]);
+        let mut keyed = green.clone();
+        apply_filters(
+            &mut keyed,
+            16,
+            16,
+            &FilterSample {
+                chroma_key_color: [0.0, 1.0, 0.0],
+                chroma_key_tolerance: 0.35,
+                chroma_key_softness: 0.15,
+                chroma_key_spill: 0.5,
+                ..FilterSample::neutral()
+            },
+            0.0,
+        );
+        let centre = (8 * 16 + 8) * 4;
+        assert_eq!(keyed[centre + 3], 0, "pure green centre is keyed out");
+
+        let mut composite_plate = vec![0u8; 16 * 16 * 4];
+        for y in 0..16 {
+            for x in 0..16 {
+                let idx = (y * 16 + x) * 4;
+                if x < 8 {
+                    composite_plate[idx] = 0;
+                    composite_plate[idx + 1] = 255;
+                    composite_plate[idx + 2] = 0;
+                } else {
+                    composite_plate[idx] = 200;
+                    composite_plate[idx + 1] = 80;
+                    composite_plate[idx + 2] = 60;
+                }
+                composite_plate[idx + 3] = 255;
+            }
+        }
+        let mut keyed_split = composite_plate.clone();
+        apply_filters(
+            &mut keyed_split,
+            16,
+            16,
+            &FilterSample {
+                chroma_key_color: [0.0, 1.0, 0.0],
+                chroma_key_tolerance: 0.35,
+                chroma_key_softness: 0.1,
+                chroma_key_spill: 0.0,
+                ..FilterSample::neutral()
+            },
+            0.0,
+        );
+        let green_side = (8 * 16 + 4) * 4;
+        let subject_side = (8 * 16 + 12) * 4;
+        assert_eq!(keyed_split[green_side + 3], 0, "green half is transparent");
+        assert!(
+            keyed_split[subject_side + 3] > 200,
+            "subject half stays opaque"
+        );
     }
 
     #[test]

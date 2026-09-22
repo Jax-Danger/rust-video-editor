@@ -48,11 +48,11 @@ pub use edit::{
     trim, update_cue_text, EditError, EqBand, SnapHit, SnapKind, SnapPoint, TrackFlag, TrimEdge,
 };
 pub use effects::{
-    blur, blur_mut, clip_relative, color_grade, color_grade_mut, crop, crop_mut, has_filter,
-    sharpen, sharpen_mut, transform, transform_mut, vignette, vignette_mut, AnimatedF32,
-    BlurFilter, ColorGrade, CropFilter, Effect, FilterKind, FilterParam, GradeParam, Interpolation,
-    KeyframeF32, RgbWheel, SharpenFilter, ToneCurve, Transform, TransformParam, VignetteFilter,
-    WheelChannel, WheelKind,
+    blur, blur_mut, chroma_key, chroma_key_mut, clip_relative, color_grade, color_grade_mut, crop,
+    crop_mut, has_filter, sharpen, sharpen_mut, transform, transform_mut, vignette, vignette_mut,
+    AnimatedF32, BlurFilter, ChromaKeyFilter, ColorGrade, CropFilter, Effect, FilterKind,
+    FilterParam, GradeParam, Interpolation, KeyframeF32, RgbWheel, SharpenFilter, ToneCurve,
+    Transform, TransformParam, VignetteFilter, WheelChannel, WheelKind,
 };
 pub use eq::{
     clamp_eq_db, ffmpeg_eq_filters, format_eq_db, process_interleaved, EqProcessor, TrackEq3,

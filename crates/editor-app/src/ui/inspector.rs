@@ -1,9 +1,9 @@
 use editor_core::{
-    blur, clip_relative, color_grade, crop, set_clip_gain_at, set_clip_speed, set_clip_title,
-    set_filter_at, set_grade_at, set_transform_at, sharpen, source_frame_at, toggle_filter_key,
-    toggle_grade_key, toggle_transform_key, toggle_volume_key, transform, vignette, ClipId,
-    ClipSpeed, FilterParam, GradeParam, LabelColor, MarkerId, TextAlign, Title, TrackKind,
-    TransformParam,
+    blur, chroma_key, clip_relative, color_grade, crop, set_clip_gain_at, set_clip_speed,
+    set_clip_title, set_filter_at, set_grade_at, set_transform_at, sharpen, source_frame_at,
+    toggle_filter_key, toggle_grade_key, toggle_transform_key, toggle_volume_key, transform,
+    vignette, ClipId, ClipSpeed, FilterParam, GradeParam, LabelColor, MarkerId, TextAlign, Title,
+    TrackKind, TransformParam,
 };
 use egui::{pos2, Align2, Rect, RichText, Sense, TextEdit, Vec2};
 
@@ -1195,11 +1195,75 @@ fn effects_controls(ui: &mut egui::Ui, app: &mut MeridianApp, clip_id: ClipId, r
         "Sharpen",
         0.0..=2.0,
     );
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add_space(2.0);
+        ui.vertical(|ui| {
+            widgets::section_label(ui, "Chroma Key");
+        });
+    });
+    filter_slider(
+        ui,
+        app,
+        clip_id,
+        rel,
+        FilterParam::ChromaKeyRed,
+        "Key red",
+        0.0..=1.0,
+    );
+    filter_slider(
+        ui,
+        app,
+        clip_id,
+        rel,
+        FilterParam::ChromaKeyGreen,
+        "Key green",
+        0.0..=1.0,
+    );
+    filter_slider(
+        ui,
+        app,
+        clip_id,
+        rel,
+        FilterParam::ChromaKeyBlue,
+        "Key blue",
+        0.0..=1.0,
+    );
+    filter_slider(
+        ui,
+        app,
+        clip_id,
+        rel,
+        FilterParam::ChromaKeyTolerance,
+        "Tolerance",
+        0.0..=1.0,
+    );
+    filter_slider(
+        ui,
+        app,
+        clip_id,
+        rel,
+        FilterParam::ChromaKeySoftness,
+        "Softness",
+        0.0..=1.0,
+    );
+    filter_slider(
+        ui,
+        app,
+        clip_id,
+        rel,
+        FilterParam::ChromaKeySpillSuppression,
+        "Spill suppression",
+        0.0..=1.0,
+    );
 }
 
 fn filter_value(app: &MeridianApp, clip: ClipId, rel: i64, param: FilterParam) -> (f32, bool) {
     let neutral = match param {
         FilterParam::VignetteSoftness => 0.5,
+        FilterParam::ChromaKeyGreen => 1.0,
+        FilterParam::ChromaKeySoftness => 0.15,
+        FilterParam::ChromaKeySpillSuppression => 0.5,
         _ => 0.0,
     };
     let Some(sequence) = app.session.project().active() else {
@@ -1217,6 +1281,14 @@ fn filter_value(app: &MeridianApp, clip: ClipId, rel: i64, param: FilterParam) -
         FilterParam::CropTop => crop(&clip.effects).map(|f| &f.top),
         FilterParam::CropBottom => crop(&clip.effects).map(|f| &f.bottom),
         FilterParam::SharpenAmount => sharpen(&clip.effects).map(|f| &f.amount),
+        FilterParam::ChromaKeyRed => chroma_key(&clip.effects).map(|f| &f.key_red),
+        FilterParam::ChromaKeyGreen => chroma_key(&clip.effects).map(|f| &f.key_green),
+        FilterParam::ChromaKeyBlue => chroma_key(&clip.effects).map(|f| &f.key_blue),
+        FilterParam::ChromaKeyTolerance => chroma_key(&clip.effects).map(|f| &f.tolerance),
+        FilterParam::ChromaKeySoftness => chroma_key(&clip.effects).map(|f| &f.softness),
+        FilterParam::ChromaKeySpillSuppression => {
+            chroma_key(&clip.effects).map(|f| &f.spill_suppression)
+        }
     };
     if let Some(anim) = anim {
         (anim.value_at(rel), anim.has_key(rel))

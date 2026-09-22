@@ -507,6 +507,31 @@ impl SharpenFilter {
     }
 }
 
+/// Chroma key (green-screen) filter. Key colour is 0…1 RGB. Tolerance and softness
+/// control the matte edge; spill suppression reduces key-colour fringing on foreground.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChromaKeyFilter {
+    pub key_red: AnimatedF32,
+    pub key_green: AnimatedF32,
+    pub key_blue: AnimatedF32,
+    pub tolerance: AnimatedF32,
+    pub softness: AnimatedF32,
+    pub spill_suppression: AnimatedF32,
+}
+
+impl ChromaKeyFilter {
+    pub fn off() -> Self {
+        Self {
+            key_red: AnimatedF32::constant(0.0),
+            key_green: AnimatedF32::constant(1.0),
+            key_blue: AnimatedF32::constant(0.0),
+            tolerance: AnimatedF32::constant(0.0),
+            softness: AnimatedF32::constant(0.15),
+            spill_suppression: AnimatedF32::constant(0.5),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FilterParam {
@@ -518,6 +543,12 @@ pub enum FilterParam {
     CropTop,
     CropBottom,
     SharpenAmount,
+    ChromaKeyRed,
+    ChromaKeyGreen,
+    ChromaKeyBlue,
+    ChromaKeyTolerance,
+    ChromaKeySoftness,
+    ChromaKeySpillSuppression,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -529,6 +560,7 @@ pub enum Effect {
     Vignette(VignetteFilter),
     Crop(CropFilter),
     Sharpen(SharpenFilter),
+    ChromaKey(ChromaKeyFilter),
 }
 
 pub fn color_grade_mut(effects: &mut Vec<Effect>) -> &mut ColorGrade {
@@ -608,6 +640,19 @@ pub fn sharpen_mut(effects: &mut Vec<Effect>) -> &mut SharpenFilter {
     }
 }
 
+pub fn chroma_key_mut(effects: &mut Vec<Effect>) -> &mut ChromaKeyFilter {
+    if !effects.iter().any(|e| matches!(e, Effect::ChromaKey(_))) {
+        effects.push(Effect::ChromaKey(ChromaKeyFilter::off()));
+    }
+    match effects
+        .iter_mut()
+        .find(|e| matches!(e, Effect::ChromaKey(_)))
+    {
+        Some(Effect::ChromaKey(filter)) => filter,
+        _ => unreachable!("chroma key filter just inserted"),
+    }
+}
+
 pub fn blur(effects: &[Effect]) -> Option<&BlurFilter> {
     effects.iter().find_map(|e| match e {
         Effect::Blur(filter) => Some(filter),
@@ -636,6 +681,13 @@ pub fn sharpen(effects: &[Effect]) -> Option<&SharpenFilter> {
     })
 }
 
+pub fn chroma_key(effects: &[Effect]) -> Option<&ChromaKeyFilter> {
+    effects.iter().find_map(|e| match e {
+        Effect::ChromaKey(filter) => Some(filter),
+        _ => None,
+    })
+}
+
 pub fn has_filter(effects: &[Effect], kind: FilterKind) -> bool {
     effects.iter().any(|e| match (kind, e) {
         (FilterKind::Blur, Effect::Blur(f)) => f.radius.base > 1.0e-4 || !f.radius.keys.is_empty(),
@@ -655,6 +707,9 @@ pub fn has_filter(effects: &[Effect], kind: FilterKind) -> bool {
         (FilterKind::Sharpen, Effect::Sharpen(f)) => {
             f.amount.base > 1.0e-4 || !f.amount.keys.is_empty()
         }
+        (FilterKind::ChromaKey, Effect::ChromaKey(f)) => {
+            f.tolerance.base > 1.0e-4 || !f.tolerance.keys.is_empty()
+        }
         _ => false,
     })
 }
@@ -665,6 +720,7 @@ pub enum FilterKind {
     Vignette,
     Crop,
     Sharpen,
+    ChromaKey,
 }
 
 impl FilterKind {
@@ -674,6 +730,7 @@ impl FilterKind {
             Self::Vignette => "Vignette",
             Self::Crop => "Crop",
             Self::Sharpen => "Sharpen",
+            Self::ChromaKey => "Chroma Key",
         }
     }
 }
@@ -731,12 +788,21 @@ mod tests {
             Effect::Sharpen(SharpenFilter {
                 amount: AnimatedF32::constant(0.8),
             }),
+            Effect::ChromaKey(ChromaKeyFilter {
+                key_red: AnimatedF32::constant(0.0),
+                key_green: AnimatedF32::constant(1.0),
+                key_blue: AnimatedF32::constant(0.0),
+                tolerance: AnimatedF32::constant(0.35),
+                softness: AnimatedF32::constant(0.15),
+                spill_suppression: AnimatedF32::constant(0.6),
+            }),
         ];
         let json = serde_json::to_string(&effects).unwrap();
         let parsed: Vec<Effect> = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, effects);
         assert!(has_filter(&effects, FilterKind::Blur));
         assert!(has_filter(&effects, FilterKind::Vignette));
+        assert!(has_filter(&effects, FilterKind::ChromaKey));
     }
 
     #[test]

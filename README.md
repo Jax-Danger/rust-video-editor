@@ -202,6 +202,7 @@ The inspector **Effects** section (video clips) adds stackable filters that run 
 | Vignette | Amount and softness |
 | Crop | Left / right / top / bottom insets (letterbox/pillarbox) |
 | Sharpen | Unsharp-mask strength |
+| Chroma Key | Key colour (RGB), tolerance, softness, spill suppression |
 
 Filter parameters are `AnimatedF32` like grade and transform.
 
@@ -260,7 +261,7 @@ Preview (`--features ffmpeg`) and Deliver call one compositor in `editor-media`.
 | Slide | Yes | Outgoing is stationary; incoming slides from off-screen |
 | Blur dissolve | Yes | Cross dissolve plus a shared blur radius that peaks at the cut |
 | Iris | Yes | Circular mask from the frame centre |
-| Blur, vignette, crop, sharpen | Yes | Per-clip filters applied before the layer is composited |
+| Blur, vignette, crop, sharpen, chroma key | Yes | Per-clip filters applied before the layer is composited. Chroma key writes real alpha from colour distance and optional spill suppression |
 | Captions | Placement yes, glyphs mostly | Both burn the same 8×8 bitmap into the picture (about 32px at 1080p, 48px bottom margin). The proxy uses the UI font instead. Soft `mov_text` subtitles are still written. H.264 then quantizes the burn-in |
 | Titles | Yes | Generator clips on a video track. Text, size, colour, alignment, position, and plate are rasterized in `compose_layers` for the monitor and for Deliver. The proxy draws that same bitmap in track order |
 | Stacking | Yes | Simple alpha over only. No blend modes, no motion blur, no track mattes |
