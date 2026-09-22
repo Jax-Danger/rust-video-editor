@@ -333,6 +333,137 @@ pub fn razor_at(
     })
 }
 
+/// Ripple-trim the previous edit on targeted tracks to `at`. Inside a clip this
+/// removes media before the playhead and parks the cut on `at`. In a gap it
+/// extends the previous clip's tail.
+pub fn ripple_trim_prev_to_playhead(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    at: Frame,
+    track_ids: &[TrackId],
+) -> Result<(), EditError> {
+    if track_ids.is_empty() {
+        return Err(EditError::TrackNotFound);
+    }
+    map_sequence(project, sequence_id, |sequence, alloc| {
+        let allowed: std::collections::HashSet<TrackId> = track_ids.iter().copied().collect();
+        let mut changed = false;
+        let containing = clips_containing_on_tracks(sequence, &allowed, at);
+        if !containing.is_empty() {
+            let targets = expand_split_targets(sequence, &containing, at);
+            let mut pairs = Vec::new();
+            for id in targets {
+                if sequence.locate_clip(id).is_some() {
+                    let right = split_clip(sequence, id, at, alloc)?;
+                    pairs.push((id, right));
+                }
+            }
+            relink_splits(sequence, &pairs);
+            let lefts: Vec<ClipId> = pairs.iter().map(|(left, _)| *left).collect();
+            ensure_unlocked(sequence, &lefts)?;
+            remove_clips(sequence, &lefts);
+            cleanup_transitions(sequence);
+            changed = true;
+        }
+        for track_id in track_ids {
+            let ti = sequence
+                .tracks
+                .iter()
+                .position(|track| track.id == *track_id)
+                .ok_or(EditError::TrackNotFound)?;
+            if sequence.tracks[ti].locked {
+                continue;
+            }
+            let track = &sequence.tracks[ti];
+            if track.clips.iter().any(|clip| clip.contains_frame(at)) {
+                continue;
+            }
+            if let Some(ci) = track.clips.iter().position(|clip| clip.timeline_in == at) {
+                if ci > 0 {
+                    let prev = &track.clips[ci - 1];
+                    let delta = at.0 - prev.timeline_out.0;
+                    if delta != 0 {
+                        ripple_trim_in_sequence(sequence, prev.id, TrimEdge::Tail, delta)?;
+                        changed = true;
+                    }
+                }
+                continue;
+            }
+            if let Some(prev) = track.clips.iter().rfind(|clip| clip.timeline_out.0 < at.0) {
+                let delta = at.0 - prev.timeline_out.0;
+                if delta > 0 {
+                    ripple_trim_in_sequence(sequence, prev.id, TrimEdge::Tail, delta)?;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return Err(EditError::NotInsideClip);
+        }
+        Ok(())
+    })
+}
+
+/// Ripple-trim the next edit on targeted tracks to `at`. Inside a clip this
+/// removes media after the playhead. In a gap it pulls the next clip's head to
+/// `at`.
+pub fn ripple_trim_next_to_playhead(
+    project: &mut Project,
+    sequence_id: SequenceId,
+    at: Frame,
+    track_ids: &[TrackId],
+) -> Result<(), EditError> {
+    if track_ids.is_empty() {
+        return Err(EditError::TrackNotFound);
+    }
+    map_sequence(project, sequence_id, |sequence, alloc| {
+        let allowed: std::collections::HashSet<TrackId> = track_ids.iter().copied().collect();
+        let mut changed = false;
+        let containing = clips_containing_on_tracks(sequence, &allowed, at);
+        if !containing.is_empty() {
+            let targets = expand_split_targets(sequence, &containing, at);
+            let mut pairs = Vec::new();
+            for id in targets {
+                if sequence.locate_clip(id).is_some() {
+                    let right = split_clip(sequence, id, at, alloc)?;
+                    pairs.push((id, right));
+                }
+            }
+            relink_splits(sequence, &pairs);
+            let rights: Vec<ClipId> = pairs.iter().map(|(_, right)| *right).collect();
+            ensure_unlocked(sequence, &rights)?;
+            remove_clips(sequence, &rights);
+            cleanup_transitions(sequence);
+            changed = true;
+        }
+        for track_id in track_ids {
+            let ti = sequence
+                .tracks
+                .iter()
+                .position(|track| track.id == *track_id)
+                .ok_or(EditError::TrackNotFound)?;
+            if sequence.tracks[ti].locked {
+                continue;
+            }
+            let track = &sequence.tracks[ti];
+            if track.clips.iter().any(|clip| clip.contains_frame(at)) {
+                continue;
+            }
+            if let Some(next) = track.clips.iter().find(|clip| clip.timeline_in.0 > at.0) {
+                let delta = at.0 - next.timeline_in.0;
+                if delta != 0 {
+                    trim_in_sequence(sequence, next.id, TrimEdge::Head, delta)?;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return Err(EditError::NotInsideClip);
+        }
+        Ok(())
+    })
+}
+
 pub fn lift_delete(
     project: &mut Project,
     sequence_id: SequenceId,
@@ -1690,6 +1821,170 @@ fn trim_head_to(clip: &mut Clip, new_in: i64, timebase: Timebase) {
     clip.source_in = Frame(clip.source_in.0 + src);
 }
 
+fn clips_containing_on_tracks(
+    sequence: &Sequence,
+    allowed: &std::collections::HashSet<TrackId>,
+    at: Frame,
+) -> Vec<ClipId> {
+    let mut ids = Vec::new();
+    for track in &sequence.tracks {
+        if !allowed.contains(&track.id) || track.locked {
+            continue;
+        }
+        for clip in &track.clips {
+            if clip.contains_frame(at) {
+                ids.push(clip.id);
+            }
+        }
+    }
+    ids
+}
+
+fn expand_split_targets(sequence: &Sequence, seeds: &[ClipId], at: Frame) -> Vec<ClipId> {
+    let mut targets = seeds.to_vec();
+    for id in seeds {
+        if let Some(clip) = sequence.clip(*id) {
+            for linked in &clip.linked {
+                if let Some(partner) = sequence.clip(*linked) {
+                    if partner.contains_frame(at) {
+                        targets.push(*linked);
+                    }
+                }
+            }
+        }
+    }
+    targets.sort_unstable();
+    targets.dedup();
+    targets
+}
+
+fn trim_in_sequence(
+    sequence: &mut Sequence,
+    clip_id: ClipId,
+    edge: TrimEdge,
+    delta: i64,
+) -> Result<(), EditError> {
+    if delta == 0 {
+        return Ok(());
+    }
+    let timebase = sequence.timebase;
+    let (ti, ci) = sequence
+        .locate_clip(clip_id)
+        .ok_or(EditError::ClipNotFound)?;
+    if sequence.tracks[ti].locked {
+        return Err(EditError::TrackLocked);
+    }
+    let clips = &sequence.tracks[ti].clips;
+    match edge {
+        TrimEdge::Head => {
+            let new_in = clips[ci].timeline_in.0 + delta;
+            let new_out = clips[ci].timeline_out.0;
+            if new_out - new_in < 1 {
+                return Err(EditError::InvalidDuration);
+            }
+            if let Some(prev) = clips.iter().take(ci).filter(|c| c.id != clip_id).last() {
+                if new_in < prev.timeline_out.0 {
+                    return Err(EditError::OutOfRange);
+                }
+            }
+            if new_in < 0 {
+                return Err(EditError::OutOfRange);
+            }
+            let src = source_delta(&clips[ci], delta, timebase);
+            let new_source = clips[ci].source_in.0 + src;
+            if new_source < clips[ci].source_min.0 || new_source >= clips[ci].source_out.0 {
+                return Err(EditError::InsufficientHandle {
+                    have: clips[ci].head_handle(),
+                    need: src.abs(),
+                });
+            }
+            let clip = &mut sequence.tracks[ti].clips[ci];
+            clip.timeline_in = Frame(new_in);
+            clip.source_in = Frame(new_source);
+        }
+        TrimEdge::Tail => {
+            let new_out = clips[ci].timeline_out.0 + delta;
+            let new_in = clips[ci].timeline_in.0;
+            if new_out - new_in < 1 {
+                return Err(EditError::InvalidDuration);
+            }
+            if let Some(next) = clips.iter().skip(ci + 1).find(|c| c.id != clip_id) {
+                if new_out > next.timeline_in.0 {
+                    return Err(EditError::OutOfRange);
+                }
+            }
+            let src = source_delta(&clips[ci], delta, timebase);
+            let new_source = clips[ci].source_out.0 + src;
+            if new_source > clips[ci].source_max.0 || new_source <= clips[ci].source_in.0 {
+                return Err(EditError::InsufficientHandle {
+                    have: clips[ci].tail_handle(),
+                    need: src.abs(),
+                });
+            }
+            let clip = &mut sequence.tracks[ti].clips[ci];
+            clip.timeline_out = Frame(new_out);
+            clip.source_out = Frame(new_source);
+        }
+    }
+    Ok(())
+}
+
+fn ripple_trim_in_sequence(
+    sequence: &mut Sequence,
+    clip_id: ClipId,
+    edge: TrimEdge,
+    delta: i64,
+) -> Result<(), EditError> {
+    if delta == 0 {
+        return Ok(());
+    }
+    let timebase = sequence.timebase;
+    let (ti, ci) = sequence
+        .locate_clip(clip_id)
+        .ok_or(EditError::ClipNotFound)?;
+    let origin = sequence.tracks[ti].id;
+    if sequence.tracks[ti].locked {
+        return Err(EditError::TrackLocked);
+    }
+    let clip = sequence.tracks[ti].clips[ci].clone();
+    let old_out = clip.timeline_out.0;
+    let src = source_delta(&clip, delta, timebase);
+    match edge {
+        TrimEdge::Tail => {
+            let new_out = clip.timeline_out.0 + delta;
+            let new_source = clip.source_out.0 + src;
+            if new_out - clip.timeline_in.0 < 1 || new_source <= clip.source_in.0 {
+                return Err(EditError::InvalidDuration);
+            }
+            if new_source > clip.source_max.0 || new_source < clip.source_min.0 {
+                return Err(EditError::InsufficientHandle {
+                    have: clip.tail_handle(),
+                    need: src.abs(),
+                });
+            }
+            sequence.tracks[ti].clips[ci].timeline_out = Frame(new_out);
+            sequence.tracks[ti].clips[ci].source_out = Frame(new_source);
+        }
+        TrimEdge::Head => {
+            let new_source = clip.source_in.0 - src;
+            let new_out = clip.timeline_out.0 + delta;
+            if new_out - clip.timeline_in.0 < 1 {
+                return Err(EditError::InvalidDuration);
+            }
+            if new_source < clip.source_min.0 || new_source >= clip.source_out.0 {
+                return Err(EditError::InsufficientHandle {
+                    have: clip.head_handle(),
+                    need: src.abs(),
+                });
+            }
+            sequence.tracks[ti].clips[ci].source_in = Frame(new_source);
+            sequence.tracks[ti].clips[ci].timeline_out = Frame(new_out);
+        }
+    }
+    ripple_downstream_except(sequence, origin, old_out, delta, clip_id, &[])?;
+    Ok(())
+}
+
 fn split_and_shift(
     sequence: &mut Sequence,
     at: i64,
@@ -2363,6 +2658,46 @@ mod tests {
 
         let err = ripple_trim(&mut project, SequenceId(1), ClipId(2), TrimEdge::Head, 100);
         assert!(matches!(err, Err(EditError::InsufficientHandle { .. })));
+    }
+
+    #[test]
+    fn ripple_trim_prev_to_playhead_inside_clip() {
+        let (mut sequence, track) = video_sequence();
+        sequence.tracks[0].clips = vec![Clip::basic(1, 0, 200).with_handles(0, 100)];
+        let mut project = project_with(sequence);
+        ripple_trim_prev_to_playhead(&mut project, SequenceId(1), Frame(80), &[track]).unwrap();
+        let seq = project.active().unwrap();
+        let clips = &seq.track(track).unwrap().clips;
+        assert_eq!(clips.len(), 1);
+        assert_eq!((clips[0].timeline_in.0, clips[0].timeline_out.0), (80, 200));
+        assert_eq!(clips[0].source_in.0, 80);
+    }
+
+    #[test]
+    fn ripple_trim_next_to_playhead_inside_clip() {
+        let (mut sequence, track) = video_sequence();
+        sequence.tracks[0].clips = vec![Clip::basic(1, 0, 200).with_handles(0, 100)];
+        let mut project = project_with(sequence);
+        ripple_trim_next_to_playhead(&mut project, SequenceId(1), Frame(120), &[track]).unwrap();
+        let seq = project.active().unwrap();
+        let clips = &seq.track(track).unwrap().clips;
+        assert_eq!(clips.len(), 1);
+        assert_eq!((clips[0].timeline_in.0, clips[0].timeline_out.0), (0, 120));
+        assert_eq!(clips[0].source_out.0, 120);
+    }
+
+    #[test]
+    fn ripple_trim_prev_to_playhead_extends_across_gap() {
+        let (mut sequence, track) = video_sequence();
+        sequence.tracks[0].clips = vec![
+            Clip::basic(1, 0, 100).with_handles(0, 40),
+            Clip::basic(2, 150, 250).with_handles(0, 40),
+        ];
+        let mut project = project_with(sequence);
+        ripple_trim_prev_to_playhead(&mut project, SequenceId(1), Frame(125), &[track]).unwrap();
+        let seq = project.active().unwrap();
+        let a = seq.clip(ClipId(1)).unwrap();
+        assert_eq!((a.timeline_in.0, a.timeline_out.0), (0, 125));
     }
 
     #[test]

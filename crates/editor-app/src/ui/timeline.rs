@@ -91,16 +91,22 @@ fn nudge_timeline_scroll(ui: &egui::Ui, app: &mut MeridianApp, end: i64) {
     if !view.contains(pointer) {
         return;
     }
-    let (dx, dy, zoom, command) = ui.input(|input| {
+    let (dx, dy, zoom, command, alt, middle, middle_dy) = ui.input(|input| {
         (
             input.smooth_scroll_delta.x,
             input.smooth_scroll_delta.y,
             input.zoom_delta(),
             input.modifiers.command || input.modifiers.ctrl,
+            input.modifiers.alt,
+            input.pointer.middle_down(),
+            input.pointer.delta().y,
         )
     });
     let scrolling = dx.abs() + dy.abs() > 0.0;
-    let zooming = (zoom - 1.0).abs() > 0.01 || (command && dy.abs() > 0.0);
+    let zooming = (zoom - 1.0).abs() > 0.01
+        || (command && dy.abs() > 0.0)
+        || (alt && dy.abs() > 0.0)
+        || (middle && middle_dy.abs() > 0.0);
     if !scrolling && !zooming {
         return;
     }
@@ -108,6 +114,8 @@ fn nudge_timeline_scroll(ui: &egui::Ui, app: &mut MeridianApp, end: i64) {
     if zooming {
         let factor = if (zoom - 1.0).abs() > 0.01 {
             zoom
+        } else if middle && middle_dy.abs() > 0.0 {
+            (-middle_dy * 0.01).exp()
         } else {
             (dy * 0.0016).exp()
         };
@@ -384,7 +392,7 @@ fn header_row(
         0.0,
         theme::track_color(track.kind),
     );
-    let name_clip = Rect::from_min_max(rect.min, pos2(rect.right() - 62.0, rect.bottom()));
+    let name_clip = Rect::from_min_max(rect.min, pos2(rect.right() - 80.0, rect.bottom()));
     painter.with_clip_rect(name_clip).text(
         pos2(rect.left() + 10.0, rect.center().y),
         Align2::LEFT_CENTER,
@@ -398,6 +406,13 @@ fn header_row(
             .layout(egui::Layout::right_to_left(egui::Align::Center)),
     );
     child.spacing_mut().item_spacing.x = 3.0;
+    let targeted = app.is_track_targeted(track.id)
+        && (track.kind == TrackKind::Video || track.kind == TrackKind::Audio);
+    if track.kind == TrackKind::Video || track.kind == TrackKind::Audio {
+        if widgets::icon_toggle(&mut child, "T", targeted, THEME.accent) {
+            app.toggle_track_target(track.id);
+        }
+    }
     if widgets::icon_toggle(&mut child, "S", track.solo, THEME.amber) {
         note_track_flag(app, track.id, TrackFlag::Solo, !track.solo);
     }
@@ -493,6 +508,9 @@ fn ruler(
             app.preview_scrub = true;
             app.halt_transport();
         }
+    }
+    if response.double_clicked() {
+        app.toggle_play();
     }
     paint_playhead(&painter, rect, app.playhead, origin, ppf);
 }
@@ -695,6 +713,14 @@ fn lane(
                 if !ui.input(|i| i.modifiers.shift) {
                     app.selected.clear();
                 }
+            }
+        }
+    }
+
+    if response.double_clicked() && track.kind != TrackKind::Caption {
+        if let Some(pos) = response.interact_pointer_pos() {
+            if hit_test(track, rect, pos, origin, ppf).is_none() {
+                app.toggle_play();
             }
         }
     }

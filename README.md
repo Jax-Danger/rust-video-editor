@@ -78,7 +78,9 @@ The toolbar exposes Select, Razor, Ripple, Roll, Slip, and Slide, plus Overwrite
 
 Linked selection is on by default so picture and sound move together. Inserting a linked pair is one ripple, not two.
 
-Click or drag the timeline ruler, or the bar under the program monitor, to scrub. The decoded preview follows the playhead. Playback and scrubbing reuse one ffmpeg job for a short burst of frames, then a memory cache and a disk cache (see [Long projects](#long-projects)) so a second pass over the same frames does not spawn ffmpeg again. The timeline scrolls horizontally by a frame origin, so an hour zoomed to single frames stays a viewport-sized strip instead of a multi-million-pixel layout. Scroll pans; Ctrl+scroll or a pinch zooms around the cursor. `+` / `−` and the slider zoom around the center of the panel. The zoom slider is logarithmic, from single frames (64 px/frame) out to about 12 px per minute at 24 fps, which fits an hour in the panel. Shift+Z fits the sequence and scrolls back to the start. Off-screen clips are not drawn. The clip under the pointer is a binary search on the sorted track, plus any clip that runs underneath later shots.
+Click or drag the timeline ruler, or the bar under the program monitor, to scrub. The decoded preview follows the playhead. Playback and scrubbing reuse one ffmpeg job for a short burst of frames, then a memory cache and a disk cache (see [Long projects](#long-projects)) so a second pass over the same frames does not spawn ffmpeg again. The timeline scrolls horizontally by a frame origin, so an hour zoomed to single frames stays a viewport-sized strip instead of a multi-million-pixel layout. Scroll pans; Ctrl+scroll, Alt+scroll, a pinch, or a vertical middle-drag zooms around the cursor. `+` / `−` and the slider zoom around the center of the panel. The zoom slider is logarithmic, from single frames (64 px/frame) out to about 12 px per minute at 24 fps, which fits an hour in the panel. `F` or Shift+Z fits the sequence and scrolls back to the start. Double-click empty timeline space or the ruler to play or pause. Off-screen clips are not drawn. The clip under the pointer is a binary search on the sorted track, plus any clip that runs underneath later shots.
+
+Track headers show a **T** target toggle on video and audio lanes. Armed tracks receive overwrite, insert, and Q/W ripple trims. Keys `1`–`9` toggle V1–V9; Shift+`1`–`9` toggle A1–A9.
 
 ## Keyboard
 
@@ -96,7 +98,12 @@ Shortcuts are global while you are not typing in a text field. The same list is 
 | I / O | Mark in / out |
 | M | Add marker |
 | V | Select tool |
-| C or Ctrl+K | Razor at the playhead |
+| C or Ctrl+K | Razor at the playhead (also selects the razor tool) |
+| / | Razor at the playhead (keeps the active tool) |
+| Q / W | Ripple trim previous / next edit to the playhead (targeted tracks) |
+| , / . | Overwrite / insert selected pool item at the playhead |
+| 1–9 | Toggle video track target (V1–V9) |
+| Shift+1–9 | Toggle audio track target (A1–A9) |
 | B / N / Y / U | Ripple, roll, slip, slide tools |
 | S | Toggle snapping |
 | Delete / Backspace | Lift delete |
@@ -109,9 +116,11 @@ Shortcuts are global while you are not typing in a text field. The same list is 
 | Ctrl+N | New project |
 | Ctrl+I | Import media |
 | + / − | Zoom timeline |
-| Ctrl+scroll or pinch | Zoom timeline |
+| F / Shift+Z | Fit sequence in the timeline |
+| Ctrl+scroll, Alt+scroll, or pinch | Zoom timeline |
+| Middle-drag (vertical) | Zoom timeline |
 | Scroll | Pan timeline |
-| Shift+Z | Zoom timeline to fit |
+| Double-click empty timeline | Play / pause |
 
 Reverse shuttle and rates other than 1× play the picture and stay silent. At 1×, the ffmpeg build decodes interleaved stereo PCM at 48 kHz in about two-second chunks and plays it through the default ALSA device (rodio, via PipeWire on Fedora). The viewer shows a stereo meter and a badge: `Audio`, `Buffering`, `Silent`, `No device`, or `No audio`. A missing device does not stop the picture. The default build (no `ffmpeg` feature) does not link an audio backend; its badge is `No audio` and the status line says to rebuild with `--features ffmpeg`.
 
@@ -392,7 +401,7 @@ A progress bar follows ffmpeg's `out_time`. **Cancel** sends `SIGTERM`. A failed
 - OFX-style plugins for third-party effects
 - Scene-linear grading and a hinted caption font. Preview and export already share the display-space formula and the bitmap burn-in
 - Multi-cam: sync groups and angle switching
-- More trim shortcuts, gang, and a command palette
+- Gang edits and a command palette
 
 ## License
 

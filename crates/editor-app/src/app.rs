@@ -1,5 +1,7 @@
 //! Application state, commands, and workspace layout.
 
+use std::collections::HashSet;
+
 use editor_core::{
     add_title, add_transition, builtin_templates, clip_from_media, expand_linked, link_clips,
     plan_export, replace_captions, Bin, BinId, BusState, CaptionTranscriber, ClipId, CueId,
@@ -227,12 +229,14 @@ pub struct MeridianApp {
     pub export_job: Option<editor_media::ExportJob>,
     #[cfg(all(feature = "ffmpeg", feature = "whisper"))]
     pub caption_job: Option<crate::caption_job::CaptionJob>,
+    /// Video and audio tracks armed for overwrite, insert, and ripple trims.
+    pub targeted_tracks: HashSet<TrackId>,
 }
 
 impl MeridianApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply(&cc.egui_ctx);
-        let app = Self {
+        let mut app = Self {
             session: Session::new(editor_core::demo_project()),
             playhead: 24,
             selected: vec![ClipId(301)],
@@ -274,9 +278,115 @@ impl MeridianApp {
             export_job: None,
             #[cfg(all(feature = "ffmpeg", feature = "whisper"))]
             caption_job: None,
+            targeted_tracks: HashSet::new(),
         };
+        app.reset_track_targets();
         app.sync_title(&cc.egui_ctx);
         app
+    }
+
+    pub fn reset_track_targets(&mut self) {
+        self.targeted_tracks = self
+            .session
+            .project()
+            .active()
+            .map(|sequence| {
+                sequence
+                    .tracks
+                    .iter()
+                    .filter(|track| {
+                        track.kind == TrackKind::Video || track.kind == TrackKind::Audio
+                    })
+                    .map(|track| track.id)
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+
+    pub fn is_track_targeted(&self, track: TrackId) -> bool {
+        self.targeted_tracks.contains(&track)
+    }
+
+    pub fn toggle_track_target(&mut self, track: TrackId) {
+        let name = self
+            .session
+            .project()
+            .active()
+            .and_then(|sequence| sequence.track(track).map(|t| t.name.clone()))
+            .unwrap_or_else(|| "Track".into());
+        if self.targeted_tracks.contains(&track) {
+            self.targeted_tracks.remove(&track);
+            self.status = format!("{name} target off.");
+        } else {
+            self.targeted_tracks.insert(track);
+            self.status = format!("{name} target on.");
+        }
+    }
+
+    fn toggle_video_target(&mut self, index: u32) {
+        let ids = self
+            .session
+            .project()
+            .active()
+            .map(|sequence| {
+                sequence
+                    .tracks
+                    .iter()
+                    .filter(|track| track.kind == TrackKind::Video)
+                    .map(|track| track.id)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let idx = index.saturating_sub(1) as usize;
+        if let Some(id) = ids.get(idx) {
+            self.toggle_track_target(*id);
+        }
+    }
+
+    fn toggle_audio_target(&mut self, index: u32) {
+        let ids = self
+            .session
+            .project()
+            .active()
+            .map(|sequence| {
+                sequence
+                    .tracks
+                    .iter()
+                    .filter(|track| track.kind == TrackKind::Audio)
+                    .map(|track| track.id)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let idx = index.saturating_sub(1) as usize;
+        if let Some(id) = ids.get(idx) {
+            self.toggle_track_target(*id);
+        }
+    }
+
+    fn targeted_track_ids(&self) -> Vec<TrackId> {
+        self.targeted_tracks.iter().copied().collect()
+    }
+
+    pub fn ripple_trim_prev_to_playhead(&mut self) {
+        let tracks = self.targeted_track_ids();
+        match self
+            .session
+            .ripple_trim_prev_to_playhead(Frame(self.playhead), &tracks)
+        {
+            Ok(()) => self.status = "Ripple trim previous edit to playhead.".into(),
+            Err(err) => self.status = err.to_string(),
+        }
+    }
+
+    pub fn ripple_trim_next_to_playhead(&mut self) {
+        let tracks = self.targeted_track_ids();
+        match self
+            .session
+            .ripple_trim_next_to_playhead(Frame(self.playhead), &tracks)
+        {
+            Ok(()) => self.status = "Ripple trim next edit to playhead.".into(),
+            Err(err) => self.status = err.to_string(),
+        }
     }
 
     pub fn sequence_end(&self) -> i64 {
@@ -579,6 +689,25 @@ impl MeridianApp {
         } else if pressed_cmd(Key::K) || (tap(Key::C) && !mods.command) {
             self.tool = Tool::Razor;
             self.split_at_playhead();
+        } else if tap(Key::Slash) {
+            self.split_at_playhead();
+        } else if tap(Key::Q) && !mods.command {
+            self.ripple_trim_prev_to_playhead();
+        } else if tap(Key::W) && !mods.command {
+            self.ripple_trim_next_to_playhead();
+        } else if tap(Key::F) {
+            self.zoom_to_fit();
+            self.reveal_playhead = true;
+        } else if tap(Key::Comma) {
+            self.place_selected_media(false);
+        } else if tap(Key::Period) {
+            self.place_selected_media(true);
+        } else if let Some(digit) = tap_digit(ctx, &mods) {
+            if mods.shift {
+                self.toggle_audio_target(digit);
+            } else if !mods.command && !mods.alt {
+                self.toggle_video_target(digit);
+            }
         } else if held_cmd(Key::ArrowLeft) {
             self.step_playhead(-second);
         } else if held_cmd(Key::ArrowRight) {
@@ -783,8 +912,9 @@ impl MeridianApp {
         };
         let playhead = self.playhead.max(0);
         let label = if insert { "Insert" } else { "Overwrite" };
+        let targeted = self.targeted_tracks.clone();
         let result = self.session.edit(label, |project| {
-            place_media(project, media_id, playhead, insert)
+            place_media(project, media_id, playhead, insert, &targeted)
         });
         self.status = match result {
             Ok(()) => {
@@ -1209,6 +1339,7 @@ impl MeridianApp {
         self.timeline_origin = 0.0;
         self.halt_transport();
         self.workspace = Workspace::Edit;
+        self.reset_track_targets();
         self.status = "Opened a 400-clip sequence. Fit shows minutes; zoom in to frames.".into();
     }
 
@@ -1362,6 +1493,7 @@ impl MeridianApp {
                 self.selected.clear();
                 self.selected_media = None;
                 self.halt_transport();
+                self.reset_track_targets();
                 self.status = format!("Opened {path}.");
                 self.modal = Modal::None;
             }
@@ -1388,6 +1520,7 @@ impl MeridianApp {
                 self.selected_media = None;
                 self.halt_transport();
                 self.workspace = Workspace::Edit;
+                self.reset_track_targets();
                 self.status = format!("New project from {}.", template.name);
                 self.modal = Modal::None;
             }
@@ -1403,6 +1536,7 @@ impl MeridianApp {
         self.selected_media = Some(MediaId(10));
         self.halt_transport();
         self.workspace = Workspace::Edit;
+        self.reset_track_targets();
         self.status = "Opened example project — Northline — Opening.".into();
     }
 
@@ -1609,6 +1743,7 @@ fn place_media(
     media_id: MediaId,
     playhead: i64,
     insert: bool,
+    targeted: &HashSet<TrackId>,
 ) -> Result<(), EditError> {
     let seq_id = project.active_sequence.ok_or(EditError::NoActiveSequence)?;
     let timebase = project
@@ -1624,14 +1759,18 @@ fn place_media(
         .unwrap()
         .tracks
         .iter()
-        .find(|t| t.kind == TrackKind::Video && !t.locked)
+        .find(|t| {
+            t.kind == TrackKind::Video && !t.locked && targeted.contains(&t.id)
+        })
         .map(|t| t.id);
     let audio_track = project
         .sequence(seq_id)
         .unwrap()
         .tracks
         .iter()
-        .find(|t| t.kind == TrackKind::Audio && !t.locked)
+        .find(|t| {
+            t.kind == TrackKind::Audio && !t.locked && targeted.contains(&t.id)
+        })
         .map(|t| t.id);
     let mut video = None;
     let mut audio = None;
@@ -1746,6 +1885,27 @@ fn refresh_offline(project: &mut Project) {
     for media in &mut project.media {
         media.offline = ui::media_missing(&media.path);
     }
+}
+
+fn tap_digit(ctx: &egui::Context, mods: &Modifiers) -> Option<u32> {
+    if mods.command || mods.alt {
+        return None;
+    }
+    let key = [
+        Key::Num1,
+        Key::Num2,
+        Key::Num3,
+        Key::Num4,
+        Key::Num5,
+        Key::Num6,
+        Key::Num7,
+        Key::Num8,
+        Key::Num9,
+    ]
+    .into_iter()
+    .enumerate()
+    .find_map(|(index, key)| consume_key(ctx, Modifiers::NONE, key, false).then_some(index as u32 + 1));
+    key
 }
 
 fn consume_key(ctx: &egui::Context, modifiers: Modifiers, key: Key, allow_repeat: bool) -> bool {
@@ -2497,7 +2657,12 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("I / O", "Mark in / out"),
     ("M", "Add marker"),
     ("V", "Select tool"),
-    ("C  /  Ctrl+K", "Razor at the playhead"),
+    ("C  /  Ctrl+K", "Razor at the playhead (also selects the razor tool)"),
+    ("/", "Razor at the playhead (keeps the active tool)"),
+    ("Q / W", "Ripple trim previous / next edit to the playhead (targeted tracks)"),
+    (", / .", "Overwrite / insert selected pool item at the playhead"),
+    ("1–9", "Toggle video track target (V1–V9)"),
+    ("Shift+1–9", "Toggle audio track target (A1–A9)"),
     ("B  N  Y  U", "Ripple, roll, slip, slide tools"),
     ("S", "Toggle snapping"),
     ("Delete / Backspace", "Lift delete"),
@@ -2510,9 +2675,11 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+N", "New project"),
     ("Ctrl+I", "Import media"),
     ("+ / −", "Zoom timeline"),
-    ("Ctrl+scroll  /  pinch", "Zoom timeline"),
+    ("F  /  Shift+Z", "Fit sequence in the timeline"),
+    ("Ctrl+scroll  /  Alt+scroll  /  pinch", "Zoom timeline"),
+    ("Middle-drag (vertical)", "Zoom timeline"),
     ("Scroll", "Pan timeline"),
-    ("Shift+Z", "Zoom timeline to fit"),
+    ("Double-click empty timeline", "Play / pause"),
 ];
 
 fn brand_mark(ui: &mut egui::Ui) {
