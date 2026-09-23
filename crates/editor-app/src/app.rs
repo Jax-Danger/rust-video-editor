@@ -84,6 +84,13 @@ pub enum Workspace {
     Deliver,
 }
 
+/// First paint is the project window. The timeline is [`ShellPhase::Editing`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellPhase {
+    Start,
+    Editing,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DragKind {
     Move,
@@ -293,17 +300,22 @@ pub struct MeridianApp {
     /// Inline rename buffer for a media-pool bin.
     pub renaming_bin: Option<(BinId, String)>,
     recovery: RecoveryClock,
+    pub phase: ShellPhase,
+    pub recent: Vec<editor_core::RecentProject>,
+    pub start_name: String,
+    pub start_template: usize,
+    pub start_note: String,
 }
 
 impl MeridianApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply(&cc.egui_ctx);
         let mut app = Self {
-            session: Session::new(editor_core::demo_project()),
-            playhead: 24,
-            selected: vec![ClipId(301)],
-            selected_media: Some(MediaId(10)),
-            pool_selection: vec![MediaId(10)],
+            session: Session::new(idle_project()),
+            playhead: 0,
+            selected: Vec::new(),
+            selected_media: None,
+            pool_selection: Vec::new(),
             selected_cue: None,
             tool: Tool::Select,
             linked_selection: true,
@@ -314,7 +326,7 @@ impl MeridianApp {
             timeline_width: 900.0,
             playing: false,
             play_accum: 0.0,
-            status: "Opened example project — Northline — Opening.".into(),
+            status: String::new(),
             path: None,
             modal: Modal::None,
             deliver: DeliverState::default(),
@@ -355,6 +367,11 @@ impl MeridianApp {
             selected_marker: None,
             renaming_bin: None,
             recovery: RecoveryClock::default(),
+            phase: ShellPhase::Start,
+            recent: editor_core::load_recent_projects(&editor_core::recent_projects_path()),
+            start_name: "Untitled".into(),
+            start_template: 0,
+            start_note: String::new(),
         };
         app.reset_track_targets();
         if let Some(offer) = editor_core::launch_recovery_offer() {
@@ -499,6 +516,10 @@ impl MeridianApp {
     }
 
     fn sync_title(&self, ctx: &egui::Context) {
+        if self.phase == ShellPhase::Start {
+            ctx.send_viewport_cmd(ViewportCommand::Title("Meridian".into()));
+            return;
+        }
         let name = &self.session.project().name;
         let dirty = if self.session.is_dirty() { " •" } else { "" };
         ctx.send_viewport_cmd(ViewportCommand::Title(format!("Meridian — {name}{dirty}")));
@@ -2120,13 +2141,10 @@ impl MeridianApp {
         self.flush_recovery();
         self.session.replace_project(editor_core::dense_project());
         self.path = None;
-        self.playhead = 0;
-        self.selected.clear();
+        self.prepare_loaded_project();
         self.selected_media = Some(MediaId(10));
         self.pool_selection = vec![MediaId(10)];
         self.pixels_per_frame = editor_core::clamp_timeline_zoom(0.05);
-        self.timeline_origin = 0.0;
-        self.halt_transport();
         self.workspace = Workspace::Edit;
         self.reset_track_targets();
         self.note_clean_session();
@@ -2143,7 +2161,10 @@ impl MeridianApp {
     pub fn open_dialog(&mut self) {
         match dialogs::open_project_file() {
             Some(path) => self.open_path(&path.to_string_lossy()),
-            None => self.status = "Open cancelled.".into(),
+            None => {
+                self.status = "Open cancelled.".into();
+                self.mirror_status_on_start();
+            }
         }
     }
 
@@ -2405,11 +2426,7 @@ impl MeridianApp {
         }
         self.session.restore_unsaved(doc.project);
         self.path = project_path;
-        self.playhead = 0;
-        self.selected.clear();
-        self.selected_media = None;
-        self.pool_selection.clear();
-        self.halt_transport();
+        self.prepare_loaded_project();
         self.reset_track_targets();
         let generation = self.session.generation();
         self.recovery.tracked_generation = generation;
@@ -2423,6 +2440,9 @@ impl MeridianApp {
             Some(path) => format!("Restored unsaved edits. {path} was not modified."),
             None => "Restored unsaved edits. The project has not been saved yet.".into(),
         };
+        if let Some(path) = self.path.clone() {
+            self.remember_recent(&path);
+        }
         Ok(())
     }
 
@@ -2445,9 +2465,11 @@ impl MeridianApp {
                 return;
             }
             self.status = format!("Discarded recovery. {} is not on disk.", path.display());
+            self.mirror_status_on_start();
             return;
         }
         self.status = "Discarded recovery.".into();
+        self.mirror_status_on_start();
     }
 
     pub fn save_to(&mut self, path: &str) {
@@ -2465,6 +2487,7 @@ impl MeridianApp {
                     Some(err) => format!("Saved {path}. Recovery cleanup failed: {err}"),
                 };
                 self.modal = Modal::None;
+                self.remember_recent(path);
             }
             Err(err) => self.status = err.to_string(),
         }
@@ -2474,6 +2497,7 @@ impl MeridianApp {
         let file = std::path::Path::new(path);
         if editor_core::is_sidecar_recovery_path(file) {
             self.status = "That file is a recovery sidecar. Open the project file, or use the recovery prompt.".into();
+            self.mirror_status_on_start();
             return;
         }
         match Project::load_file(file) {
@@ -2482,15 +2506,13 @@ impl MeridianApp {
                 refresh_offline(&mut project);
                 self.session.replace_project(project);
                 self.path = Some(path.to_string());
-                self.playhead = 0;
-                self.selected.clear();
-                self.selected_media = None;
-                self.pool_selection.clear();
-                self.halt_transport();
+                self.prepare_loaded_project();
                 self.reset_track_targets();
                 self.note_clean_session();
                 self.status = format!("Opened {path}.");
+                self.start_note.clear();
                 self.modal = Modal::None;
+                self.remember_recent(path);
                 if let Some(offer) = editor_core::offer_for_project_file(file) {
                     self.modal = Modal::Recover {
                         offer,
@@ -2498,7 +2520,10 @@ impl MeridianApp {
                     };
                 }
             }
-            Err(err) => self.status = err.to_string(),
+            Err(err) => {
+                self.status = err.to_string();
+                self.mirror_status_on_start();
+            }
         }
     }
 
@@ -2517,11 +2542,7 @@ impl MeridianApp {
                 self.flush_recovery();
                 self.session.replace_project(project);
                 self.path = None;
-                self.playhead = 0;
-                self.selected.clear();
-                self.selected_media = None;
-                self.pool_selection.clear();
-                self.halt_transport();
+                self.prepare_loaded_project();
                 self.workspace = Workspace::Edit;
                 self.reset_track_targets();
                 self.note_clean_session();
@@ -2532,18 +2553,147 @@ impl MeridianApp {
         }
     }
 
+    /// Build an empty project from a preset, ask for a `.meridian` path, then open it.
+    pub(crate) fn create_from_start(&mut self) {
+        let templates = builtin_templates();
+        let Some(template) = templates.get(self.start_template).cloned() else {
+            self.start_note = "Choose a project style.".into();
+            return;
+        };
+        let name = {
+            let trimmed = self.start_name.trim();
+            if trimmed.is_empty() {
+                template.name.clone()
+            } else {
+                trimmed.to_string()
+            }
+        };
+        let project = match editor_core::project_from_template(&template, &name) {
+            Ok(project) => project,
+            Err(err) => {
+                self.start_note = err.to_string();
+                return;
+            }
+        };
+        let suggested = dialogs::project_file_name(&name);
+        let Some(path) = dialogs::save_project_file(&suggested, None) else {
+            self.start_note = "Save cancelled. The project was not created.".into();
+            return;
+        };
+        if editor_core::is_sidecar_recovery_path(&path) {
+            self.start_note =
+                "Choose a project file. Recovery files are not the saved project.".into();
+            return;
+        }
+        if let Err(err) = project.save_file(&path) {
+            self.start_note = err.to_string();
+            return;
+        }
+        let path_str = path.to_string_lossy().to_string();
+        self.flush_recovery();
+        self.session.replace_project(project);
+        self.path = Some(path_str.clone());
+        self.prepare_loaded_project();
+        self.workspace = Workspace::Edit;
+        self.reset_track_targets();
+        self.note_clean_session();
+        self.modal = Modal::None;
+        self.start_note.clear();
+        self.status = format!("New project from {} — {path_str}.", template.name);
+        self.remember_recent(&path_str);
+        if let Some(offer) = editor_core::offer_for_project_file(std::path::Path::new(&path_str)) {
+            self.modal = Modal::Recover {
+                offer,
+                error: String::new(),
+            };
+        }
+    }
+
+    pub(crate) fn open_recent(&mut self, path: &str) {
+        if editor_core::recent_project_missing(path) {
+            let note = format!("Missing — {path} is not on disk.");
+            self.status = note.clone();
+            self.start_note = note;
+            return;
+        }
+        self.open_path(path);
+    }
+
+    pub(crate) fn remove_recent(&mut self, path: &str) {
+        self.recent = editor_core::remove_recent(std::mem::take(&mut self.recent), path);
+        if let Err(err) =
+            editor_core::save_recent_projects(&editor_core::recent_projects_path(), &self.recent)
+        {
+            self.start_note = format!("Could not update recent projects: {err}");
+        }
+    }
+
+    pub fn close_project(&mut self) {
+        let dirty = self.session.is_dirty();
+        self.flush_recovery();
+        self.halt_transport();
+        self.halt_source_transport();
+        self.drag = None;
+        self.modal = Modal::None;
+        self.phase = ShellPhase::Start;
+        self.start_note = if dirty {
+            "Closed project. Unsaved edits were copied to recovery.".into()
+        } else {
+            String::new()
+        };
+        self.status = "Closed project.".into();
+    }
+
+    fn prepare_loaded_project(&mut self) {
+        self.playhead = 0;
+        self.selected.clear();
+        self.selected_media = None;
+        self.pool_selection.clear();
+        self.selected_cue = None;
+        self.selected_bin = None;
+        self.selected_marker = None;
+        self.renaming_bin = None;
+        self.sequence_nav_stack.clear();
+        self.source_marks.clear();
+        self.focused_monitor = MonitorFocus::Program;
+        self.timeline_origin = 0.0;
+        self.drag = None;
+        self.halt_transport();
+        self.halt_source_transport();
+        self.phase = ShellPhase::Editing;
+    }
+
+    fn remember_recent(&mut self, path: &str) {
+        let name = self.session.project().name.clone();
+        self.recent = editor_core::remember_recent(std::mem::take(&mut self.recent), path, &name);
+        if let Err(err) =
+            editor_core::save_recent_projects(&editor_core::recent_projects_path(), &self.recent)
+        {
+            self.status = format!("{}. Recent list was not updated: {err}", self.status);
+            self.mirror_status_on_start();
+        }
+    }
+
+    fn mirror_status_on_start(&mut self) {
+        if self.phase == ShellPhase::Start {
+            self.start_note = self.status.clone();
+        }
+    }
+
     pub fn open_example(&mut self) {
         self.flush_recovery();
         self.session.replace_project(editor_core::demo_project());
         self.path = None;
+        self.prepare_loaded_project();
         self.playhead = 24;
         self.selected = vec![ClipId(301)];
         self.selected_media = Some(MediaId(10));
         self.pool_selection = vec![MediaId(10)];
-        self.halt_transport();
         self.workspace = Workspace::Edit;
         self.reset_track_targets();
         self.note_clean_session();
+        self.start_note.clear();
+        self.modal = Modal::None;
         self.status = "Opened example project — Northline — Opening.".into();
     }
 
@@ -3054,7 +3204,21 @@ fn consume_key(ctx: &egui::Context, modifiers: Modifiers, key: Key, allow_repeat
 impl eframe::App for MeridianApp {
     fn update(&mut self, ctx: &egui::Context, host: &mut eframe::Frame) {
         if matches!(self.modal, Modal::Recover { .. }) {
+            egui::CentralPanel::default()
+                .frame(theme::chrome_frame())
+                .show(ctx, |_| {});
             self.modals(ctx);
+            return;
+        }
+        if self.phase == ShellPhase::Start {
+            self.handle_start_keys(ctx);
+            self.text_editing = false;
+            self.sync_title(ctx);
+            egui::CentralPanel::default()
+                .frame(theme::chrome_frame())
+                .show(ctx, |ui| {
+                    ui::start_screen(ui, self);
+                });
             return;
         }
         self.preview_scrub = false;
@@ -3196,6 +3360,10 @@ impl MeridianApp {
                         }
                         if ui.button("Save As…").clicked() {
                             self.save_dialog();
+                            ui.close_menu();
+                        }
+                        if ui.button("Close Project").clicked() {
+                            self.close_project();
                             ui.close_menu();
                         }
                         ui.separator();
@@ -3941,6 +4109,25 @@ fn angle_hotkey(ctx: &egui::Context) -> Option<u32> {
         }
     }
     None
+}
+
+fn idle_project() -> Project {
+    builtin_templates()
+        .into_iter()
+        .find(|template| template.id == "blank")
+        .and_then(|template| editor_core::project_from_template(&template, "Untitled").ok())
+        .unwrap_or_else(|| Project::new("Untitled"))
+}
+
+impl MeridianApp {
+    fn handle_start_keys(&mut self, ctx: &egui::Context) {
+        if self.text_editing {
+            return;
+        }
+        if consume_key(ctx, Modifiers::COMMAND, Key::O, false) {
+            self.open_dialog();
+        }
+    }
 }
 
 fn brand_mark(ui: &mut egui::Ui) {

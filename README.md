@@ -2,7 +2,7 @@
 
 Meridian is a desktop non-linear editor written in Rust. The timeline is frame-accurate, the chrome is dense, and colour, transforms, and transitions live in the same project model as the cut.
 
-`cargo run` opens the **Meridian** window on the sample sequence *Northline — Opening*.
+`cargo run` opens the **Meridian** start window. The timeline stays closed until you open or create a project. The sample sequence *Northline — Opening* is still available from that window, or from **File → Open Example**.
 
 ## Workspace
 
@@ -28,7 +28,7 @@ cargo test --workspace
 cargo run
 ```
 
-`editor-app` is the default workspace member, so `cargo run` from the repository root launches Meridian. `cargo test` without `--workspace` only runs that crate. The window title is `Meridian — <project>`.
+`editor-app` is the default workspace member, so `cargo run` from the repository root launches Meridian. `cargo test` without `--workspace` only runs that crate. The start window is titled `Meridian`. After a project is open the title is `Meridian — <project>`.
 
 ### Fedora
 
@@ -50,7 +50,15 @@ sudo apt install gcc g++ cmake pkg-config libgtk-3-dev libasound2-dev ffmpeg \
 cargo run -p editor-app --features ffmpeg
 ```
 
-The first launch loads an in-memory example: three picture tracks, a lower-third title, linked interview audio, a cross dissolve, a wipe, keyframed picture-in-picture, captions, and markers. **File → Open Example** returns to it. **File → Save** and **File → Save As** write a `.meridian` project through a native dialog. The file is still pretty JSON; only the extension changed. A copy of that example lives at [`samples/northline-opening.json`](samples/northline-opening.json) and stays `.json` so tests can load it from that path. **File → Open** (Ctrl+O) reloads a `.meridian` project, and still opens older `.json` projects (`.mproj` is accepted as the same document). Unsaved edits are also copied to a recovery sidecar; see [Autosave and recovery](#autosave-and-recovery).
+## Start window
+
+Meridian does not load a timeline on launch. The first screen lists recent projects and the built-in presets (Blank, YouTube 1080p24, YouTube 1080p30, Vertical 9:16, Cinematic widescreen).
+
+**Open…** uses the system file dialog. Clicking a recent row loads that project. A path that is no longer on disk is marked **Missing** and can be removed. **Create** builds an empty project with `project_from_template` (no Northline media), asks you to save a `.meridian` file, then opens the editor. **Open example (Northline)** loads the sample sequence. **File → Close Project** returns to this window. Unsaved edits are copied to the recovery sidecar first.
+
+Recent paths are stored in `~/.config/meridian/recent-projects.json` (`MERIDIAN_CONFIG` overrides that directory, the same way Deliver's last-used settings do). The list keeps the newest 16 paths and drops duplicates.
+
+The Northline example is three picture tracks, a lower-third title, linked interview audio, a cross dissolve, a wipe, keyframed picture-in-picture, captions, and markers. **File → Open Example** returns to it after the editor is open. **File → Save** and **File → Save As** write a `.meridian` project through a native dialog. The file is still pretty JSON; only the extension changed. A copy of that example lives at [`samples/northline-opening.json`](samples/northline-opening.json) and stays `.json` so tests can load it from that path. **File → Open** (Ctrl+O) reloads a `.meridian` project, and still opens older `.json` projects (`.mproj` is accepted as the same document). **File → New Project…** inside the editor still creates from a preset in memory; save it with **Save As**. Unsaved edits are also copied to a recovery sidecar; see [Autosave and recovery](#autosave-and-recovery).
 
 ## Autosave and recovery
 
@@ -68,7 +76,7 @@ The support directory is `{stem}.meridian`. A project file named `film.meridian`
 
 `MERIDIAN_CONFIG` overrides that config directory, the same way Deliver's last-used settings do. The sidecar is not a project file. Opening it from **File → Open** is refused.
 
-`~/.config/meridian/recovery-index.json` remembers the last sidecar. On the next launch, if that file is strictly newer than the project it belongs to — or the project was never saved — Meridian asks you to **Restore** or **Discard** before showing the timeline. Restore loads the sidecar into the editor and leaves the project file untouched, so the session stays unsaved until you Save. Discard deletes the sidecar. When a project file is still on disk, Discard then opens that saved file.
+`~/.config/meridian/recovery-index.json` remembers the last sidecar. On the next launch, if that file is strictly newer than the project it belongs to — or the project was never saved — Meridian asks you to **Restore** or **Discard** before showing the timeline. Restore loads the sidecar into the editor and leaves the project file untouched, so the session stays unsaved until you Save. Discard deletes the sidecar. When a project file is still on disk, Discard then opens that saved file. Discarding a session that was never saved returns to the start window. Opening a project from that window still offers a newer sidecar before the timeline is shown.
 
 Opening a project whose sidecar is newer than the file shows the same choice. Saving deletes the sidecar for that project. A recovery that is older than the project file, or the same age, is ignored.
 

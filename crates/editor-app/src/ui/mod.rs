@@ -8,6 +8,7 @@ mod inspector;
 mod mixer;
 mod pool;
 mod scopes;
+mod start;
 mod timeline;
 mod viewer;
 pub mod widgets;
@@ -20,6 +21,7 @@ pub use deliver::deliver_panel;
 pub use inspector::inspector_panel;
 pub use pool::media_pool;
 pub use scopes::scopes_panel;
+pub use start::start_screen;
 pub use timeline::timeline_panel;
 pub use viewer::{dual_monitor_panel, viewer_panel};
 
