@@ -135,6 +135,55 @@ pub enum Modal {
     Import { path: String, note: String },
     Shortcuts,
     Recover { offer: RecoveryOffer, error: String },
+    /// Save / Don't Save / Cancel, shown when quitting a dirty edit.
+    UnsavedQuit,
+}
+
+/// Whether a quit should leave immediately or ask about unsaved edits.
+///
+/// The start window ignores a leftover dirty session. Closing a project
+/// returns there without quitting, and that session may still be dirty.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuitGate {
+    Exit,
+    Prompt,
+}
+
+fn quit_gate(phase: ShellPhase, dirty: bool) -> QuitGate {
+    if phase == ShellPhase::Editing && dirty {
+        QuitGate::Prompt
+    } else {
+        QuitGate::Exit
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuitPromptChoice {
+    Save,
+    Discard,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuitPromptEffect {
+    Exit,
+    Stay,
+}
+
+/// Save exits only after the project is actually clean. A cancelled or failed
+/// save stays in the editor with the prompt still up.
+fn quit_prompt_effect(choice: QuitPromptChoice, project_saved: bool) -> QuitPromptEffect {
+    match choice {
+        QuitPromptChoice::Discard => QuitPromptEffect::Exit,
+        QuitPromptChoice::Cancel => QuitPromptEffect::Stay,
+        QuitPromptChoice::Save => {
+            if project_saved {
+                QuitPromptEffect::Exit
+            } else {
+                QuitPromptEffect::Stay
+            }
+        }
+    }
 }
 
 struct RecoveryClock {
@@ -949,6 +998,12 @@ impl MeridianApp {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
+        if matches!(self.modal, Modal::UnsavedQuit) {
+            if consume_key(ctx, Modifiers::NONE, Key::Escape, false) {
+                self.modal = Modal::None;
+            }
+            return;
+        }
         if self.text_editing {
             return;
         }
@@ -2628,6 +2683,39 @@ impl MeridianApp {
         }
     }
 
+    fn handle_quit_request(&mut self, ctx: &egui::Context) {
+        let close_requested = ctx.input(|input| input.viewport().close_requested());
+        let quit_key = !matches!(self.modal, Modal::UnsavedQuit)
+            && consume_key(ctx, Modifiers::COMMAND, Key::Q, false);
+        if close_requested || quit_key {
+            self.begin_quit(ctx);
+        }
+    }
+
+    fn begin_quit(&mut self, ctx: &egui::Context) {
+        if quit_gate(self.phase, self.session.is_dirty()) == QuitGate::Prompt {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            self.modal = Modal::UnsavedQuit;
+            return;
+        }
+        self.exit_process();
+    }
+
+    /// Leave while the native window still exists.
+    ///
+    /// eframe 0.31 on Linux destroys the X11 window on close and then calls
+    /// `inner_size` / `inner_position`. winit unwraps the resulting
+    /// `BadDrawable` / `BadWindow`, so `ViewportCommand::Close` panics on quit.
+    /// Exiting from `update` runs after the recovery sidecar is flushed and
+    /// before that query. `process::exit` skips `Drop` and `on_exit`.
+    #[allow(clippy::exit)]
+    fn exit_process(&mut self) {
+        self.halt_transport();
+        self.halt_source_transport();
+        self.flush_recovery();
+        std::process::exit(0);
+    }
+
     pub fn close_project(&mut self) {
         let dirty = self.session.is_dirty();
         self.flush_recovery();
@@ -3203,6 +3291,7 @@ fn consume_key(ctx: &egui::Context, modifiers: Modifiers, key: Key, allow_repeat
 
 impl eframe::App for MeridianApp {
     fn update(&mut self, ctx: &egui::Context, host: &mut eframe::Frame) {
+        self.handle_quit_request(ctx);
         if matches!(self.modal, Modal::Recover { .. }) {
             egui::CentralPanel::default()
                 .frame(theme::chrome_frame())
@@ -3420,8 +3509,9 @@ impl MeridianApp {
                             ui.close_menu();
                         }
                         ui.separator();
-                        if ui.button("Quit").clicked() {
-                            ctx.send_viewport_cmd(ViewportCommand::Close);
+                        if ui.button("Quit    Ctrl+Q").clicked() {
+                            ui.close_menu();
+                            self.begin_quit(ctx);
                         }
                     });
                     ui.menu_button("Edit", |ui| {
@@ -3784,6 +3874,67 @@ impl MeridianApp {
             Modal::Import { path, note } => self.modal_import(ctx, path, note),
             Modal::Shortcuts => self.modal_shortcuts(ctx),
             Modal::Recover { offer, error } => self.modal_recover(ctx, offer, error),
+            Modal::UnsavedQuit => self.modal_unsaved_quit(ctx),
+        }
+    }
+
+    fn modal_unsaved_quit(&mut self, ctx: &egui::Context) {
+        let mut choice = None;
+        let saved_path = self.path.clone();
+        let name = self.session.project().name.clone();
+        egui::Window::new("Unsaved Changes")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(theme::dialog_frame())
+            .show(ctx, |ui| {
+                ui.set_min_width(460.0);
+                ui.label(format!("Save changes to {name} before quitting?"));
+                ui.add_space(6.0);
+                match &saved_path {
+                    Some(path) => {
+                        ui.label(
+                            RichText::new(path)
+                                .size(11.0)
+                                .color(theme::THEME.text_dim),
+                        );
+                    }
+                    None => {
+                        ui.label(
+                            RichText::new("This project has not been saved yet.")
+                                .size(11.0)
+                                .color(theme::THEME.text_dim),
+                        );
+                    }
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui::widgets::action_button(ui, "Save", true) {
+                        choice = Some(QuitPromptChoice::Save);
+                    }
+                    if ui::widgets::action_button(ui, "Don't Save", false) {
+                        choice = Some(QuitPromptChoice::Discard);
+                    }
+                    if ui::widgets::action_button(ui, "Cancel", false) {
+                        choice = Some(QuitPromptChoice::Cancel);
+                    }
+                });
+            });
+        let Some(choice) = choice else {
+            return;
+        };
+        if choice == QuitPromptChoice::Save {
+            self.save_or_prompt();
+        }
+        match quit_prompt_effect(choice, !self.session.is_dirty()) {
+            QuitPromptEffect::Exit => self.exit_process(),
+            QuitPromptEffect::Stay => {
+                if choice == QuitPromptChoice::Cancel {
+                    self.modal = Modal::None;
+                } else if self.session.is_dirty() {
+                    self.modal = Modal::UnsavedQuit;
+                }
+            }
         }
     }
 
@@ -4079,6 +4230,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+Z", "Undo"),
     ("Ctrl+Shift+Z  /  Ctrl+Y", "Redo"),
     ("Ctrl+S", "Save"),
+    ("Ctrl+Q", "Quit"),
     ("Ctrl+Shift+S", "Export still at the program playhead"),
     ("Ctrl+O", "Open project"),
     ("Ctrl+N", "New project"),
@@ -4199,4 +4351,37 @@ pub fn open_import(app: &mut MeridianApp) {
         path: String::new(),
         note: "Paste a path, or use File → Import for the system dialog.".into(),
     };
+}
+
+#[cfg(test)]
+mod quit_tests {
+    use super::*;
+
+    #[test]
+    fn quit_prompts_only_for_a_dirty_edit() {
+        assert_eq!(quit_gate(ShellPhase::Editing, true), QuitGate::Prompt);
+        assert_eq!(quit_gate(ShellPhase::Editing, false), QuitGate::Exit);
+        assert_eq!(quit_gate(ShellPhase::Start, true), QuitGate::Exit);
+        assert_eq!(quit_gate(ShellPhase::Start, false), QuitGate::Exit);
+    }
+
+    #[test]
+    fn quit_prompt_stays_open_when_save_does_not_finish() {
+        assert_eq!(
+            quit_prompt_effect(QuitPromptChoice::Save, false),
+            QuitPromptEffect::Stay
+        );
+        assert_eq!(
+            quit_prompt_effect(QuitPromptChoice::Save, true),
+            QuitPromptEffect::Exit
+        );
+        assert_eq!(
+            quit_prompt_effect(QuitPromptChoice::Discard, false),
+            QuitPromptEffect::Exit
+        );
+        assert_eq!(
+            quit_prompt_effect(QuitPromptChoice::Cancel, true),
+            QuitPromptEffect::Stay
+        );
+    }
 }
