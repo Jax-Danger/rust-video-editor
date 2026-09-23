@@ -21,8 +21,8 @@ pub fn start_screen(ui: &mut Ui, app: &mut MeridianApp) {
             header(ui);
             ui.add_space(22.0);
             ui.columns(2, |cols| {
-                recent_column(&mut cols[0], app);
-                new_column(&mut cols[1], app);
+                cols[0].push_id("recent-column", |ui| recent_column(ui, app));
+                cols[1].push_id("new-column", |ui| new_column(ui, app));
             });
             ui.add_space(14.0);
             footer(ui, app);
@@ -87,6 +87,7 @@ fn recent_column(ui: &mut Ui, app: &mut MeridianApp) {
             let mut open_path = None;
             let mut remove_path = None;
             egui::ScrollArea::vertical()
+                .id_salt("recent-projects")
                 .max_height(340.0)
                 .show(ui, |ui| {
                     for entry in &entries {
@@ -134,6 +135,7 @@ fn new_column(ui: &mut Ui, app: &mut MeridianApp) {
         }
         ui.add_space(8.0);
         egui::ScrollArea::vertical()
+            .id_salt("project-templates")
             .max_height(300.0)
             .show(ui, |ui| {
                 for (index, preset) in templates.iter().enumerate() {
